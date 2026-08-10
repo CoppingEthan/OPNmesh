@@ -58,6 +58,19 @@ func TestHashFilesIsOrderIndependentAndContentSensitive(t *testing.T) {
 	}
 }
 
+func TestAllowedPrefixesNormalization(t *testing.T) {
+	prefixes := allowedPrefixes(sampleConf)
+	if !prefixes["10.99.0.2"] {
+		t.Fatal("/32 must normalize to a bare address")
+	}
+	if !prefixes["10.20.0.0/16"] {
+		t.Fatal("subnet prefix missing")
+	}
+	if len(prefixes) != 2 {
+		t.Fatalf("expected 2 prefixes, got %v", prefixes)
+	}
+}
+
 func TestUdpPortFree(t *testing.T) {
 	if !udpPortFree(0) {
 		t.Fatal("binding an ephemeral port must succeed")

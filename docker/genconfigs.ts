@@ -19,10 +19,12 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { build } from "esbuild";
+import { copyFileSync } from "node:fs";
 import { sitesFileSchema, resolveConfig } from "../lib/schema.js";
 import { generateAll } from "../lib/generator/index.js";
 import { runValidators } from "../lib/validators/index.js";
 import { CLIENT_PRIVATE_KEY_PLACEHOLDER } from "../lib/generator/wireguard.js";
+import { emptyRegistry, hashToken } from "../lib/enrol/registry.js";
 import { wgKeypair, agentToken } from "./simkeys.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -62,7 +64,7 @@ mkdirSync(join(stateDir, "control"), { recursive: true });
 // Source of truth for the control server (public keys only, like the real thing).
 writeFileSync(join(stateDir, "sites.yml"), stringifyYaml(raw), "utf8");
 
-const tokenMap: Record<string, string> = {};
+const registry = emptyRegistry();
 
 for (const [siteId, node] of Object.entries(bundle.nodes)) {
   const dir = join(stateDir, siteId);
@@ -77,7 +79,7 @@ for (const [siteId, node] of Object.entries(bundle.nodes)) {
   });
 
   const token = agentToken();
-  tokenMap[token] = siteId;
+  registry.bindings[siteId] = { nodeTokenHash: hashToken(token), role: "gateway" };
   writeFileSync(join(dir, "agent.token"), token + "\n", { encoding: "utf8", mode: 0o600 });
   writeFileSync(
     join(dir, "agent.json"),
@@ -98,10 +100,11 @@ for (const [siteId, node] of Object.entries(bundle.nodes)) {
 }
 
 writeFileSync(
-  join(stateDir, "control", "tokens.json"),
-  JSON.stringify(tokenMap, null, 2) + "\n",
+  join(stateDir, "control", "registry.json"),
+  JSON.stringify(registry, null, 2) + "\n",
   { encoding: "utf8", mode: 0o600 },
 );
+copyFileSync(join(here, "..", "deploy", "install.sh"), join(stateDir, "control", "install.sh"));
 
 for (const [clientId, { config }] of Object.entries(bundle.clients)) {
   const dir = join(stateDir, "clients", clientId);

@@ -22,7 +22,8 @@ RUN apk add --no-cache \
     wireguard-tools \
     iperf3 \
     tcpdump \
-    netcat-openbsd
+    netcat-openbsd \
+    curl
 
 COPY --from=wg-go /wireguard-go /usr/bin/wireguard-go
 COPY --from=agent /opnmesh-agent /usr/bin/opnmesh-agent

@@ -102,10 +102,73 @@ func wgInterfaceExists(iface string) bool {
 	return err == nil
 }
 
+// allowedPrefixes collects every AllowedIPs prefix in a config, normalized
+// the way `ip route show` prints them (/32 becomes a bare address).
+func allowedPrefixes(conf string) map[string]bool {
+	out := map[string]bool{}
+	for _, raw := range strings.Split(conf, "\n") {
+		line := strings.TrimSpace(raw)
+		if !strings.HasPrefix(line, "AllowedIPs") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		for _, p := range strings.Split(parts[1], ",") {
+			prefix := strings.TrimSpace(p)
+			prefix = strings.TrimSuffix(prefix, "/32")
+			if prefix != "" {
+				out[prefix] = true
+			}
+		}
+	}
+	return out
+}
+
+// syncRoutes reconciles the kernel routes on the wg interface with the
+// config's AllowedIPs. wg-quick installs routes only at `up`; peer changes
+// applied via syncconf update crypto but NOT routing — without this, a newly
+// added peer is crypto-reachable yet unrouted, which is a silent black hole.
+// Connected/kernel-managed routes (the interface's own subnet) are left alone.
+func syncRoutes(iface, conf string) error {
+	desired := allowedPrefixes(conf)
+	out, err := runCmd("ip", "-4", "route", "show", "dev", iface)
+	if err != nil {
+		return err
+	}
+	current := map[string]bool{}
+	for _, raw := range strings.Split(strings.TrimSpace(out), "\n") {
+		if raw == "" || strings.Contains(raw, "proto kernel") {
+			continue
+		}
+		fields := strings.Fields(raw)
+		if len(fields) > 0 {
+			current[fields[0]] = true
+		}
+	}
+	for p := range desired {
+		if !current[p] {
+			if _, err := runCmd("ip", "-4", "route", "replace", p, "dev", iface); err != nil {
+				return err
+			}
+		}
+	}
+	for c := range current {
+		if !desired[c] {
+			if _, err := runCmd("ip", "-4", "route", "del", c, "dev", iface); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // wgSyncPeers applies peer-level changes without recreating the interface:
 // existing peers with unchanged parameters keep their sessions. The private
 // key is re-asserted afterwards because the generated config never carries it
-// inline.
+// inline, and kernel routes are reconciled because syncconf does not touch
+// routing.
 func wgSyncPeers(iface, confPath, keyPath string) error {
 	stripped, err := runCmd("wg-quick", "strip", confPath)
 	if err != nil {
@@ -129,7 +192,11 @@ func wgSyncPeers(iface, confPath, keyPath string) error {
 			return err
 		}
 	}
-	return nil
+	conf, err := os.ReadFile(confPath)
+	if err != nil {
+		return err
+	}
+	return syncRoutes(iface, string(conf))
 }
 
 // wgPeerStats parses `wg show <if> dump`.

@@ -20,6 +20,10 @@ networks:
     ipam:
       config:
         - subnet: 10.30.0.0/16
+  lan-d:
+    ipam:
+      config:
+        - subnet: 10.40.0.0/16
 
 x-node: &node
   build:
@@ -140,6 +144,10 @@ services:
     networks:
       lan-a:
         ipv4_address: 10.10.7.10
+      # The wan address stands in for the site router's port forward that
+      # publishes the control node's web port for enrolment (§12).
+      wan:
+        ipv4_address: 198.51.100.50
     volumes:
       - ./state:/state
     environment:
@@ -155,6 +163,40 @@ services:
         "-c",
         "ip route replace default via 10.10.0.2 && exec node /state/control/server.mjs",
       ]
+
+  # --- enrolment profile: a factory-fresh fourth site (§12 end-to-end) ---
+
+  gw-d:
+    <<: *wg-node
+    container_name: opnmesh-gw-d
+    hostname: gw-d
+    profiles:
+      - enrol
+    sysctls:
+      net.ipv4.ip_forward: 1
+    networks:
+      wan:
+        ipv4_address: 198.51.100.40
+      lan-d:
+        ipv4_address: 10.40.0.2
+    environment:
+      ENROL_SERVER: http://198.51.100.50:8080
+      ENROL_TOKEN: ${ENROL_TOKEN:-}
+    command: /opt/opnmesh/enrol-gateway.sh
+
+  host-d:
+    <<: *node
+    container_name: opnmesh-host-d
+    profiles:
+      - enrol
+    networks:
+      lan-d:
+        ipv4_address: 10.40.5.20
+    environment:
+      GW_IP: 10.40.0.2
+    depends_on:
+      - gw-d
+    command: /opt/opnmesh/host.sh
 
   traffic-gen:
     <<: *node
