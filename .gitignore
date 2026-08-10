@@ -143,3 +143,7 @@ config/repo/
 *.key
 *.pem
 docker/state/
+
+# UI-local data (sessions, admin credential hash) — never in the repo
+.data/
+next-env.d.ts

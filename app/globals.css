@@ -1,0 +1,71 @@
+@import "tailwindcss";
+
+/* Dense, functional, dark-mode-first admin UI. Monospace for addresses,
+   keys and config. Status legible at a glance from across the room. */
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-zinc-950 text-zinc-200 antialiased;
+}
+
+.mono {
+  font-family: ui-monospace, "Cascadia Mono", "JetBrains Mono", Menlo, monospace;
+}
+
+.card {
+  @apply rounded border border-zinc-800 bg-zinc-900/60 p-4;
+}
+
+.h1 {
+  @apply text-lg font-semibold text-zinc-100;
+}
+
+.label {
+  @apply text-xs uppercase tracking-wide text-zinc-500;
+}
+
+.btn {
+  @apply inline-block cursor-pointer rounded border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-100 hover:bg-zinc-700 disabled:opacity-40;
+}
+
+.btn-danger {
+  @apply border-red-900 bg-red-950 text-red-200 hover:bg-red-900;
+}
+
+.btn-primary {
+  @apply border-emerald-800 bg-emerald-950 text-emerald-200 hover:bg-emerald-900;
+}
+
+.input {
+  @apply w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-sm text-zinc-100 outline-none focus:border-zinc-500;
+}
+
+table.data {
+  @apply w-full border-collapse text-sm;
+}
+table.data th {
+  @apply border-b border-zinc-800 px-2 py-1.5 text-left text-xs font-medium uppercase tracking-wide text-zinc-500;
+}
+table.data td {
+  @apply border-b border-zinc-800/60 px-2 py-1.5 align-top;
+}
+
+.status-ok {
+  @apply text-emerald-400;
+}
+.status-warn {
+  @apply text-amber-400;
+}
+.status-bad {
+  @apply text-red-400;
+}
+.status-dim {
+  @apply text-zinc-500;
+}
+
+pre.conf {
+  font-family: ui-monospace, "Cascadia Mono", "JetBrains Mono", Menlo, monospace;
+  @apply overflow-x-auto rounded border border-zinc-800 bg-black/60 p-3 text-xs leading-5 text-zinc-300;
+}

@@ -25,7 +25,7 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { loadSitesYaml } from "../lib/schema.js";
@@ -167,7 +167,7 @@ function tickRollout(): void {
     pinned: (n) => settings.pinned[n] === true,
   });
   for (const e of events) appendAudit(`rollout:${e.type}`, `${e.node ?? ""} ${e.detail}`.trim());
-  if (rollout.status === "aborted") rolloutAborted = 1;
+  if (events.some((e) => e.type === "rollout-aborted")) rolloutAborted = 1;
   // Write-on-change only: sync writes to a bind-mounted state dir are slow
   // enough (Docker Desktop gRPC-FUSE) to stall the event loop if done on
   // every report.
@@ -232,6 +232,62 @@ setInterval(() => {
     console.error("tick error:", e);
   }
 }, 2000).unref();
+
+// --- tier-4 on-demand capture (§13): queued here, pulled and executed by the
+// agent (control never dials nodes), pcap uploaded back. Hard server-side
+// caps on duration and size; every request audited. ---
+
+const CAPTURES_DIR = join(STATE_DIR, "control", "captures");
+const CAPTURE_MAX_SECONDS = 60;
+const CAPTURE_MAX_KB = 10240;
+
+interface CaptureJob {
+  id: string;
+  node: string;
+  filter: string;
+  seconds: number;
+  maxKb: number;
+  status: "queued" | "running" | "done" | "failed";
+  createdAt: number;
+  sizeKb: number;
+}
+
+function capturesPath(): string {
+  return join(CAPTURES_DIR, "jobs.json");
+}
+function loadCaptures(): CaptureJob[] {
+  if (!existsSync(capturesPath())) return [];
+  return JSON.parse(readFileSync(capturesPath(), "utf8")) as CaptureJob[];
+}
+function saveCaptures(jobs: CaptureJob[]): void {
+  mkdirSync(CAPTURES_DIR, { recursive: true });
+  writeFileSync(capturesPath(), JSON.stringify(jobs, null, 2) + "\n", "utf8");
+}
+
+async function sendTestEmail(): Promise<{ ok: boolean; error?: string }> {
+  const host = process.env["OPNMESH_SMTP_HOST"];
+  const port = Number(process.env["OPNMESH_SMTP_PORT"] ?? 587);
+  if (!host) return { ok: false, error: "OPNMESH_SMTP_HOST is not set in the environment" };
+  try {
+    const nodemailer = await import("nodemailer");
+    const user = process.env["OPNMESH_SMTP_USER"];
+    const transport = nodemailer.createTransport({
+      host,
+      port,
+      secure: false,
+      ...(user ? { auth: { user, pass: process.env["OPNMESH_SMTP_PASSWORD"] ?? "" } } : {}),
+    });
+    await transport.sendMail({
+      from: process.env["OPNMESH_SMTP_FROM"] ?? "opnmesh@localhost",
+      to: process.env["OPNMESH_ALERT_TO"] ?? process.env["OPNMESH_SMTP_FROM"] ?? "opnmesh@localhost",
+      subject: "OPNmesh test email",
+      text: "SMTP is configured correctly. Alerts from Alertmanager will arrive like this.",
+    });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
 
 function flowRetentionCutoff(): number {
   const cfg = loadSitesYaml(readFileSync(SITES_PATH, "utf8"));
@@ -702,6 +758,100 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "GET" && url === "/api/v1/admin/port-change") {
       return json(res, 200, { active: loadPortChange() });
+    }
+
+    if (req.method === "GET" && url === "/api/v1/agent/capture") {
+      const token = bearerToken(req);
+      if (!token) return json(res, 401, { error: "unauthorized" });
+      const auth = authenticate(loadRegistry(), token);
+      if (auth.status !== "active") return json(res, 401, { error: "unauthorized" });
+      const jobs = loadCaptures();
+      const job = jobs.find((j) => j.node === auth.siteId && j.status === "queued");
+      if (!job) {
+        res.writeHead(204);
+        return res.end();
+      }
+      job.status = "running";
+      saveCaptures(jobs);
+      return json(res, 200, { id: job.id, filter: job.filter, seconds: job.seconds, maxKb: job.maxKb });
+    }
+
+    if (req.method === "POST" && url.startsWith("/api/v1/agent/capture/")) {
+      const token = bearerToken(req);
+      if (!token) return json(res, 401, { error: "unauthorized" });
+      const auth = authenticate(loadRegistry(), token);
+      if (auth.status !== "active") return json(res, 401, { error: "unauthorized" });
+      const id = url.slice("/api/v1/agent/capture/".length).replace(/[^a-z0-9-]/g, "");
+      const jobs = loadCaptures();
+      const job = jobs.find((j) => j.id === id && j.node === auth.siteId);
+      if (!job) return json(res, 404, { error: "no such capture" });
+      const chunks: Buffer[] = [];
+      let size = 0;
+      for await (const chunk of req) {
+        size += (chunk as Buffer).length;
+        if (size > job.maxKb * 1024) break;
+        chunks.push(chunk as Buffer);
+      }
+      mkdirSync(CAPTURES_DIR, { recursive: true });
+      writeFileSync(join(CAPTURES_DIR, `${job.id}.pcap`), Buffer.concat(chunks));
+      job.status = "done";
+      job.sizeKb = Math.round(size / 1024);
+      saveCaptures(jobs);
+      appendAudit("capture:completed", `${job.id} on ${job.node}: ${job.sizeKb} KiB`);
+      return json(res, 200, { ok: true });
+    }
+
+    if (req.method === "POST" && url === "/api/v1/admin/capture") {
+      const body = await readBody(req);
+      const seconds = Math.min(Number(body.seconds ?? 15), CAPTURE_MAX_SECONDS);
+      const maxKb = Math.min(Number(body.maxKb ?? 2048), CAPTURE_MAX_KB);
+      const node = String(body.node);
+      if (!loadRegistry().bindings[node]) return json(res, 400, { error: `unknown node ${node}` });
+      const job: CaptureJob = {
+        id: "cap-" + Date.now().toString(36),
+        node,
+        filter: String(body.filter ?? ""),
+        seconds,
+        maxKb,
+        status: "queued",
+        createdAt: Date.now(),
+        sizeKb: 0,
+      };
+      const jobs = loadCaptures();
+      jobs.push(job);
+      saveCaptures(jobs);
+      appendAudit("capture:requested", `${job.id} on ${node}: ${seconds}s, ≤${maxKb} KiB, filter "${job.filter}"`);
+      return json(res, 200, { id: job.id });
+    }
+
+    if (req.method === "GET" && url === "/api/v1/admin/captures") {
+      return json(res, 200, { captures: loadCaptures().slice(-30).reverse() });
+    }
+
+    if (req.method === "GET" && url.startsWith("/api/v1/admin/captures/")) {
+      const file = url.slice("/api/v1/admin/captures/".length).replace(/[^a-z0-9.-]/g, "");
+      const p = join(CAPTURES_DIR, file);
+      if (!file.endsWith(".pcap") || !existsSync(p)) return json(res, 404, { error: "not found" });
+      res.writeHead(200, { "content-type": "application/vnd.tcpdump.pcap" });
+      return res.end(readFileSync(p));
+    }
+
+    if (req.method === "POST" && url === "/api/v1/admin/test-email") {
+      const result = await sendTestEmail();
+      appendAudit("test-email", result.ok ? "sent" : `failed: ${result.error}`);
+      return json(res, result.ok ? 200 : 500, result);
+    }
+
+    if (req.method === "GET" && url === "/api/v1/admin/releases") {
+      const out: unknown[] = [];
+      if (existsSync(RELEASES_DIR)) {
+        const { readdirSync } = await import("node:fs");
+        for (const v of readdirSync(RELEASES_DIR)) {
+          const m = manifestFor(v);
+          if (m) out.push(m);
+        }
+      }
+      return json(res, 200, { releases: out });
     }
 
     if (req.method === "POST" && url === "/api/v1/admin/remove") {

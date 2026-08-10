@@ -149,6 +149,7 @@ func runLoop(cfg AgentConfig, rec *Reconciler) {
 			rec.Apply()
 			report(cfg, rec, client, state, int64(time.Since(start).Seconds()))
 			flowReporter.MaybeReport(client, loadSettings(cfg.ConfDir))
+			maybeCapture(cfg, client)
 
 			// Self-update path: separate from config reconcile, and only
 			// when not already mid-confirm.
