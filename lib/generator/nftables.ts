@@ -4,7 +4,12 @@
  * Everything lives in a dedicated `table inet opnmesh` so reloads are atomic
  * (declare + delete + redefine) and operator-managed tables are never touched.
  * The forward chain has `policy accept` — cross-site traffic is allowed by
- * default and OPNmesh adds targeted drops (client isolation, management ACLs).
+ * default and OPNmesh adds targeted drops (guest isolation, client isolation,
+ * management ACLs).
+ *
+ * Multi-VLAN sites: each site's advertised subnets become one named set, so
+ * the traffic matrix stays one counter per site pair no matter how many VLANs
+ * a site has (rather than a rule per subnet-pair combination).
  *
  * Never generated here, enforced by validator and test: masquerade / SNAT.
  * Source addresses must survive the mesh end to end.
@@ -14,13 +19,20 @@ import { connectivityMatrix } from "../topology.js";
 
 const WG_IF = "wg0";
 
+function ident(id: string): string {
+  return id.replace(/-/g, "_");
+}
+
 function counterName(fromId: string, toId: string): string {
-  const clean = (s: string) => s.replace(/-/g, "_");
-  return `cnt_${clean(fromId)}_to_${clean(toId)}`;
+  return `cnt_${ident(fromId)}_to_${ident(toId)}`;
+}
+
+function netSetName(id: string): string {
+  return `nets_${ident(id)}`;
 }
 
 /**
- * Ordered LAN-pairs whose traffic can traverse this gateway: its own site to
+ * Ordered site pairs whose traffic can traverse this gateway: its own site to
  * every reachable remote site (both directions), plus — when it is a transit
  * hub — the pairs it relays for. Drives the tier-2 traffic matrix.
  */
@@ -45,6 +57,7 @@ export function generateNftables(cfg: ResolvedConfig, siteId: string): string {
   const mgmt = cfg.policy?.management ?? null;
   const hasMgmt =
     mgmt !== null && (mgmt.adminSources.length > 0 || mgmt.managementDestinations.length > 0);
+  const guestNets = g.lans.filter((l) => l.role === "guest").map((l) => l.cidr);
 
   const lines: string[] = [
     "#!/usr/sbin/nft -f",
@@ -67,6 +80,36 @@ export function generateNftables(cfg: ResolvedConfig, siteId: string): string {
     "  }",
   );
 
+  // One set per site holding its advertised subnets, so a multi-VLAN site is
+  // matched by a single rule.
+  const pairs = counterPairs(cfg, g);
+  const setSites = new Map<string, ResolvedSite>();
+  for (const [from, to] of pairs) {
+    setSites.set(from.id, from);
+    setSites.set(to.id, to);
+  }
+  for (const s of [...setSites.values()].sort((a, b) => a.id.localeCompare(b.id))) {
+    lines.push(
+      "",
+      `  set ${netSetName(s.id)} {`,
+      "    type ipv4_addr",
+      "    flags interval",
+      `    elements = { ${s.advertised.join(", ")} }`,
+      "  }",
+    );
+  }
+
+  if (guestNets.length > 0) {
+    lines.push(
+      "",
+      "  set guest_nets {",
+      "    type ipv4_addr",
+      "    flags interval",
+      `    elements = { ${guestNets.join(", ")} }`,
+      "  }",
+    );
+  }
+
   if (hasMgmt && mgmt.adminSources.length > 0) {
     lines.push(
       "",
@@ -88,7 +131,6 @@ export function generateNftables(cfg: ResolvedConfig, siteId: string): string {
     );
   }
 
-  const pairs = counterPairs(cfg, g);
   if (pairs.length > 0) lines.push("");
   for (const [from, to] of pairs) {
     lines.push(`  counter ${counterName(from.id, to.id)} {}`);
@@ -102,6 +144,17 @@ export function generateNftables(cfg: ResolvedConfig, siteId: string): string {
     `    oifname "${WG_IF}" tcp flags syn tcp option maxseg size set rt mtu`,
     `    iifname "${WG_IF}" tcp flags syn tcp option maxseg size set rt mtu`,
   );
+
+  if (guestNets.length > 0) {
+    lines.push(
+      "",
+      "    # Guest VLANs never touch the mesh in either direction. No peer routes",
+      "    # them (they are absent from every AllowedIPs), and this is the second,",
+      "    # independent mechanism enforcing it on this gateway.",
+      `    oifname "${WG_IF}" ip saddr @guest_nets drop`,
+      `    iifname "${WG_IF}" ip daddr @guest_nets drop`,
+    );
+  }
 
   lines.push(
     "",
@@ -127,7 +180,7 @@ export function generateNftables(cfg: ResolvedConfig, siteId: string): string {
     lines.push("", "    # Tier-2 traffic matrix: per site-pair byte/packet counters.");
     for (const [from, to] of pairs) {
       lines.push(
-        `    ip saddr ${from.lan} ip daddr ${to.lan} counter name "${counterName(from.id, to.id)}"`,
+        `    ip saddr @${netSetName(from.id)} ip daddr @${netSetName(to.id)} counter name "${counterName(from.id, to.id)}"`,
       );
     }
   }

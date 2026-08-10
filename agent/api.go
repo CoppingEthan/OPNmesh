@@ -2,11 +2,17 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -47,11 +53,39 @@ type APIClient struct {
 	etag string
 }
 
-func NewAPIClient(baseURL, token string) *APIClient {
+// NewAPIClient builds a client whose TLS behaviour is decided by the agent
+// config: with a pin, the control node's certificate public key must match
+// exactly (no CA trust needed for a private mesh); without TLS at all, only
+// when the install is explicitly marked insecure.
+func NewAPIClient(cfg AgentConfig, token string) *APIClient {
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+		Proxy:           nil, // never route agent traffic through an env proxy
+	}
+	if cfg.ServerPinSha256 != "" {
+		pin := strings.ToLower(strings.TrimSpace(cfg.ServerPinSha256))
+		// Pinning replaces chain validation: we verify the presented key, not
+		// who signed it, so a private/self-signed certificate is fine and a
+		// swapped one is refused even if it chains to a public CA.
+		transport.TLSClientConfig.InsecureSkipVerify = true
+		transport.TLSClientConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			for _, raw := range rawCerts {
+				cert, err := x509.ParseCertificate(raw)
+				if err != nil {
+					continue
+				}
+				sum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+				if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(pin)) == 1 {
+					return nil
+				}
+			}
+			return fmt.Errorf("control node certificate does not match the pin recorded at enrolment")
+		}
+	}
 	return &APIClient{
-		baseURL: baseURL,
+		baseURL: strings.TrimSuffix(cfg.ServerURL, "/"),
 		token:   token,
-		http:    &http.Client{Timeout: 15 * time.Second},
+		http:    &http.Client{Timeout: 15 * time.Second, Transport: transport},
 	}
 }
 

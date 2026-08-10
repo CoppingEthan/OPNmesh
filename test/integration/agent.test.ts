@@ -14,8 +14,9 @@ import { join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { wgKeypair } from "../../docker/simkeys.js";
 
+import { adminFetch, adminJson } from "./helpers.js";
+
 const enabled = process.env["RUN_MESH_TESTS"] === "1";
-const CONTROL = "http://localhost:18080";
 const SITES_PATH = join(process.cwd(), "docker", "state", "sites.yml");
 const POLL_MS = 3000;
 
@@ -46,7 +47,7 @@ interface NodeState {
 }
 
 async function controlState(): Promise<Record<string, NodeState>> {
-  const res = await fetch(`${CONTROL}/api/v1/state`);
+  const res = await adminFetch("/api/v1/state");
   expect(res.ok).toBe(true);
   return ((await res.json()) as { nodes: Record<string, NodeState> }).nodes;
 }

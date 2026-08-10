@@ -61,14 +61,40 @@ const gatewaySchema = z
   })
   .strict();
 
+/**
+ * One LAN segment behind a gateway. A single-VLAN site has one; an office with
+ * VLANs has several. `role` decides how the mesh treats it:
+ *   standard   — advertised to every reachable site (the default)
+ *   management — advertised, but reachable only from policy.management
+ *                admin sources, and never allowed to initiate across the mesh
+ *   guest      — NEVER advertised: stays local to its site, no mesh route
+ *                exists for it in any direction
+ */
+const lanSchema = z
+  .object({
+    cidr: cidrSchema,
+    /** Display name, e.g. "Staff", "Voice", "CCTV". Cosmetic. */
+    name: z.string().min(1).optional(),
+    /** 802.1Q VLAN id, documentation only — OPNmesh never configures switches. */
+    vlan: z.number().int().min(1).max(4094).optional(),
+    role: z.enum(["standard", "management", "guest"]).default("standard"),
+  })
+  .strict();
+
 const siteSchema = z
   .object({
     id: idSchema,
     name: z.string().min(1),
-    lan: cidrSchema,
+    /** Single-subnet shorthand. Exactly one of `lan` or `lans` is required. */
+    lan: cidrSchema.optional(),
+    /** Multi-VLAN sites list every segment here. */
+    lans: z.array(lanSchema).min(1).optional(),
     gateway: gatewaySchema,
   })
-  .strict();
+  .strict()
+  .refine((s) => (s.lan === undefined) !== (s.lans === undefined), {
+    message: "each site needs exactly one of `lan` (single subnet) or `lans` (multiple VLANs)",
+  });
 
 const clientSchema = z
   .object({
@@ -148,10 +174,25 @@ export interface ResolvedGateway {
   flows: boolean;
 }
 
+export interface ResolvedLan {
+  cidr: string;
+  name: string | undefined;
+  vlan: number | undefined;
+  role: "standard" | "management" | "guest";
+}
+
 export interface ResolvedSite {
   id: string;
   name: string;
-  lan: string;
+  /** Every LAN segment behind this gateway, in file order. */
+  lans: ResolvedLan[];
+  /**
+   * Subnets advertised across the mesh (standard + management; never guest).
+   * This is the list that reaches AllowedIPs and router instructions.
+   */
+  advertised: string[];
+  /** Management-role subnets at this site. */
+  managementNets: string[];
   gateway: ResolvedGateway;
 }
 
@@ -244,24 +285,38 @@ export function resolveConfig(file: SitesFile): ResolvedConfig {
     .filter((s) => s.gateway.endpoint !== null)
     .map((s) => s.id);
 
-  const sites: ResolvedSite[] = file.sites.map((s) => ({
-    id: s.id,
-    name: s.name,
-    lan: s.lan,
-    gateway: {
-      displayName: s.gateway.name,
-      lanIp: s.gateway.lan_ip,
-      tunnelIp: s.gateway.tunnel_ip,
-      endpoint: s.gateway.endpoint,
-      endpointIsHostname: s.gateway.endpoint !== null && isHostname(s.gateway.endpoint),
-      listenPort: s.gateway.listen_port ?? file.network.default_listen_port,
-      publicKey: s.gateway.public_key,
-      mtu: s.gateway.mtu ?? file.network.default_mtu,
-      privateKeyPath: s.gateway.private_key_path ?? DEFAULT_PRIVATE_KEY_PATH,
-      metricsPort: s.gateway.metrics_port ?? file.network.default_metrics_port,
-      flows: s.gateway.flows,
-    },
-  }));
+  const sites: ResolvedSite[] = file.sites.map((s) => {
+    const lans: ResolvedLan[] = s.lans
+      ? s.lans.map((l) => ({ cidr: l.cidr, name: l.name, vlan: l.vlan, role: l.role }))
+      : [{ cidr: s.lan!, name: undefined, vlan: undefined, role: "standard" as const }];
+    // Guest segments are deliberately absent from `advertised`: no peer ever
+    // routes them, so a guest VLAN cannot reach — or be reached from — the mesh.
+    const advertised = lans.filter((l) => l.role !== "guest").map((l) => l.cidr);
+    const managementNets = lans.filter((l) => l.role === "management").map((l) => l.cidr);
+    if (advertised.length === 0) {
+      problems.push(`site "${s.id}" advertises no subnets — every LAN is marked guest`);
+    }
+    return {
+      id: s.id,
+      name: s.name,
+      lans,
+      advertised,
+      managementNets,
+      gateway: {
+        displayName: s.gateway.name,
+        lanIp: s.gateway.lan_ip,
+        tunnelIp: s.gateway.tunnel_ip,
+        endpoint: s.gateway.endpoint,
+        endpointIsHostname: s.gateway.endpoint !== null && isHostname(s.gateway.endpoint),
+        listenPort: s.gateway.listen_port ?? file.network.default_listen_port,
+        publicKey: s.gateway.public_key,
+        mtu: s.gateway.mtu ?? file.network.default_mtu,
+        privateKeyPath: s.gateway.private_key_path ?? DEFAULT_PRIVATE_KEY_PATH,
+        metricsPort: s.gateway.metrics_port ?? file.network.default_metrics_port,
+        flows: s.gateway.flows,
+      },
+    };
+  });
 
   const clients: ResolvedClient[] = file.clients.map((c) => {
     let entryPoints = c.entry_points ?? eligibleEntrySites;
@@ -314,14 +369,20 @@ export function resolveConfig(file: SitesFile): ResolvedConfig {
     topology: { shape, hubs },
     sites,
     clients,
-    policy: file.policy
-      ? {
-          management: {
-            adminSources: file.policy.management.admin_sources,
-            managementDestinations: file.policy.management.management_destinations,
-          },
-        }
-      : null,
+    // Any LAN marked role: management joins the management destination set
+    // automatically, so a multi-VLAN office does not have to restate its
+    // management subnets in the policy block.
+    policy: (() => {
+      const fromLans = sites.flatMap((s) => s.managementNets);
+      if (!file.policy && fromLans.length === 0) return null;
+      const declared = file.policy?.management.management_destinations ?? [];
+      return {
+        management: {
+          adminSources: file.policy?.management.admin_sources ?? [],
+          managementDestinations: [...new Set([...declared, ...fromLans])],
+        },
+      };
+    })(),
   };
 }
 

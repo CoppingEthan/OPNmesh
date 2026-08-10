@@ -53,6 +53,9 @@ describe.skipIf(!enabled)("UI (phase 7)", () => {
         // Unreachable on purpose: the UI must render without the control server.
         OPNMESH_CONTROL_URL: "http://127.0.0.1:9",
         OPNMESH_PROM_URL: "http://127.0.0.1:9",
+        OPNMESH_ADMIN_TOKEN: "t".repeat(64),
+        // Plain HTTP under test, so cookies drop the __Host- prefix.
+        OPNMESH_ALLOW_INSECURE_HTTP: "1",
       },
     });
     const deadline = Date.now() + 60_000;
@@ -83,12 +86,12 @@ describe.skipIf(!enabled)("UI (phase 7)", () => {
   it("first run redirects to setup; after admin exists, to login", async () => {
     const res = await get("/");
     expect(res.url).toContain("/setup");
-    expect(await res.text()).toContain("create the admin account");
+    expect(await res.text()).toContain("Welcome to OPNmesh");
 
     // Configure the admin out-of-band (same SQLite the server uses).
     process.env["OPNMESH_DATA_DIR"] = dataDir;
     const { setAdminPassword } = await import("../lib/ui/auth.js");
-    await setAdminPassword("correct-horse-battery");
+    await setAdminPassword("correct-horse-battery-staple");
 
     const after = await get("/");
     expect(after.url).toContain("/login");
@@ -97,25 +100,33 @@ describe.skipIf(!enabled)("UI (phase 7)", () => {
 
   it("a valid server-side session unlocks the dashboard", async () => {
     const Database = (await import("better-sqlite3")).default;
+    const { createHash } = await import("node:crypto");
     const db = new Database(join(dataDir, "ui.db"));
     sessionToken = randomBytes(32).toString("hex");
     const now = Date.now();
-    db.prepare("INSERT INTO sessions (token, created_at, last_seen) VALUES (?, ?, ?)").run(sessionToken, now, now);
+    // Sessions are stored hashed, so insert the hash the server will look up.
+    const hash = createHash("sha256").update(sessionToken, "utf8").digest("hex");
+    db.prepare("INSERT INTO sessions (token_hash, created_at, last_seen) VALUES (?, ?, ?)").run(hash, now, now);
     db.close();
 
     const res = await get("/");
     const html = await res.text();
     expect(res.url).not.toContain("/login");
-    expect(html).toContain("Mesh overview");
-    expect(html).toContain("site-a");
-    expect(html).toContain("Connectivity matrix");
-    // Full mesh: all pairs direct.
-    expect(html).toContain("direct");
+    // The control server is unreachable in this test, so the honest headline
+    // is that nothing has checked in — stated in plain language, not jargon.
+    expect(html).toContain("Waiting for your first location to connect");
+    expect(html).toContain("Site A");
+    expect(html).toContain("How your locations reach each other");
+    // Topology is known from sites.yml even with no live data.
+    expect(html).toContain("connects directly");
+    // The diagram renders from config alone.
+    expect(html).toContain("Your network right now");
   }, 30_000);
 
   it("feature pages render with config-derived content, control server down", async () => {
     const checks: Array<[string, string]> = [
       ["/nodes", "Issue one-time token"],
+      ["/", "Your network right now"],
       ["/clients", "Entry points (preference order)"],
       ["/config", "wg0.conf"],
       ["/routes", "UniFi"],

@@ -27,30 +27,53 @@ topology:
   shape: full-mesh
 
 sites:
+  # A site with several VLANs — list each one. `role` decides how the mesh
+  # treats it:
+  #   standard   (default) reachable from every other site
+  #   management reachable only from policy.management.admin_sources, and
+  #              never allowed to start connections across the mesh
+  #   guest      never carried across the mesh at all; stays local to its site
   - id: site-a
-    name: Site A
-    lan: 10.10.0.0/16
+    name: Head Office
+    lans:
+      - cidr: 10.10.10.0/24
+        name: Staff
+        vlan: 10
+      - cidr: 10.10.20.0/24
+        name: Voice
+        vlan: 20
+      - cidr: 10.10.99.0/24
+        name: Management
+        vlan: 99
+        role: management
+      - cidr: 192.168.1.0/24
+        name: Guest Wi-Fi
+        vlan: 90
+        role: guest
     gateway:
-      name: Gateway A          # display name — cosmetic, never appears in generated config
-      lan_ip: 10.10.0.2        # the gateway's address on its own LAN (router next hop)
+      name: Head Office Gateway  # display name — cosmetic, never in generated config
+      lan_ip: 10.10.10.2         # the gateway's address on its own LAN (router next hop)
       tunnel_ip: 10.99.0.1
-      endpoint: 198.51.100.10  # public IP or DDNS hostname; null if no inbound UDP
-      listen_port: 51820       # per-node; omit to use default_listen_port
+      endpoint: 198.51.100.10    # public IP or DDNS hostname; null if no inbound UDP
+      listen_port: 51820         # per-node; omit to use default_listen_port
       public_key: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=
+
+  # A site with one flat network — use the `lan` shorthand instead of `lans`.
   - id: site-b
-    name: Site B
+    name: Branch
     lan: 10.20.0.0/16
     gateway:
-      name: Gateway B
+      name: Branch Gateway
       lan_ip: 10.20.0.2
       tunnel_ip: 10.99.0.2
       endpoint: 198.51.100.20
       public_key: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=
+
   - id: site-c
-    name: Site C
+    name: Warehouse
     lan: 10.30.0.0/16
     gateway:
-      name: Gateway C
+      name: Warehouse Gateway
       lan_ip: 10.30.0.2
       tunnel_ip: 10.99.0.3
       endpoint: 198.51.100.30
@@ -66,13 +89,14 @@ clients:
     # limit reach — a client entering at one site reaches every site.
     home_site: site-b          # cosmetic + DNS-level only; any site is allowed
 
-# Optional management ACLs, generated into every gateway's nftables ruleset:
-# admin sources may reach management destinations; nothing else may; and
-# management devices never initiate connections across the mesh.
+# Management ACLs, generated into every gateway's nftables ruleset: admin
+# sources may reach management destinations; nothing else may; and management
+# devices never initiate connections across the mesh.
+#
+# Any LAN with `role: management` is added to management_destinations
+# automatically, so you normally only need to list your admin sources here.
 policy:
   management:
     admin_sources:
-      - 10.10.5.0/24
-    management_destinations:
-      - 10.10.9.0/24
-      - 10.30.9.0/24
+      - 10.10.10.0/24     # the IT subnet
+    management_destinations: []

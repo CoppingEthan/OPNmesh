@@ -1,5 +1,6 @@
 {
   "metrics_port": 9586,
+  "metrics_bind": "10.99.0.4",
   "flows": false,
   "flow_interval_sec": 30,
   "needs_reresolve": false

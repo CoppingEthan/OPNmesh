@@ -11,8 +11,9 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { adminJson, CONTROL } from "./helpers.js";
+
 const enabled = process.env["RUN_MESH_TESTS"] === "1";
-const CONTROL = "http://localhost:18080";
 const COMPOSE = "docker compose -f docker/docker-compose.yml";
 
 const sh = (cmd: string, env: Record<string, string> = {}): string =>
@@ -25,12 +26,15 @@ const sh = (cmd: string, env: Record<string, string> = {}): string =>
 const exec = (c: string, cmd: string): string => sh(`docker exec ${c} sh -c "${cmd.replace(/"/g, '\\"')}"`);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Admin routes need the credential; /api/v1/enrol is deliberately public. */
 async function api(method: string, path: string, body?: unknown): Promise<any> {
-  const init: RequestInit = { method, headers: { "content-type": "application/json" } };
-  if (body !== undefined) init.body = JSON.stringify(body);
-  const res = await fetch(`${CONTROL}${path}`, init);
-  const parsed = await res.json();
-  return { status: res.status, body: parsed };
+  if (path.startsWith("/api/v1/enrol")) {
+    const init: RequestInit = { method, headers: { "content-type": "application/json" } };
+    if (body !== undefined) init.body = JSON.stringify(body);
+    const res = await fetch(`${CONTROL}${path}`, init);
+    return { status: res.status, body: await res.json().catch(() => ({})) };
+  }
+  return adminJson(method, path, body);
 }
 
 async function waitFor<T>(fn: () => Promise<T | null>, timeoutMs: number, what: string): Promise<T> {

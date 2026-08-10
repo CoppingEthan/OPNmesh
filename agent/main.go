@@ -104,7 +104,7 @@ func newClient(cfg AgentConfig) (*APIClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewAPIClient(cfg.ServerURL, token), nil
+	return NewAPIClient(cfg, token), nil
 }
 
 func runLoop(cfg AgentConfig, rec *Reconciler) {
@@ -138,7 +138,7 @@ func runLoop(cfg AgentConfig, rec *Reconciler) {
 	flowReporter := NewFlowReporter(cfg)
 	for {
 		settings := loadSettings(cfg.ConfDir)
-		metrics.Ensure(settings.MetricsPort)
+		metrics.Ensure(settings.MetricsBind, settings.MetricsPort)
 		client, err := newClient(cfg)
 		if err != nil {
 			// Token file missing/unreadable: nothing to do but wait; the

@@ -22,6 +22,13 @@ type AgentConfig struct {
 	CommitConfirmSec int `json:"commit_confirm_sec"`
 	// Boot watchdog window (§11 layer 6). 0 disables.
 	BootWatchdogSec int `json:"boot_watchdog_sec"`
+	// SHA-256 of the control node's certificate public key (SPKI), recorded at
+	// enrolment. Pinning means a private mesh needs no public CA and a
+	// mis-issued or swapped certificate is refused.
+	ServerPinSha256 string `json:"server_pin_sha256"`
+	// Escape hatch for an isolated lab/simulation: allows http:// and skips
+	// pinning. Never set this on a real network.
+	InsecureTransport bool `json:"insecure_transport"`
 }
 
 func defaultConfig() AgentConfig {
@@ -47,6 +54,12 @@ func LoadConfig(path string) (AgentConfig, error) {
 	}
 	if cfg.ServerURL == "" {
 		return cfg, fmt.Errorf("agent config: server_url is required")
+	}
+	// The node bearer token rides every request, so plaintext is refused
+	// unless the operator has explicitly marked this install as insecure.
+	if !strings.HasPrefix(cfg.ServerURL, "https://") && !cfg.InsecureTransport {
+		return cfg, fmt.Errorf(
+			"agent config: server_url must be https:// (set insecure_transport for an isolated lab only)")
 	}
 	if cfg.PollIntervalSec < 1 {
 		cfg.PollIntervalSec = 10

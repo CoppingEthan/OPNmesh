@@ -120,6 +120,14 @@ func execVersion(cfg AgentConfig, v string) error {
 // downloadAndVerify fetches a release through the authenticated API and
 // verifies sha256 + minisign signature + the release's own self-test.
 func downloadAndVerify(cfg AgentConfig, client *APIClient, instr UpdateInstruction) (string, error) {
+	// The version becomes a filesystem path and a symlink target, so it is
+	// validated before it is joined to anything.
+	if !safeVersion(instr.TargetVersion) {
+		return "", fmt.Errorf("refusing unsafe release version %q", instr.TargetVersion)
+	}
+	if len(instr.Sha256) != 64 {
+		return "", fmt.Errorf("release manifest has no usable sha256")
+	}
 	dir := filepath.Join(versionsDir(cfg), instr.TargetVersion)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err

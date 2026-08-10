@@ -27,6 +27,12 @@ export interface NodeMeta {
  */
 export interface AgentSettings {
   metrics_port: number;
+  /**
+   * Address the exporter binds. This is the node's own tunnel IP, so metrics
+   * are reachable over the mesh and nowhere else — never on the WAN, where
+   * they would publish peer public keys and traffic volumes to the internet.
+   */
+  metrics_bind: string;
   flows: boolean;
   flow_interval_sec: number;
   needs_reresolve: boolean;
@@ -53,6 +59,7 @@ export function generateAll(cfg: ResolvedConfig): GeneratedBundle {
     );
     const settings: AgentSettings = {
       metrics_port: s.gateway.metricsPort,
+      metrics_bind: s.gateway.tunnelIp,
       flows: s.gateway.flows,
       flow_interval_sec: 30,
       needs_reresolve: peerEndpointsAreHostnames,

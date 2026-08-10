@@ -31,14 +31,18 @@ function endpointOf(site: ResolvedSite): string | null {
   return `${site.gateway.endpoint}:${site.gateway.listenPort}`;
 }
 
-/** AllowedIPs another gateway lists for peer `p`, seen from gateway `g`. */
+/**
+ * AllowedIPs another gateway lists for peer `p`, seen from gateway `g`.
+ * Multi-VLAN sites contribute every advertised subnet; guest segments are
+ * absent from `advertised` and therefore never routable across the mesh.
+ */
 export function gatewayPeerAllowedIps(cfg: ResolvedConfig, g: ResolvedSite, p: ResolvedSite): string[] {
-  const ips: string[] = [`${p.gateway.tunnelIp}/32`, p.lan];
+  const ips: string[] = [`${p.gateway.tunnelIp}/32`, ...p.advertised];
   const transits = transitDestinationsVia(cfg, g.id, p.id)
     .map((id) => cfg.sites.find((s) => s.id === id)!)
     .sort((a, b) => compareIp(a.gateway.tunnelIp, b.gateway.tunnelIp));
   for (const t of transits) {
-    ips.push(`${t.gateway.tunnelIp}/32`, t.lan);
+    ips.push(`${t.gateway.tunnelIp}/32`, ...t.advertised);
   }
   const carried = cfg.clients
     .filter((c) => clientRouteFrom(cfg, g.id, c) === p.id)
@@ -120,11 +124,11 @@ export function generateClientConfig(cfg: ResolvedConfig, clientId: string): str
   // peers equally.
   for (const entryId of c.entryPoints) {
     const entry = cfg.sites.find((s) => s.id === entryId)!;
-    const ips: string[] = [`${entry.gateway.tunnelIp}/32`, entry.lan];
+    const ips: string[] = [`${entry.gateway.tunnelIp}/32`, ...entry.advertised];
     const carried = cfg.sites
       .filter((d) => d.id !== entryId && clientPathTo(cfg, c, d.id) === entryId)
       .sort((a, b) => compareIp(a.gateway.tunnelIp, b.gateway.tunnelIp));
-    for (const d of carried) ips.push(`${d.gateway.tunnelIp}/32`, d.lan);
+    for (const d of carried) ips.push(`${d.gateway.tunnelIp}/32`, ...d.advertised);
 
     lines.push("", "[Peer]", `# entry: ${entry.id}`, `PublicKey = ${entry.gateway.publicKey}`);
     const ep = endpointOf(entry);

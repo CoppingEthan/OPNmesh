@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,14 +17,18 @@ import (
 // file, so the control panel can retune the exporter and flow collection
 // without touching the agent binary or restarting anything.
 type AgentSettings struct {
-	MetricsPort     int  `json:"metrics_port"`
-	Flows           bool `json:"flows"`
-	FlowIntervalSec int  `json:"flow_interval_sec"`
-	NeedsReresolve  bool `json:"needs_reresolve"`
+	MetricsPort int `json:"metrics_port"`
+	// Bind address for the exporter. Empty means loopback only: the exporter
+	// publishes peer public keys and byte counters, so it must never default
+	// to every interface (which on a gateway includes the WAN).
+	MetricsBind     string `json:"metrics_bind"`
+	Flows           bool   `json:"flows"`
+	FlowIntervalSec int    `json:"flow_interval_sec"`
+	NeedsReresolve  bool   `json:"needs_reresolve"`
 }
 
 func defaultSettings() AgentSettings {
-	return AgentSettings{MetricsPort: 9586, Flows: false, FlowIntervalSec: 30}
+	return AgentSettings{MetricsPort: 9586, MetricsBind: "127.0.0.1", Flows: false, FlowIntervalSec: 30}
 }
 
 func loadSettings(confDir string) AgentSettings {
@@ -41,6 +46,9 @@ func loadSettings(confDir string) AgentSettings {
 	if s.FlowIntervalSec < 5 {
 		s.FlowIntervalSec = 30
 	}
+	if s.MetricsBind == "" {
+		s.MetricsBind = "127.0.0.1"
+	}
 	return s
 }
 
@@ -55,17 +63,20 @@ type MetricsServer struct {
 	mu     sync.Mutex
 	server *http.Server
 	port   int
+	bind   string
 }
 
 func NewMetricsServer(cfg AgentConfig, rec *Reconciler) *MetricsServer {
 	return &MetricsServer{cfg: cfg, rec: rec}
 }
 
-// Ensure (re)starts the listener if the configured port changed.
-func (m *MetricsServer) Ensure(port int) {
+// Ensure (re)starts the listener if the configured bind address or port
+// changed. Rebinding is normal: the tunnel address only exists once wg0 is up,
+// so the first attempts before the interface exists are expected to fail.
+func (m *MetricsServer) Ensure(bind string, port int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.server != nil && m.port == port {
+	if m.server != nil && m.port == port && m.bind == bind {
 		return
 	}
 	if m.server != nil {
@@ -74,15 +85,24 @@ func (m *MetricsServer) Ensure(port int) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", m.handleMetrics)
-	srv := &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: mux}
+	srv := &http.Server{Addr: net.JoinHostPort(bind, fmt.Sprint(port)), Handler: mux}
 	m.server = srv
 	m.port = port
+	m.bind = bind
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("metrics listener on :%d failed: %v", port, err)
+			// Retried on the next poll once the interface is up.
+			log.Printf("metrics listener on %s failed: %v", srv.Addr, err)
+			m.mu.Lock()
+			if m.server == srv {
+				m.server = nil
+				m.port = 0
+				m.bind = ""
+			}
+			m.mu.Unlock()
 		}
 	}()
-	log.Printf("metrics exporter listening on :%d", port)
+	log.Printf("metrics exporter listening on %s", srv.Addr)
 }
 
 func promEscape(s string) string {

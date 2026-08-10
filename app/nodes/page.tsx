@@ -2,6 +2,7 @@ import { revalidatePath } from "next/cache";
 import { requireAdmin } from "../../lib/ui/auth.js";
 import { loadSites, editSites } from "../../lib/ui/sites.js";
 import { control } from "../../lib/ui/control.js";
+import { stash, take } from "../../lib/ui/flash.js";
 import { HealthBadge, ago, healthOf } from "../ui.js";
 
 export const dynamic = "force-dynamic";
@@ -42,8 +43,11 @@ async function issueToken(formData: FormData) {
     String(formData.get("role") ?? "gateway"),
     String(formData.get("note") ?? ""),
   );
+  // The token is held server-side and shown once. Putting it in the URL would
+  // leak it into browser history, proxy logs and Referer headers.
+  const ref = stash({ token: res.token, sha: res.installShSha256, expiresAt: res.expiresAt });
   const { redirect } = await import("next/navigation");
-  redirect(`/nodes?token=${res.token}&sha=${res.installShSha256 ?? ""}`);
+  redirect(`/nodes?issued=${ref}`);
 }
 
 async function approveNode(formData: FormData) {
@@ -82,10 +86,11 @@ async function removeNode(formData: FormData) {
 export default async function NodesPage({
   searchParams,
 }: {
-  searchParams: Promise<{ token?: string; sha?: string }>;
+  searchParams: Promise<{ issued?: string }>;
 }) {
   await requireAdmin();
   const params = await searchParams;
+  const issued = take<{ token: string; sha: string | null; expiresAt: number }>(params.issued);
   const sites = loadSites();
   const [state, pending, rollout] = await Promise.all([
     control.state().catch(() => ({ nodes: {} as Record<string, any> })),
@@ -183,16 +188,20 @@ export default async function NodesPage({
           install command on the new node; it appears below as pending. Nothing gets configuration
           until you approve it.
         </p>
-        {params.token && (
+        {issued && (
           <div className="mt-3 rounded border border-emerald-900 bg-black/40 p-3">
-            <div className="label mb-1 text-emerald-400">One-time enrolment command (shown once)</div>
+            <div className="label mb-1 text-emerald-400">
+              Run this on the new machine — shown once, expires{" "}
+              {new Date(issued.expiresAt).toLocaleTimeString()}
+            </div>
             <pre className="conf">{`curl -fsSL https://<control-host>:<port>/install.sh | sudo bash -s -- \\
-  --token ${params.token} \\
+  --token ${issued.token} \\
   --server https://<control-host>:<port>`}</pre>
-            {params.sha && (
+            {issued.sha && (
               <p className="mono mt-2 text-xs text-zinc-500">
-                install.sh SHA-256: {params.sha} — verify before piping to a shell:
-                {" curl -fsSL …/install.sh | sha256sum"}
+                install.sh SHA-256: {issued.sha}
+                <br />
+                Verify before piping to a shell: curl -fsSL …/install.sh | sha256sum
               </p>
             )}
           </div>

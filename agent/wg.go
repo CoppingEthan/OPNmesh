@@ -11,7 +11,40 @@ import (
 )
 
 // ManagedFiles are the files the agent reconciles, relative to ConfDir.
+// This list is an allowlist, not documentation: anything the control node
+// names that is not here is refused (see isManagedFile).
 var ManagedFiles = []string{"wg0.conf", "nftables.conf", "sysctl.conf", "agent-settings.json"}
+
+// isManagedFile reports whether a server-supplied name may be written.
+func isManagedFile(name string) bool {
+	if name == "" || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
+		return false
+	}
+	for _, m := range ManagedFiles {
+		if name == m {
+			return true
+		}
+	}
+	return false
+}
+
+// safeVersion constrains a server-supplied release version before it is used
+// in any filesystem path.
+func safeVersion(v string) bool {
+	if v == "" || len(v) > 64 || strings.Contains(v, "..") {
+		return false
+	}
+	for i, r := range v {
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+		if i > 0 {
+			ok = ok || r == '.' || r == '_' || r == '-'
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
 
 func runCmd(name string, args ...string) (string, error) {
 	out, err := exec.Command(name, args...).CombinedOutput()

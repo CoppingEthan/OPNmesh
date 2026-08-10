@@ -10,10 +10,11 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
+import { adminFetch, CONTROL } from "./helpers.js";
+
 const enabled = process.env["RUN_MESH_TESTS"] === "1";
 const PROM = "http://localhost:19090";
 const MAILPIT = "http://localhost:18025";
-const CONTROL = "http://localhost:18080";
 const COMPOSE = "docker compose -f docker/docker-compose.yml";
 const SITES_PATH = join(process.cwd(), "docker", "state", "sites.yml");
 
@@ -108,9 +109,9 @@ describe.skipIf(!enabled)("observability (§13)", () => {
 
   it("tier 3: flows are off by default, centrally enabled, queryable, and purgeable", async () => {
     // Start from a clean store: earlier runs may have left records behind.
-    await fetch(`${CONTROL}/api/v1/admin/flows/purge`, { method: "POST" });
+    await adminFetch("/api/v1/admin/flows/purge", { method: "POST" });
     await sleep(2000);
-    const before = await fetch(`${CONTROL}/api/v1/flows/top?window=600`);
+    const before = await adminFetch("/api/v1/flows/top?window=600");
     // Flows are off (sites.yml default) — nothing new arrives after a purge.
     expect(((await before.json()) as any).top).toEqual([]);
 
@@ -122,7 +123,7 @@ describe.skipIf(!enabled)("observability (§13)", () => {
 
     const top = await waitFor(
       async () => {
-        const res = await fetch(`${CONTROL}/api/v1/flows/top?window=600&limit=50`);
+        const res = await adminFetch("/api/v1/flows/top?window=600&limit=50");
         const body = (await res.json()) as any;
         const heavy = body.top.filter((t: any) => t.src.startsWith("10.10.") && t.bytes > 0);
         return heavy.length > 0 ? body.top : null;
@@ -135,15 +136,15 @@ describe.skipIf(!enabled)("observability (§13)", () => {
 
     // Purge action (§13): flow logging records who talked to whom, so the
     // operator can wipe it.
-    await fetch(`${CONTROL}/api/v1/admin/flows/purge`, { method: "POST" });
-    const after = await fetch(`${CONTROL}/api/v1/flows/top?window=600`);
+    await adminFetch("/api/v1/admin/flows/purge", { method: "POST" });
+    const after = await adminFetch("/api/v1/flows/top?window=600");
     expect(((await after.json()) as any).top).toEqual([]);
   }, 180_000);
 
   it("dead-man's switch: control heartbeats an external endpoint and exposes success", async () => {
     await waitFor(
       async () => {
-        const res = await fetch(`${CONTROL}/metrics`);
+        const res = await adminFetch("/metrics");
         const text = await res.text();
         const m = text.match(/opnmesh_deadman_last_success_timestamp_seconds (\d+)/);
         return m && Number(m[1]) > 0 ? true : null;

@@ -12,8 +12,9 @@ import { execSync } from "node:child_process";
 import { cpSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { adminFetch, adminJson, adminToken, CONTROL } from "./helpers.js";
+
 const enabled = process.env["RUN_MESH_TESTS"] === "1";
-const CONTROL = "http://localhost:18080";
 const GATEWAYS = ["site-a", "site-b", "site-c"] as const;
 
 const sh = (cmd: string): string =>
@@ -21,22 +22,7 @@ const sh = (cmd: string): string =>
 const exec = (c: string, cmd: string): string => sh(`docker exec ${c} sh -c "${cmd.replace(/"/g, '\\"')}"`);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function api(method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> {
-  const init: RequestInit = { method, headers: { "content-type": "application/json" } };
-  if (body !== undefined) init.body = JSON.stringify(body);
-  // Retried: the dev control container can be mid-restart from another test.
-  let lastErr: unknown;
-  for (let i = 0; i < 5; i++) {
-    try {
-      const res = await fetch(`${CONTROL}${path}`, init);
-      return { status: res.status, body: await res.json().catch(() => ({})) };
-    } catch (e) {
-      lastErr = e;
-      await sleep(2000);
-    }
-  }
-  throw lastErr;
-}
+const api = adminJson;
 
 async function nodeVersions(): Promise<Record<string, string>> {
   const { body } = await api("GET", "/api/v1/state");
@@ -60,7 +46,8 @@ async function waitFor<T>(fn: () => Promise<T | null>, timeoutMs: number, what: 
 }
 
 function buildRelease(version: string, flags = ""): void {
-  sh(`npx tsx docker/build-release.ts --version ${version} ${flags}`);
+  // build-release registers the release through the management API.
+  sh(`npx cross-env OPNMESH_ADMIN_TOKEN=${adminToken()} npx tsx docker/build-release.ts --version ${version} ${flags}`);
 }
 
 async function auditEvents(): Promise<Array<{ ts: number; type: string; detail: string }>> {
@@ -284,7 +271,7 @@ describe.skipIf(!enabled)("auto-update (§11) and coordinated port changes (§6)
     // Data plane untouched throughout.
     expect(await pingOk("opnmesh-host-a", "10.30.5.20")).toBe(true);
 
-    const metrics = await (await fetch(`${CONTROL}/metrics`)).text();
+    const metrics = await (await adminFetch("/metrics")).text();
     expect(metrics).toMatch(/opnmesh_rollout_aborted 1/);
     expect(metrics).toMatch(/opnmesh_node_update_error\{node="site-a"\} 1/);
     const audit = await auditEvents();

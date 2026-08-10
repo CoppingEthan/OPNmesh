@@ -17,7 +17,7 @@
     "start": "next start",
     "ui:test": "next build && cross-env RUN_UI_TESTS=1 vitest run test/ui.test.ts --testTimeout 120000",
     "goldens:update": "cross-env UPDATE_GOLDENS=1 vitest run test/golden.test.ts",
-    "mesh:up": "tsx docker/genconfigs.ts && docker compose -f docker/docker-compose.yml build gw-a && docker compose -f docker/docker-compose.yml up -d",
+    "mesh:up": "tsx docker/genconfigs.ts && docker compose -f docker/docker-compose.yml build gw-a && docker compose -f docker/docker-compose.yml up -d && docker compose -f docker/docker-compose.yml up -d --force-recreate control",
     "mesh:down": "docker compose -f docker/docker-compose.yml --profile traffic --profile obs --profile enrol down -v",
     "mesh:obs": "docker compose -f docker/docker-compose.yml --profile obs up -d prometheus alertmanager grafana mailpit",
     "mesh:logs": "docker compose -f docker/docker-compose.yml logs -f",

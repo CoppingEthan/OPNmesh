@@ -2,7 +2,6 @@ import { revalidatePath } from "next/cache";
 import { requireAdmin } from "../../lib/ui/auth.js";
 import { loadSites, editSites } from "../../lib/ui/sites.js";
 import { control } from "../../lib/ui/control.js";
-import { CONTROL_URL } from "../../lib/ui/env.js";
 import { bytes, HandshakeAge } from "../ui.js";
 
 export const dynamic = "force-dynamic";
@@ -233,9 +232,11 @@ export default async function TrafficPage() {
                 <td className="mono">{c.node}</td>
                 <td>{c.status}</td>
                 <td className="mono">{c.sizeKb} KiB</td>
+                {/* Streamed through the authenticated UI, never fetched
+                    directly from the control API by the browser. */}
                 <td>
                   {c.status === "done" && (
-                    <a className="text-emerald-400 underline" href={`${CONTROL_URL}/api/v1/admin/captures/${c.id}.pcap`}>
+                    <a className="text-emerald-400 underline" href={`/api/captures/${c.id}.pcap`}>
                       pcap
                     </a>
                   )}

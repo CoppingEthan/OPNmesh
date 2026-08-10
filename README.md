@@ -24,9 +24,37 @@ Three deliberately independent layers:
    what is happening.
 
 Site-to-site, not per-host: each site has **one** gateway routing for the whole
-site subnet. Ordinary hosts, VMs, IPMI cards and appliances run no VPN software
-and never have their default gateway changed — they keep talking to their site
+site. Ordinary hosts, VMs, IPMI cards and appliances run no VPN software and
+never have their default gateway changed — they keep talking to their site
 router, which routes the mesh subnets to the gateway.
+
+## Sites with more than one network (VLANs)
+
+A site can have one flat subnet or many VLANs. List each segment and give it a
+role:
+
+```yaml
+sites:
+  - id: head-office
+    name: Head Office
+    lans:
+      - { cidr: 10.10.10.0/24, name: Staff,      vlan: 10 }
+      - { cidr: 10.10.20.0/24, name: Voice,      vlan: 20 }
+      - { cidr: 10.10.99.0/24, name: Management, vlan: 99, role: management }
+      - { cidr: 192.168.1.0/24, name: Guest Wi-Fi, vlan: 90, role: guest }
+  - id: branch
+    name: Branch
+    lan: 10.20.0.0/16          # single flat network — shorthand
+```
+
+| Role | Behaviour |
+|---|---|
+| `standard` (default) | Reachable from every other site. |
+| `management` | Reachable **only** from `policy.management.admin_sources`, and never allowed to start connections across the mesh. Added to the ACL set automatically. |
+| `guest` | Never carried across the mesh in either direction. No peer routes it, and the gateway drops it — so guest ranges may safely overlap between sites. |
+
+OPNmesh never configures switches; `vlan` is documentation that appears in the
+router instructions so whoever wires it up knows which segment is which.
 
 ## What's in the box
 
@@ -35,7 +63,7 @@ router, which routes the mesh subnets to the gateway.
 | Config schema, generators, validators | `lib/` (schema, topology, generator, validators, diff, flows, update) |
 | On-node agent (Go) | `agent/` — pull loop, reconcile, port pre-flight, commit-confirm, A/B install, boot watchdog, flow + capture, rollback CLI |
 | Admin UI (Next.js) | `app/` — dashboard, nodes, clients, traffic, config, routes, updates, alerts, settings |
-| Control API (dev/sim server; production semantics) | `scripts/control-dev.ts` |
+| Control API (dev/sim server; production semantics) | `scripts/control-server.ts` |
 | Simulation mesh | `docker/` — compose harness, config/release builders, chaos |
 | Deployment | `deploy/` — control-node compose, agent systemd units, `install.sh`, Prometheus/Alertmanager/Grafana |
 | Optional relay | `relay/` |
@@ -191,16 +219,55 @@ Manual escape hatch on every node: `opnmesh-agent rollback` (config) and
 
 Private keys never enter either repository, the database, or any log line.
 
-## Security decisions (v1)
+## Security
 
-- **UI auth**: single local admin, argon2id hash, server-side sessions in
-  SQLite, idle + absolute timeouts, rate-limited login.
-- **Agent credentials**: per-node 256-bit bearer token, issued at approval,
-  stored root-only, only its hash kept server-side, all traffic over HTTPS.
-- **Releases**: minisign (Ed25519) detached signatures, verified offline;
-  SHA-256 as a secondary check.
+The control node holds the keys to every site, and the agent runs as root on
+every gateway, so the trust boundaries are explicit.
+
+**Three credential tiers, never interchangeable.**
+
+| Tier | Covers | Held by |
+|---|---|---|
+| Public | `/install.sh`, `POST /api/v1/enrol` (rate limited, gated by a single-use short-TTL token) | anyone who can reach the port |
+| Node | `/api/v1/agent/*` | one 256-bit bearer token per node, issued at approval, stored root-only; only its hash is kept server-side |
+| Admin | `/api/v1/admin/*`, `/api/v1/state`, `/api/v1/flows/*`, `/metrics` | the UI only, via `OPNMESH_ADMIN_TOKEN` |
+
+- **TLS is mandatory.** The control server refuses to start without a
+  certificate unless you explicitly set `OPNMESH_ALLOW_INSECURE_HTTP=1` for an
+  isolated lab. `install.sh` records the control node's certificate public key
+  and the agent **pins** it, so a private mesh needs no public CA and a swapped
+  certificate is refused.
+- **The agent does not trust the control node with paths or commands.** It
+  writes only its own known filenames (no traversal), validates release
+  versions before they touch a path, and refuses any packet-capture filter
+  containing a `-` token — tcpdump would read that as an option, and `-z` runs
+  a command as root.
+- **UI auth**: one local admin, argon2id, server-side sessions stored *hashed*,
+  idle + absolute timeouts, per-source login throttling that only counts
+  failures (so nobody can lock you out of your own panel), and a one-time
+  bootstrap token for first-run setup printed to the server log.
+- **Exporters bind to the tunnel address only.** Prometheus scrapes gateways
+  over the mesh; the metrics port is not reachable from the WAN.
+- **No secrets in URLs.** Enrolment tokens are shown once from a server-side
+  store; pcaps stream through the authenticated UI, not the raw API.
+- **Releases**: minisign (Ed25519) detached signatures, verified offline before
+  anything is switched; SHA-256 as a secondary check.
 - **Agent language**: Go — one static binary, trivial A/B installs, no runtime
   on gateways.
+
+`test/integration/security.test.ts` asserts these against the running server so
+a refactor cannot quietly reopen one.
+
+### Before you deploy on a real network
+
+1. Generate an admin token: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` → `OPNMESH_ADMIN_TOKEN`.
+2. Put a real certificate and key in `deploy/control-node/tls/`.
+3. Set `OPNMESH_GRAFANA_PASSWORD` (Grafana ships with no default password set,
+   and the compose file refuses to start without it).
+4. Prometheus, Alertmanager and Grafana bind to **loopback only** — reach them
+   over an SSH tunnel, not from the LAN.
+5. Ship your minisign public key to nodes as `/etc/opnmesh/minisign.pub`;
+   without it, agents refuse all self-updates (fail closed).
 
 ## Development
 
@@ -208,9 +275,10 @@ Stack: Next.js (App Router) + TypeScript + Tailwind, Node 22, `yaml`,
 `simple-git`, `better-sqlite3`; agent in Go; Vitest for unit tests.
 
 ```bash
-npm test          # unit tests (schema, topology, generators, validators, flows, rollout, isolation)
+npm test          # unit tests (schema, topology, generators, validators, VLANs, flows, rollout, isolation)
 npm run typecheck
 npm run ui:test   # build + smoke-test the UI
+npm run mesh:test # live integration suite, including security regressions
 ```
 
 Golden config output lives in `test/golden/`; regenerate deliberately with

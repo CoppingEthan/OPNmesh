@@ -1,6 +1,11 @@
 # OPNmesh Prometheus configuration.
-# Targets are generated per deployment; the simulation mounts a copy with the
-# sim addresses. Ports come from configuration, never hardcoded defaults.
+#
+# Gateways are scraped over the MESH at their tunnel addresses, never at their
+# WAN addresses: the exporter publishes peer public keys and traffic volumes,
+# and binds to the tunnel IP only. The control target requires the admin
+# credential, supplied from a file mounted alongside this config.
+#
+# Targets are per deployment; the simulation writes its own copy of this file.
 global:
   scrape_interval: 10s
   evaluation_interval: 10s
@@ -16,19 +21,16 @@ alerting:
 scrape_configs:
   - job_name: gateways
     static_configs:
-      - targets:
-          - "198.51.100.10:9586"
-        labels:
-          node: site-a
-      - targets:
-          - "198.51.100.20:9586"
-        labels:
-          node: site-b
-      - targets:
-          - "198.51.100.30:9586"
-        labels:
-          node: site-c
+      - targets: ["10.99.0.1:9586"]
+        labels: { node: site-a }
+      - targets: ["10.99.0.2:9586"]
+        labels: { node: site-b }
+      - targets: ["10.99.0.3:9586"]
+        labels: { node: site-c }
 
   - job_name: control
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/admin.token
     static_configs:
-      - targets: ["198.51.100.50:8080"]
+      - targets: ["control:8080"]

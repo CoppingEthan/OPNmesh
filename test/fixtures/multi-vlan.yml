@@ -1,0 +1,79 @@
+# A realistic mixed deployment: one office with several VLANs, one small site
+# with a single flat subnet, and one site with a guest network that must never
+# reach the mesh.
+version: 1
+network:
+  name: multi-vlan
+sites:
+  - id: site-a
+    name: Head Office
+    lans:
+      - cidr: 10.10.10.0/24
+        name: Staff
+        vlan: 10
+      - cidr: 10.10.20.0/24
+        name: Voice
+        vlan: 20
+      - cidr: 10.10.30.0/24
+        name: CCTV
+        vlan: 30
+      - cidr: 10.10.99.0/24
+        name: Management
+        vlan: 99
+        role: management
+      - cidr: 192.168.1.0/24
+        name: Guest Wi-Fi
+        vlan: 90
+        role: guest
+    gateway:
+      name: Head Office Gateway
+      lan_ip: 10.10.10.2
+      tunnel_ip: 10.99.0.1
+      endpoint: 198.51.100.10
+      public_key: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=
+  - id: site-b
+    name: Branch
+    # Single flat network — the shorthand form.
+    lan: 10.20.0.0/16
+    gateway:
+      name: Branch Gateway
+      lan_ip: 10.20.0.2
+      tunnel_ip: 10.99.0.2
+      endpoint: 198.51.100.20
+      public_key: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=
+  - id: site-c
+    name: Warehouse
+    lans:
+      - cidr: 10.30.10.0/24
+        name: Office
+        vlan: 10
+      - cidr: 10.30.40.0/24
+        name: Scanners
+        vlan: 40
+      - cidr: 10.30.99.0/24
+        name: Management
+        vlan: 99
+        role: management
+      # Deliberately the same guest range as site-a: guest networks are never
+      # routed, so overlapping them across sites is fine.
+      - cidr: 192.168.1.0/24
+        name: Guest Wi-Fi
+        vlan: 90
+        role: guest
+    gateway:
+      name: Warehouse Gateway
+      lan_ip: 10.30.10.2
+      tunnel_ip: 10.99.0.3
+      endpoint: 198.51.100.30
+      public_key: ccccccccccccccccccccccccccccccccccccccccccc=
+clients:
+  - id: laptop
+    name: Field Laptop
+    tunnel_ip: 10.99.1.10
+    public_key: ddddddddddddddddddddddddddddddddddddddddddd=
+    home_site: site-b
+policy:
+  management:
+    # Only the IT subnet may reach any management network.
+    admin_sources:
+      - 10.10.10.0/24

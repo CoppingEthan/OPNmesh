@@ -1,32 +1,25 @@
 /**
- * Development control server: the agent-facing pull API plus enrolment,
- * backed by sites.yml + registry.json on disk. Used by the compose simulation
- * (bundled into docker/state/control/server.mjs) and for local development.
- * The production control node mounts these same semantics inside the Next.js
- * app later; the admin endpoints here correspond to what become
- * session-authenticated Server Actions.
+ * OPNmesh control server: the agent-facing pull API, enrolment, and the
+ * management API the UI drives. Backed by sites.yml + registry.json on disk.
  *
- * Agent-facing:
- *   GET  /api/v1/agent/config    Bearer-auth'd; node files + hash; ETag/304.
- *                                403 {status:"pending"} until approved.
- *   POST /api/v1/agent/report    Bearer-auth'd status ingest.
- *   POST /api/v1/enrol           one-time-token enrolment (public endpoint).
- *   GET  /install.sh             the installer, with its SHA-256 in a header.
+ * Authentication — three tiers, never interchangeable:
+ *   PUBLIC   /install.sh, POST /api/v1/enrol (rate limited; enrolment is
+ *            gated by a single-use, short-TTL, role-bound token)
+ *   NODE     /api/v1/agent/*  — per-node bearer token issued at approval
+ *   ADMIN    /api/v1/admin/*, /api/v1/state, /api/v1/flows/*, /metrics —
+ *            the admin bearer token (OPNMESH_ADMIN_TOKEN), held only by the UI
  *
- * Dev/admin (unauthenticated here; session-auth in the real app):
- *   GET  /api/v1/state           node status summary.
- *   POST /api/v1/admin/enrol-tokens {role, note, ttlMs?} → {token, expiresAt}
- *   GET  /api/v1/admin/pending
- *   POST /api/v1/admin/approve  {pendingId, site:{...sites.yml site entry, public_key omitted}}
- *   POST /api/v1/admin/reject   {pendingId}
- *   POST /api/v1/admin/remove   {siteId}   (decommission binding + site)
+ * Transport: HTTPS whenever OPNMESH_TLS_CERT/OPNMESH_TLS_KEY are set (required
+ * in production; the server refuses to start over plain HTTP unless
+ * OPNMESH_ALLOW_INSECURE_HTTP=1, which exists for the local simulation only).
  *
  * The control node never dials out to nodes. Agents pull.
  */
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { createHash } from "node:crypto";
+import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
+import { createHash, randomBytes } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { loadSitesYaml } from "../lib/schema.js";
 import { generateAll } from "../lib/generator/index.js";
@@ -53,9 +46,44 @@ import {
   type NodeReportView,
 } from "../lib/update/rollout.js";
 import { runValidators } from "../lib/validators/index.js";
+import { AdminAuth, RateLimiter, bearerToken as parseBearer } from "../lib/control/auth.js";
+import * as S from "../lib/control/schemas.js";
 
 const STATE_DIR = process.env["STATE_DIR"] ?? "docker/state";
 const PORT = Number(process.env["PORT"] ?? 8080);
+/** Bind address. Defaults to all interfaces because agents must reach it. */
+const BIND = process.env["OPNMESH_BIND"] ?? "0.0.0.0";
+const TLS_CERT = process.env["OPNMESH_TLS_CERT"] ?? "";
+const TLS_KEY = process.env["OPNMESH_TLS_KEY"] ?? "";
+const ALLOW_INSECURE_HTTP = process.env["OPNMESH_ALLOW_INSECURE_HTTP"] === "1";
+
+/**
+ * Admin credential for the management API. Required — no default, no bypass.
+ * Prefer a file (kept out of the process environment and `docker inspect`)
+ * and fall back to the variable.
+ */
+function adminTokenFromEnv(): string | undefined {
+  const file = process.env["OPNMESH_ADMIN_TOKEN_FILE"];
+  if (file && existsSync(file)) return readFileSync(file, "utf8").trim();
+  return process.env["OPNMESH_ADMIN_TOKEN"];
+}
+const adminAuth = new AdminAuth(adminTokenFromEnv);
+
+/** Enrolment is public, so it is the one endpoint an attacker can hammer. */
+const enrolLimiter = new RateLimiter(10, 15 * 60 * 1000);
+/** Blunt backstop against unauthenticated flooding of everything else. */
+const publicLimiter = new RateLimiter(300, 60 * 1000);
+setInterval(() => {
+  enrolLimiter.sweep();
+  publicLimiter.sweep();
+}, 60_000).unref();
+
+const MAX_BODY_BYTES = 1 << 20; // 1 MiB for JSON endpoints
+const MAX_CAPTURE_BYTES = 12 << 20; // capture uploads are capped again per job
+
+function clientIp(req: IncomingMessage): string {
+  return req.socket.remoteAddress ?? "unknown";
+}
 /** Dead-man's switch (§10): heartbeat to an external endpoint so the control node's own death is noticed. */
 const DEADMAN_URL = process.env["OPNMESH_DEADMAN_URL"] ?? "";
 const DEADMAN_INTERVAL_MS = Number(process.env["OPNMESH_DEADMAN_INTERVAL_MS"] ?? 60_000);
@@ -70,10 +98,90 @@ interface NodeStatus {
   diskHash: string;
   lastError: string;
   lastUpdateError: string;
-  peers: Array<{ publicKey?: string; latestHandshake?: number }>;
+  peers: Array<{ publicKey?: string; latestHandshake?: number; rxBytes?: number; txBytes?: number }>;
 }
 
 const reports = new Map<string, NodeStatus>();
+
+/**
+ * Live per-tunnel throughput, derived by differencing successive agent
+ * reports. It lives here rather than in the UI because the control server is
+ * the one long-lived process that sees every report — the UI may be restarted,
+ * scaled out, or (in dev) re-evaluated per request, none of which should lose
+ * the baseline needed to turn cumulative counters into a rate.
+ *
+ * Keyed "a|b" with the ids sorted, so both ends agree on direction.
+ */
+interface RateSample {
+  at: number;
+  totals: Map<string, { aToB: number; bToA: number }>;
+}
+let rateSample: RateSample | null = null;
+let currentRates = new Map<string, { aToB: number; bToA: number }>();
+
+function sortedPair(a: string, b: string): string {
+  return [a, b].sort().join("|");
+}
+
+/** Cumulative bytes per link, normalised to "lower id → higher id". */
+function peerTotals(): Map<string, { aToB: number; bToA: number }> {
+  const cfg = loadSitesYaml(readFileSync(SITES_PATH, "utf8"));
+  const keyToId = new Map<string, string>([
+    ...cfg.sites.map((s) => [s.gateway.publicKey, s.id] as const),
+    ...cfg.clients.map((c) => [c.publicKey, c.id] as const),
+  ]);
+  const totals = new Map<string, { aToB: number; bToA: number }>();
+  for (const [nodeId, status] of reports) {
+    for (const peer of status.peers) {
+      const peerId = peer.publicKey ? keyToId.get(peer.publicKey) : undefined;
+      if (!peerId) continue;
+      const key = sortedPair(nodeId, peerId);
+      const fromLow = key.split("|")[0] === nodeId;
+      const rx = Number(peer.rxBytes ?? 0);
+      const tx = Number(peer.txBytes ?? 0);
+      const aToB = fromLow ? tx : rx;
+      const bToA = fromLow ? rx : tx;
+      const existing = totals.get(key);
+      // Both ends count the same tunnel; take the higher (fresher) reading.
+      totals.set(
+        key,
+        existing
+          ? { aToB: Math.max(existing.aToB, aToB), bToA: Math.max(existing.bToA, bToA) }
+          : { aToB, bToA },
+      );
+    }
+  }
+  return totals;
+}
+
+function sampleRates(): void {
+  let totals: Map<string, { aToB: number; bToA: number }>;
+  try {
+    totals = peerTotals();
+  } catch {
+    return; // sites.yml mid-write; try again next tick
+  }
+  const now = Date.now();
+  if (rateSample) {
+    const elapsed = (now - rateSample.at) / 1000;
+    if (elapsed >= 1 && elapsed <= 120) {
+      const rates = new Map<string, { aToB: number; bToA: number }>();
+      for (const [key, current] of totals) {
+        const before = rateSample.totals.get(key);
+        if (!before) continue;
+        // A negative delta means the interface was recreated, not negative traffic.
+        rates.set(key, {
+          aToB: Math.max(0, current.aToB - before.aToB) / elapsed,
+          bToA: Math.max(0, current.bToA - before.bToA) / elapsed,
+        });
+      }
+      currentRates = rates;
+    }
+  }
+  rateSample = { at: now, totals };
+}
+setInterval(sampleRates, 5000).unref();
+
 const flowStore = new JsonlFlowStore(join(STATE_DIR, "control", "flows.jsonl"));
 let deadmanLastSuccess = 0;
 
@@ -332,25 +440,83 @@ function desiredFor(nodeId: string): { files: Record<string, string>; hash: stri
 }
 
 function bearerToken(req: IncomingMessage): string | null {
-  const header = req.headers.authorization ?? "";
-  return header.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : null;
+  return parseBearer(req.headers.authorization);
 }
 
 function json(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  res.writeHead(status, { "content-type": "application/json", ...headers });
+  res.writeHead(status, {
+    "content-type": "application/json",
+    // These endpoints are an API, never a browser surface.
+    "x-content-type-options": "nosniff",
+    "cache-control": "no-store",
+    ...headers,
+  });
   res.end(JSON.stringify(body));
 }
 
-async function readBody(req: IncomingMessage): Promise<any> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk as Buffer);
-  const text = Buffer.concat(chunks).toString("utf8");
-  return text ? JSON.parse(text) : {};
+class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
 }
 
-const server = createServer(async (req, res) => {
+/** Read a JSON body with a hard size cap; oversized requests kill the socket. */
+async function readBody(req: IncomingMessage, limit = MAX_BODY_BYTES): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > limit) {
+      req.destroy();
+      throw new HttpError(413, "request body too large");
+    }
+    chunks.push(chunk as Buffer);
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new HttpError(400, "malformed JSON body");
+  }
+}
+
+/** Parse + validate a body against a schema, or throw a 400. */
+async function body<T>(req: IncomingMessage, schema: { parse: (v: unknown) => T }, limit?: number): Promise<T> {
+  const raw = await readBody(req, limit);
+  try {
+    return schema.parse(raw);
+  } catch (e) {
+    const issues =
+      e && typeof e === "object" && "issues" in e
+        ? (e as { issues: Array<{ path: unknown[]; message: string }> }).issues
+            .map((i) => `${i.path.join(".") || "body"}: ${i.message}`)
+            .join("; ")
+        : "invalid request body";
+    throw new HttpError(400, issues);
+  }
+}
+
+/**
+ * Gate for the management API. Everything under /api/v1/admin, plus the state,
+ * flow and metrics views, requires the admin credential — these endpoints can
+ * reconfigure the entire mesh and expose full topology and packet captures.
+ */
+function requireAdmin(req: IncomingMessage, res: ServerResponse): boolean {
+  if (adminAuth.verify(req.headers.authorization)) return true;
+  json(res, 401, { error: "unauthorized" });
+  return false;
+}
+
+const handler = async (req: IncomingMessage, res: ServerResponse) => {
   try {
     const url = req.url ?? "/";
+    if (!publicLimiter.allow(clientIp(req))) {
+      return json(res, 429, { error: "too many requests" });
+    }
 
     if (req.method === "GET" && url === "/api/v1/agent/config") {
       const token = bearerToken(req);
@@ -372,36 +538,36 @@ const server = createServer(async (req, res) => {
       if (!token) return json(res, 401, { error: "unauthorized" });
       const auth = authenticate(loadRegistry(), token);
       if (auth.status !== "active") return json(res, 401, { error: "unauthorized" });
-      const body = await readBody(req);
+      const report = await body(req, S.agentReportSchema);
+      const hadNone = reports.size === 0;
       reports.set(auth.siteId, {
         lastSeen: Date.now(),
-        version: String(body.version ?? ""),
-        appliedHash: String(body.appliedHash ?? ""),
-        diskHash: String(body.diskHash ?? ""),
-        lastError: String(body.lastError ?? ""),
-        lastUpdateError: String(body.lastUpdateError ?? ""),
-        peers: Array.isArray(body.peers) ? body.peers : [],
+        version: report.version,
+        appliedHash: report.appliedHash,
+        diskHash: report.diskHash,
+        lastError: report.lastError,
+        lastUpdateError: report.lastUpdateError,
+        peers: report.peers,
       });
+      // Establish the rate baseline as soon as the first report lands.
+      if (hadNone) sampleRates();
       tickRollout();
       return json(res, 200, { ok: true });
     }
 
     if (req.method === "POST" && url === "/api/v1/enrol") {
-      const body = await readBody(req);
+      // Public endpoint: rate limited per source so enrolment tokens cannot be
+      // guessed, and validated before it reaches the registry.
+      if (!enrolLimiter.allow(clientIp(req))) {
+        return json(res, 429, { error: "too many enrolment attempts" });
+      }
+      const request = await body(req, S.enrolRequestSchema);
       const reg = loadRegistry();
-      const result = enrol(
-        reg,
-        {
-          token: String(body.token ?? ""),
-          publicKey: String(body.publicKey ?? ""),
-          hostname: String(body.hostname ?? ""),
-          addresses: Array.isArray(body.addresses) ? body.addresses.map(String) : [],
-        },
-        Date.now(),
-      );
+      const result = enrol(reg, request, Date.now());
       if (!result.ok) return json(res, 400, { error: result.reason });
       saveRegistry(reg);
-      console.log(`enrol: pending node ${result.pendingId} (${body.hostname})`);
+      // Log the pending id only — never the node token.
+      console.log(`enrol: pending node ${result.pendingId} from ${clientIp(req)}`);
       return json(res, 200, { status: "pending", nodeToken: result.nodeToken, pendingId: result.pendingId });
     }
 
@@ -443,9 +609,11 @@ const server = createServer(async (req, res) => {
       if (!token) return json(res, 401, { error: "unauthorized" });
       const auth = authenticate(loadRegistry(), token);
       if (auth.status !== "active") return json(res, 401, { error: "unauthorized" });
-      const rel = url.slice("/api/v1/agent/release/".length);
-      const m = rel.match(/^([A-Za-z0-9._-]+)\/(opnmesh-agent(?:\.minisig)?)$/);
-      if (!m) return json(res, 400, { error: "bad release path" });
+      const rel = url.slice("/api/v1/agent/release/".length).split("?")[0]!;
+      // Version must not be a traversal segment; the leading character rules
+      // out "." and ".." outright.
+      const m = rel.match(/^([A-Za-z0-9][A-Za-z0-9._-]{0,63})\/(opnmesh-agent(?:\.minisig)?)$/);
+      if (!m || m[1]!.includes("..")) return json(res, 400, { error: "bad release path" });
       const filePath = join(RELEASES_DIR, m[1]!, m[2]!);
       if (!existsSync(filePath)) return json(res, 404, { error: "no such release file" });
       res.writeHead(200, { "content-type": "application/octet-stream" });
@@ -457,37 +625,46 @@ const server = createServer(async (req, res) => {
       if (!token) return json(res, 401, { error: "unauthorized" });
       const auth = authenticate(loadRegistry(), token);
       if (auth.status !== "active") return json(res, 401, { error: "unauthorized" });
-      const body = await readBody(req);
-      const flows = Array.isArray(body.flows) ? body.flows : [];
+      const payload = await body(req, S.agentFlowsSchema);
+      const now = Math.floor(Date.now() / 1000);
       flowStore.ingest(
-        flows.map((f: any) => ({
+        payload.flows.map((f) => ({
           node: auth.siteId,
-          proto: String(f.proto ?? ""),
-          src: String(f.src ?? ""),
-          dst: String(f.dst ?? ""),
-          dstPort: Number(f.dstPort ?? 0),
-          bytes: Number(f.bytes ?? 0),
-          packets: Number(f.packets ?? 0),
-          reported: Number(f.reported ?? Math.floor(Date.now() / 1000)),
+          proto: f.proto,
+          src: f.src,
+          dst: f.dst,
+          dstPort: f.dstPort,
+          bytes: f.bytes,
+          packets: f.packets,
+          reported: f.reported ?? now,
         })),
       );
       return json(res, 200, { ok: true });
     }
 
     if (req.method === "GET" && url.startsWith("/api/v1/flows/top")) {
+      if (!requireAdmin(req, res)) return;
       const params = new URL(url, "http://x").searchParams;
-      const windowSec = Number(params.get("window") ?? 3600);
-      const limit = Number(params.get("limit") ?? 20);
-      const since = Math.floor(Date.now() / 1000) - windowSec;
-      return json(res, 200, { top: flowStore.topTalkers(since, limit) });
+      const q = S.flowQuerySchema.safeParse({
+        window: Number(params.get("window") ?? 3600),
+        limit: Number(params.get("limit") ?? 30),
+      });
+      if (!q.success) return json(res, 400, { error: "invalid query" });
+      const since = Math.floor(Date.now() / 1000) - q.data.window;
+      return json(res, 200, { top: flowStore.topTalkers(since, q.data.limit) });
     }
 
     if (req.method === "POST" && url === "/api/v1/admin/flows/purge") {
+      if (!requireAdmin(req, res)) return;
       flowStore.purge();
+      appendAudit("flows:purged", "all per-host flow records deleted");
       return json(res, 200, { ok: true });
     }
 
     if (req.method === "GET" && url === "/metrics") {
+      // Telemetry exposes topology and node health: admin credential required
+      // (Prometheus scrapes it with authorization.credentials_file).
+      if (!requireAdmin(req, res)) return;
       // Control-side metrics: node convergence, enrolment queue, dead-man.
       const reg = loadRegistry();
       const lines: string[] = [
@@ -536,6 +713,8 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url === "/api/v1/state") {
+      // Full topology, public keys, peer endpoints and handshake state.
+      if (!requireAdmin(req, res)) return;
       const reg = loadRegistry();
       const out: Record<string, unknown> = {};
       for (const siteId of Object.keys(reg.bindings)) {
@@ -553,19 +732,25 @@ const server = createServer(async (req, res) => {
           peers: report?.peers ?? [],
         };
       }
-      return json(res, 200, { nodes: out });
+      // Live per-link byte rates, so the dashboard diagram can show direction
+      // and volume without every client keeping its own counter baseline.
+      const rates: Record<string, { aToB: number; bToA: number }> = {};
+      for (const [key, value] of currentRates) rates[key] = value;
+      return json(res, 200, { nodes: out, rates });
     }
 
-    // --- dev/admin endpoints (session-authenticated Server Actions in the real app) ---
+    // --- management API: every route below requires the admin credential ---
+
+    if (url.startsWith("/api/v1/admin/") && !requireAdmin(req, res)) return;
 
     if (req.method === "POST" && url === "/api/v1/admin/enrol-tokens") {
-      const body = await readBody(req);
+      const request = await body(req, S.issueTokenSchema);
       const reg = loadRegistry();
-      const role = (body.role ?? "gateway") as NodeRole;
-      const ttl = typeof body.ttlMs === "number" ? body.ttlMs : undefined;
-      const token = issueEnrolToken(reg, role, String(body.note ?? ""), Date.now(), ttl);
+      const role = request.role as NodeRole;
+      const token = issueEnrolToken(reg, role, request.note, Date.now(), request.ttlMs);
       saveRegistry(reg);
       const script = existsSync(INSTALL_SH_PATH) ? readFileSync(INSTALL_SH_PATH) : null;
+      appendAudit("enrol:token-issued", `role=${role} note=${request.note}`);
       return json(res, 200, {
         token,
         role,
@@ -590,37 +775,40 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url === "/api/v1/admin/approve") {
-      const body = await readBody(req);
+      const request = await body(req, S.approveSchema);
       const reg = loadRegistry();
-      const site = body.site;
-      if (!site?.id) return json(res, 400, { error: "site entry required" });
-      const node = approve(reg, String(body.pendingId), String(site.id));
+      const site = request.site;
+      const node = approve(reg, request.pendingId, site.id);
       // Approval and topology entry are one operation: the site joins
-      // sites.yml with the key the node itself reported.
+      // sites.yml with the key the node itself reported. The schema above is
+      // a strict allowlist — no caller-supplied field can reach the generated
+      // config except the ones listed there (notably NOT private_key_path,
+      // which would land in a PostUp command line).
       const doc = parseYaml(readFileSync(SITES_PATH, "utf8"));
       doc.sites.push({ ...site, gateway: { ...site.gateway, public_key: node.publicKey } });
       // Validate before persisting; a bad approval must not corrupt truth.
       loadSitesYaml(stringifyYaml(doc));
       writeFileSync(SITES_PATH, stringifyYaml(doc), "utf8");
       saveRegistry(reg);
-      console.log(`approve: ${node.id} bound to ${site.id}`);
+      appendAudit("enrol:approved", `${node.hostname} bound to ${site.id}`);
       return json(res, 200, { ok: true, siteId: site.id });
     }
 
     if (req.method === "POST" && url === "/api/v1/admin/reject") {
-      const body = await readBody(req);
+      const request = await body(req, S.pendingIdSchema);
       const reg = loadRegistry();
-      rejectPending(reg, String(body.pendingId));
+      rejectPending(reg, request.pendingId);
       saveRegistry(reg);
+      appendAudit("enrol:rejected", request.pendingId);
       return json(res, 200, { ok: true });
     }
 
     if (req.method === "POST" && url === "/api/v1/admin/releases") {
-      const body = await readBody(req);
+      const request = await body(req, S.registerReleaseSchema);
       const manifest: ReleaseManifest = {
-        version: String(body.version),
-        sha256: String(body.sha256),
-        configDigest: body.configDigest === undefined ? null : body.configDigest,
+        version: request.version,
+        sha256: request.sha256,
+        configDigest: request.configDigest ?? null,
       };
       const dir = join(RELEASES_DIR, manifest.version);
       if (!existsSync(join(dir, "opnmesh-agent"))) {
@@ -632,8 +820,8 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url === "/api/v1/admin/rollout") {
-      const body = await readBody(req);
-      const version = String(body.version);
+      const request = await body(req, S.startRolloutSchema);
+      const version = request.version;
       const manifest = manifestFor(version);
       if (!manifest) return json(res, 400, { error: `unknown release ${version}` });
 
@@ -644,7 +832,7 @@ const server = createServer(async (req, res) => {
       if (
         manifest.configDigest != null &&
         manifest.configDigest !== currentConfigDigest() &&
-        body.approveConfigChange !== true
+        request.approveConfigChange !== true
       ) {
         appendAudit("rollout:blocked", `${version}: generated config would change; approval required`);
         return json(res, 409, {
@@ -657,9 +845,9 @@ const server = createServer(async (req, res) => {
       const rollout = planRollout(
         cfg,
         version,
-        String(body.canary ?? cfg.sites[0]!.id),
-        Number(body.soakSec ?? 1800),
-        Number(body.failTimeoutSec ?? 300),
+        request.canary ?? cfg.sites[0]!.id,
+        request.soakSec ?? 1800,
+        request.failTimeoutSec ?? 300,
         Date.now(),
       );
       rolloutAborted = 0;
@@ -684,27 +872,27 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url === "/api/v1/admin/freeze") {
-      const body = await readBody(req);
+      const request = await body(req, S.freezeSchema);
       const settings = loadSettings();
-      settings.frozen = body.frozen === true;
+      settings.frozen = request.frozen;
       saveSettings(settings);
       appendAudit("freeze", settings.frozen ? "global freeze ON (immediate, incl. mid-rollout)" : "global freeze off");
       return json(res, 200, settings);
     }
 
     if (req.method === "POST" && url === "/api/v1/admin/pin") {
-      const body = await readBody(req);
+      const request = await body(req, S.pinSchema);
       const settings = loadSettings();
-      settings.pinned[String(body.siteId)] = body.pinned === true;
+      settings.pinned[request.siteId] = request.pinned;
       saveSettings(settings);
-      appendAudit("pin", `${body.siteId} pinned=${body.pinned === true}`);
+      appendAudit("pin", `${request.siteId} pinned=${request.pinned}`);
       return json(res, 200, settings);
     }
 
     if (req.method === "POST" && url === "/api/v1/admin/window") {
-      const body = await readBody(req);
+      const request = await body(req, S.windowSchema);
       const settings = loadSettings();
-      settings.updateWindow = String(body.updateWindow ?? "always");
+      settings.updateWindow = request.updateWindow;
       saveSettings(settings);
       appendAudit("window", `maintenance window set to ${settings.updateWindow}`);
       return json(res, 200, settings);
@@ -714,13 +902,22 @@ const server = createServer(async (req, res) => {
       const lines = existsSync(AUDIT_PATH)
         ? readFileSync(AUDIT_PATH, "utf8").trim().split("\n").filter(Boolean).slice(-200)
         : [];
-      return json(res, 200, { audit: lines.map((l) => JSON.parse(l)) });
+      // A truncated final line (crash mid-append) must not 500 the page.
+      const audit: unknown[] = [];
+      for (const l of lines) {
+        try {
+          audit.push(JSON.parse(l));
+        } catch {
+          /* skip corrupt entry */
+        }
+      }
+      return json(res, 200, { audit });
     }
 
     if (req.method === "POST" && url === "/api/v1/admin/change-port") {
-      const body = await readBody(req);
-      const siteId = String(body.siteId);
-      const port = Number(body.port);
+      const request = await body(req, S.changePortSchema);
+      const siteId = request.siteId;
+      const port = request.port;
       const prevYaml = readFileSync(SITES_PATH, "utf8");
       const doc = parseYaml(prevYaml);
       const site = doc.sites.find((s: any) => s.id === siteId);
@@ -740,7 +937,7 @@ const server = createServer(async (req, res) => {
         port,
         prevYaml,
         startedAt: Date.now(),
-        verifyUntilMs: Date.now() + Number(body.verifyWindowSec ?? 120) * 1000,
+        verifyUntilMs: Date.now() + (request.verifyWindowSec ?? 120) * 1000,
         affectedTunnels,
       };
       writeFileSync(PORTCHANGE_PATH, JSON.stringify(pc, null, 2) + "\n", "utf8");
@@ -781,19 +978,28 @@ const server = createServer(async (req, res) => {
       if (!token) return json(res, 401, { error: "unauthorized" });
       const auth = authenticate(loadRegistry(), token);
       if (auth.status !== "active") return json(res, 401, { error: "unauthorized" });
-      const id = url.slice("/api/v1/agent/capture/".length).replace(/[^a-z0-9-]/g, "");
+      const id = url.slice("/api/v1/agent/capture/".length).split("?")[0]!;
+      if (!/^cap-[a-z0-9]{1,32}$/.test(id)) return json(res, 400, { error: "bad capture id" });
       const jobs = loadCaptures();
       const job = jobs.find((j) => j.id === id && j.node === auth.siteId);
       if (!job) return json(res, 404, { error: "no such capture" });
+      const cap = Math.min(job.maxKb * 1024, MAX_CAPTURE_BYTES);
       const chunks: Buffer[] = [];
       let size = 0;
       for await (const chunk of req) {
         size += (chunk as Buffer).length;
-        if (size > job.maxKb * 1024) break;
+        if (size > cap) {
+          req.destroy();
+          job.status = "failed";
+          saveCaptures(jobs);
+          return json(res, 413, { error: "capture exceeded its size cap" });
+        }
         chunks.push(chunk as Buffer);
       }
       mkdirSync(CAPTURES_DIR, { recursive: true });
-      writeFileSync(join(CAPTURES_DIR, `${job.id}.pcap`), Buffer.concat(chunks));
+      // basename() pins the write inside CAPTURES_DIR even if the id regex
+      // above is ever loosened.
+      writeFileSync(join(CAPTURES_DIR, basename(`${job.id}.pcap`)), Buffer.concat(chunks));
       job.status = "done";
       job.sizeKb = Math.round(size / 1024);
       saveCaptures(jobs);
@@ -802,15 +1008,20 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url === "/api/v1/admin/capture") {
-      const body = await readBody(req);
-      const seconds = Math.min(Number(body.seconds ?? 15), CAPTURE_MAX_SECONDS);
-      const maxKb = Math.min(Number(body.maxKb ?? 2048), CAPTURE_MAX_KB);
-      const node = String(body.node);
+      const request = await body(req, S.captureSchema);
+      const seconds = Math.min(request.seconds, CAPTURE_MAX_SECONDS);
+      const maxKb = Math.min(request.maxKb, CAPTURE_MAX_KB);
+      const node = request.node;
       if (!loadRegistry().bindings[node]) return json(res, 400, { error: `unknown node ${node}` });
       const job: CaptureJob = {
-        id: "cap-" + Date.now().toString(36),
+        // Unpredictable id: the pcap is fetched by id, so a guessable one
+        // would let a lower-privileged reader race for someone else's capture.
+        id: "cap-" + randomBytes(8).toString("hex"),
         node,
-        filter: String(body.filter ?? ""),
+        // The filter is a BPF expression only — schemas.ts rejects anything
+        // that could be read as a tcpdump option (notably -z, which runs a
+        // command as root). agent/capture.go re-checks independently.
+        filter: request.filter,
         seconds,
         maxKb,
         status: "queued",
@@ -829,17 +1040,24 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.startsWith("/api/v1/admin/captures/")) {
-      const file = url.slice("/api/v1/admin/captures/".length).replace(/[^a-z0-9.-]/g, "");
-      const p = join(CAPTURES_DIR, file);
-      if (!file.endsWith(".pcap") || !existsSync(p)) return json(res, 404, { error: "not found" });
-      res.writeHead(200, { "content-type": "application/vnd.tcpdump.pcap" });
+      const file = url.slice("/api/v1/admin/captures/".length).split("?")[0]!;
+      if (!/^cap-[a-z0-9]{1,32}\.pcap$/.test(file)) return json(res, 404, { error: "not found" });
+      const p = join(CAPTURES_DIR, basename(file));
+      if (!existsSync(p)) return json(res, 404, { error: "not found" });
+      res.writeHead(200, {
+        "content-type": "application/vnd.tcpdump.pcap",
+        "content-disposition": `attachment; filename="${basename(file)}"`,
+      });
       return res.end(readFileSync(p));
     }
 
     if (req.method === "POST" && url === "/api/v1/admin/test-email") {
       const result = await sendTestEmail();
-      appendAudit("test-email", result.ok ? "sent" : `failed: ${result.error}`);
-      return json(res, result.ok ? 200 : 500, result);
+      appendAudit("test-email", result.ok ? "sent" : "failed");
+      if (result.ok) return json(res, 200, { ok: true });
+      // The raw SMTP error names the host and user; log it, return a summary.
+      console.error("test-email failed:", result.error);
+      return json(res, 500, { ok: false, error: "SMTP send failed — see the control node log for details" });
     }
 
     if (req.method === "GET" && url === "/api/v1/admin/releases") {
@@ -855,8 +1073,8 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url === "/api/v1/admin/remove") {
-      const body = await readBody(req);
-      const siteId = String(body.siteId);
+      const request = await body(req, S.siteIdSchema);
+      const siteId = request.siteId;
       const reg = loadRegistry();
       removeBinding(reg, siteId);
       const doc = parseYaml(readFileSync(SITES_PATH, "utf8"));
@@ -865,20 +1083,62 @@ const server = createServer(async (req, res) => {
       writeFileSync(SITES_PATH, stringifyYaml(doc), "utf8");
       saveRegistry(reg);
       reports.delete(siteId);
+      appendAudit("node:removed", siteId);
       return json(res, 200, { ok: true });
     }
 
     json(res, 404, { error: "not found" });
   } catch (e) {
-    json(res, 500, { error: String(e) });
+    if (e instanceof HttpError) return json(res, e.status, { error: e.message });
+    // Referencing something that does not exist is a 400, not a server fault.
+    const msg = e instanceof Error ? e.message : "";
+    if (/^(no pending node|no binding for|site .* already has a bound node|unknown site)/.test(msg)) {
+      return json(res, 400, { error: msg });
+    }
+    // Never return internal detail (paths, stacks) to a caller.
+    const ref = randomBytes(6).toString("hex");
+    console.error(`[${ref}] unhandled error on ${req.method} ${req.url}:`, e);
+    json(res, 500, { error: `internal error (reference ${ref})` });
   }
-});
+};
 
-// Dev server resilience: log instead of dying, and name the culprit so real
-// bugs surface in `docker logs` rather than as silent restarts.
+// Resilience: log instead of dying, and name the culprit so real bugs surface
+// in the container log rather than as silent restarts.
 process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 
-server.listen(PORT, () => {
-  console.log(`opnmesh control (dev) listening on :${PORT}, state dir ${STATE_DIR}`);
+/**
+ * Transport. Node bearer tokens ride every poll, so plaintext is only ever
+ * acceptable on an isolated lab network — and then only with an explicit
+ * opt-in, so nobody reaches production by accident.
+ */
+const useTls = TLS_CERT !== "" && TLS_KEY !== "";
+if (!useTls && !ALLOW_INSECURE_HTTP) {
+  console.error(
+    "refusing to start without TLS: set OPNMESH_TLS_CERT and OPNMESH_TLS_KEY,\n" +
+      "or set OPNMESH_ALLOW_INSECURE_HTTP=1 for an isolated lab/simulation only.",
+  );
+  process.exit(1);
+}
+
+const server = useTls
+  ? createHttpsServer(
+      {
+        cert: readFileSync(TLS_CERT),
+        key: readFileSync(TLS_KEY),
+        minVersion: "TLSv1.2",
+        honorCipherOrder: true,
+      },
+      handler,
+    )
+  : createHttpServer(handler);
+
+// Slowloris and hung-request protection.
+server.headersTimeout = 20_000;
+server.requestTimeout = 60_000;
+server.keepAliveTimeout = 15_000;
+
+server.listen(PORT, BIND, () => {
+  const scheme = useTls ? "https" : "http (INSECURE — lab use only)";
+  console.log(`OPNmesh control server listening on ${scheme}://${BIND}:${PORT}, state dir ${STATE_DIR}`);
 });

@@ -39,18 +39,37 @@ describe("addressing", () => {
   });
 
   it("rejects overlapping site LANs", () => {
-    const bad = mutate(cfg, (c) => (c.sites[1]!.lan = "10.10.128.0/17"));
+    const bad = mutate(cfg, (c) => {
+      c.sites[1]!.lans[0]!.cidr = "10.10.128.0/17";
+      c.sites[1]!.advertised = ["10.10.128.0/17"];
+    });
     expect(codes(validateAddressing(bad))).toContain("overlap");
   });
 
   it("rejects a LAN with host bits set", () => {
-    const bad = mutate(cfg, (c) => (c.sites[0]!.lan = "10.10.0.2/16"));
+    const bad = mutate(cfg, (c) => (c.sites[0]!.lans[0]!.cidr = "10.10.0.2/16"));
     expect(codes(validateAddressing(bad))).toContain("lan-host-bits");
   });
 
   it("rejects a LAN overlapping tunnel space", () => {
-    const bad = mutate(cfg, (c) => (c.sites[0]!.lan = "10.99.0.0/16"));
+    const bad = mutate(cfg, (c) => (c.sites[0]!.lans[0]!.cidr = "10.99.0.0/16"));
     expect(codes(validateAddressing(bad))).toContain("overlap");
+  });
+
+  it("rejects two VLANs at the same site overlapping each other", () => {
+    const bad = mutate(cfg, (c) => {
+      c.sites[0]!.lans.push({ cidr: "10.10.0.0/24", name: "Voice", vlan: 20, role: "standard" });
+    });
+    expect(codes(validateAddressing(bad))).toContain("overlap");
+  });
+
+  it("allows guest VLANs to overlap across sites — they are never routed", () => {
+    const ok = mutate(cfg, (c) => {
+      for (const s of c.sites.slice(0, 2)) {
+        s.lans.push({ cidr: "192.168.1.0/24", name: "Guest", vlan: 90, role: "guest" });
+      }
+    });
+    expect(codes(validateAddressing(ok))).not.toContain("overlap");
   });
 
   it("rejects a tunnel IP outside the gateway subnet", () => {

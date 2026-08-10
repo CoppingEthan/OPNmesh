@@ -72,9 +72,16 @@ sh(
 const sha256 = createHash("sha256").update(readFileSync(join(releaseDir, "opnmesh-agent"))).digest("hex");
 
 const register = async () => {
+  // The management API is authenticated; fall back to the simulation's token
+  // file so a local build needs no extra setup.
+  const token =
+    process.env["OPNMESH_ADMIN_TOKEN"] ??
+    (existsSync(join(stateDir, "control", "admin.token"))
+      ? readFileSync(join(stateDir, "control", "admin.token"), "utf8").trim()
+      : "");
   const res = await fetch(`${CONTROL}/api/v1/admin/releases`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
     body: JSON.stringify({ version, sha256, configDigest: configDigest ?? null }),
   });
   if (!res.ok) throw new Error(`release registration failed: ${res.status} ${await res.text()}`);

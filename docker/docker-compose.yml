@@ -165,6 +165,10 @@ services:
     environment:
       STATE_DIR: /state
       PORT: 8080
+      # Simulation only: plain HTTP on an isolated docker network. A real
+      # deployment sets OPNMESH_TLS_CERT/KEY instead and this refuses to start.
+      OPNMESH_ALLOW_INSECURE_HTTP: "1"
+      OPNMESH_ADMIN_TOKEN_FILE: /state/control/admin.token
       # Dead-man's switch heartbeat target (§10). In the sim it pings
       # Prometheus's health endpoint once the obs profile is up.
       OPNMESH_DEADMAN_URL: http://prometheus:9090/-/healthy
@@ -226,12 +230,28 @@ services:
     container_name: opnmesh-prometheus
     profiles:
       - obs
+    cap_add:
+      - NET_ADMIN
+    # Simulation only: the container installs a mesh route at start, which
+    # needs root. On a real control node the site router already routes the
+    # mesh subnets, so the production compose runs Prometheus as nobody.
+    user: root
     networks:
-      - wan
+      wan:
+      # Exporters bind to their tunnel addresses, so Prometheus scrapes over
+      # the mesh like any other host at site-a.
+      lan-a:
+        ipv4_address: 10.10.7.20
     volumes:
       - ./state/obs/prometheus:/etc/prometheus
+    depends_on:
+      - gw-a
     ports:
       - "19090:9090"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "ip route replace 10.99.0.0/24 via 10.10.0.2 && exec /bin/prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus"
 
   alertmanager:
     image: prom/alertmanager:v0.27.0

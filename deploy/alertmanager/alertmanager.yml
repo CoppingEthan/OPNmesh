@@ -5,7 +5,9 @@
 global:
   smtp_smarthost: "${OPNMESH_SMTP_HOST}:${OPNMESH_SMTP_PORT}"
   smtp_from: "${OPNMESH_SMTP_FROM}"
-  smtp_require_tls: false
+  # Credentials must never cross the wire in the clear. The simulation
+  # overrides this for its local mailpit sink.
+  smtp_require_tls: true
 
 route:
   receiver: mail

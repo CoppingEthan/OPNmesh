@@ -1,7 +1,7 @@
 import { revalidatePath } from "next/cache";
 import { existsSync } from "node:fs";
 import { simpleGit } from "simple-git";
-import { requireAdmin, logout } from "../../lib/ui/auth.js";
+import { requireAdmin, logout, setAdminPassword, passwordProblem } from "../../lib/ui/auth.js";
 import { loadSites, editSites } from "../../lib/ui/sites.js";
 import { STATE_DIR, CONTROL_URL } from "../../lib/ui/env.js";
 
@@ -18,11 +18,27 @@ async function setRetention(formData: FormData) {
   revalidatePath("/settings");
 }
 
+/**
+ * Only https:// and scp-style git@host:path are accepted. Git supports
+ * transports such as `ext::sh -c ...` that execute commands on fetch/push —
+ * an operator-supplied remote must never be able to reach those.
+ */
+function safeRemote(url: string): boolean {
+  if (url.length > 300) return false;
+  if (/^https:\/\/[A-Za-z0-9._~:/?#@!$&'()*+,;=%-]+$/.test(url)) return true;
+  if (/^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[A-Za-z0-9._~/-]+$/.test(url)) return true;
+  return false;
+}
+
 async function addRemote(formData: FormData) {
   "use server";
   await requireAdmin();
   const url = String(formData.get("url")).trim();
   if (!url) return;
+  if (!safeRemote(url)) {
+    const { redirect } = await import("next/navigation");
+    redirect("/settings?err=" + encodeURIComponent("Use an https:// URL or git@host:path address."));
+  }
   const git = simpleGit(STATE_DIR);
   await git.addRemote("origin", url).catch(async () => {
     await git.remote(["set-url", "origin", url]);
@@ -37,6 +53,21 @@ async function removeRemote() {
   revalidatePath("/settings");
 }
 
+async function changePassword(formData: FormData) {
+  "use server";
+  await requireAdmin();
+  const password = String(formData.get("password") ?? "");
+  const confirm = String(formData.get("confirm") ?? "");
+  const { redirect } = await import("next/navigation");
+  if (password !== confirm) redirect("/settings?err=" + encodeURIComponent("Passwords do not match."));
+  const problem = passwordProblem(password);
+  if (problem) redirect("/settings?err=" + encodeURIComponent(problem));
+  // Signs every session out, including this one — a password change must not
+  // leave a stolen session alive.
+  await setAdminPassword(password);
+  redirect("/login");
+}
+
 async function doLogout() {
   "use server";
   await logout();
@@ -44,8 +75,13 @@ async function doLogout() {
   redirect("/login");
 }
 
-export default async function SettingsPage() {
+export default async function SettingsPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ err?: string }>;
+}) {
   await requireAdmin();
+  const params = await searchParams;
   const sites = loadSites();
   let remote: string | null = null;
   if (existsSync(`${STATE_DIR}/.git`)) {
@@ -64,6 +100,7 @@ export default async function SettingsPage() {
   return (
     <div className="space-y-6">
       <h1 className="h1">Settings</h1>
+      {params.err && <p className="status-bad text-sm">{params.err}</p>}
 
       <div className="card">
         <div className="label mb-3">Service endpoints (all configurable via environment — nothing hardcoded)</div>
@@ -115,6 +152,18 @@ export default async function SettingsPage() {
             <button className="btn" type="submit">Add remote (no auto-push)</button>
           </form>
         )}
+      </div>
+
+      <div className="card">
+        <div className="label mb-2">Change password</div>
+        <p className="mb-2 text-sm text-zinc-400">
+          Changing your password signs out every device, including this one.
+        </p>
+        <form action={changePassword} className="flex flex-wrap items-end gap-2">
+          <input className="input w-56" type="password" name="password" placeholder="New password" />
+          <input className="input w-56" type="password" name="confirm" placeholder="Repeat it" />
+          <button className="btn" type="submit">Change password</button>
+        </form>
       </div>
 
       <div className="card">

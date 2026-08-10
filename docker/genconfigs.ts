@@ -19,12 +19,13 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { build } from "esbuild";
-import { copyFileSync } from "node:fs";
+import { copyFileSync, existsSync } from "node:fs";
 import { sitesFileSchema, resolveConfig } from "../lib/schema.js";
 import { generateAll } from "../lib/generator/index.js";
 import { runValidators } from "../lib/validators/index.js";
 import { CLIENT_PRIVATE_KEY_PLACEHOLDER } from "../lib/generator/wireguard.js";
 import { emptyRegistry, hashToken } from "../lib/enrol/registry.js";
+import { generateAdminToken } from "../lib/control/auth.js";
 import { wgKeypair, agentToken } from "./simkeys.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -93,6 +94,9 @@ for (const [siteId, node] of Object.entries(bundle.nodes)) {
         poll_interval_sec: AGENT_POLL_SEC,
         commit_confirm_sec: 20,
         boot_watchdog_sec: 45,
+        // Simulation only: the sim control server speaks plain HTTP on an
+        // isolated docker network. Real installs use https:// with a pin.
+        insecure_transport: true,
       },
       null,
       2,
@@ -107,6 +111,36 @@ writeFileSync(
   { encoding: "utf8", mode: 0o600 },
 );
 copyFileSync(join(here, "..", "deploy", "install.sh"), join(stateDir, "control", "install.sh"));
+
+// Admin credential for the management API. Shared with the UI (via .env.local)
+// and with Prometheus (via a credentials file) — never committed.
+const adminToken = generateAdminToken();
+writeFileSync(join(stateDir, "control", "admin.token"), adminToken + "\n", {
+  encoding: "utf8",
+  mode: 0o600,
+});
+
+// Make `npm run dev` work against the simulation without manual setup.
+const envPath = join(here, "..", ".env.local");
+const existingEnv = existsSync(envPath) ? readFileSync(envPath, "utf8") : "";
+const withoutToken = existingEnv
+  .split("\n")
+  .filter((l) => !l.startsWith("OPNMESH_ADMIN_TOKEN="))
+  .join("\n")
+  .replace(/\n+$/, "");
+const cleanedEnv = withoutToken
+  .split("\n")
+  .filter((l) => !l.startsWith("OPNMESH_ALLOW_INSECURE_HTTP="))
+  .join("\n")
+  .replace(/\n+$/, "");
+writeFileSync(
+  envPath,
+  `${cleanedEnv ? cleanedEnv + "\n" : ""}OPNMESH_ADMIN_TOKEN=${adminToken}\n` +
+    // The simulation runs over plain HTTP, so session cookies drop the
+    // __Host- prefix (which mandates Secure). Never set this in production.
+    `OPNMESH_ALLOW_INSECURE_HTTP=1\n`,
+  { encoding: "utf8", mode: 0o600 },
+);
 
 for (const [clientId, { config }] of Object.entries(bundle.clients)) {
   const dir = join(stateDir, "clients", clientId);
@@ -128,18 +162,25 @@ copyFileSync(
   join(here, "..", "deploy", "prometheus", "rules", "opnmesh.yml"),
   join(obsDir, "prometheus", "rules", "opnmesh.yml"),
 );
+// Prometheus authenticates to the control target with the admin credential.
+writeFileSync(join(obsDir, "prometheus", "admin.token"), adminToken, {
+  encoding: "utf8",
+  mode: 0o600,
+});
 mkdirSync(join(obsDir, "alertmanager"), { recursive: true });
 const amTemplate = readFileSync(join(here, "..", "deploy", "alertmanager", "alertmanager.yml"), "utf8");
 const amRendered = amTemplate
   .replace(/\$\{OPNMESH_SMTP_HOST\}/g, "mailpit")
   .replace(/\$\{OPNMESH_SMTP_PORT\}/g, "1025")
   .replace(/\$\{OPNMESH_SMTP_FROM\}/g, "opnmesh@example.test")
-  .replace(/\$\{OPNMESH_ALERT_TO\}/g, "ops@example.test");
+  .replace(/\$\{OPNMESH_ALERT_TO\}/g, "ops@example.test")
+  // The simulation's mailpit sink speaks plain SMTP on an isolated network.
+  .replace("smtp_require_tls: true", "smtp_require_tls: false");
 writeFileSync(join(obsDir, "alertmanager", "alertmanager.yml"), amRendered, "utf8");
 
 // Bundle the control dev server so the control container only needs plain Node.
 await build({
-  entryPoints: [join(here, "..", "scripts", "control-dev.ts")],
+  entryPoints: [join(here, "..", "scripts", "control-server.ts")],
   bundle: true,
   platform: "node",
   target: "node22",

@@ -81,6 +81,15 @@ func (r *Reconciler) Apply() bool {
 	disk := r.diskFiles()
 	changedNames := []string{}
 	for name, want := range r.desired.Files {
+		// The control node is authenticated, not trusted with filesystem
+		// paths: only the files this agent manages are ever written, and only
+		// by exact name. Without this, a compromised or MITM'd control
+		// response could write anywhere on the box as root (e.g.
+		// "../../etc/cron.d/x").
+		if !isManagedFile(name) {
+			log.Printf("reconcile: refusing unexpected file name %q from control node", name)
+			continue
+		}
 		if disk[name] != want {
 			changedNames = append(changedNames, name)
 		}

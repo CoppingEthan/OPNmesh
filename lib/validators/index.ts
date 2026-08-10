@@ -38,28 +38,61 @@ export function validateAddressing(cfg: ResolvedConfig): Finding[] {
   }
 
   for (const s of cfg.sites) {
-    if (cidrHasHostBits(s.lan)) {
-      out.push(err("lan-host-bits", `site "${s.id}" lan ${s.lan} has host bits set — use the network address`));
-    }
-    for (const sub of [gatewaySubnet, clientSubnet]) {
-      if (cidrOverlaps(s.lan, sub)) {
-        out.push(err("overlap", `site "${s.id}" lan ${s.lan} overlaps tunnel space ${sub}`));
+    for (const lan of s.lans) {
+      const label = lan.name ? `${lan.cidr} (${lan.name})` : lan.cidr;
+      if (cidrHasHostBits(lan.cidr)) {
+        out.push(err("lan-host-bits", `site "${s.id}" network ${label} has host bits set — use the network address`));
+      }
+      for (const sub of [gatewaySubnet, clientSubnet]) {
+        if (cidrOverlaps(lan.cidr, sub)) {
+          out.push(err("overlap", `site "${s.id}" network ${label} overlaps tunnel space ${sub}`));
+        }
       }
     }
-    if (!ipInCidr(s.gateway.lanIp, s.lan)) {
-      out.push(err("lan-ip", `site "${s.id}" gateway lan_ip ${s.gateway.lanIp} is not inside ${s.lan}`));
+
+    // Overlaps between VLANs at the same site: a routing ambiguity locally,
+    // and it makes the generated per-site nftables set meaningless.
+    for (let i = 0; i < s.lans.length; i++) {
+      for (let j = i + 1; j < s.lans.length; j++) {
+        const a = s.lans[i]!;
+        const b = s.lans[j]!;
+        if (cidrOverlaps(a.cidr, b.cidr)) {
+          out.push(err("overlap", `site "${s.id}" networks ${a.cidr} and ${b.cidr} overlap each other`));
+        }
+      }
+    }
+
+    // The gateway's own LAN address must sit in one of its segments.
+    if (!s.lans.some((l) => ipInCidr(s.gateway.lanIp, l.cidr))) {
+      out.push(
+        err(
+          "lan-ip",
+          `site "${s.id}" gateway lan_ip ${s.gateway.lanIp} is not inside any of its networks (${s.lans.map((l) => l.cidr).join(", ")})`,
+        ),
+      );
     }
     if (!ipInCidr(s.gateway.tunnelIp, gatewaySubnet)) {
       out.push(err("tunnel-ip", `site "${s.id}" tunnel_ip ${s.gateway.tunnelIp} is not inside ${gatewaySubnet}`));
     }
   }
 
+  // Cross-site overlaps, every segment against every segment. Two sites
+  // sharing a subnet is the classic merge-two-offices failure.
   for (let i = 0; i < cfg.sites.length; i++) {
     for (let j = i + 1; j < cfg.sites.length; j++) {
       const a = cfg.sites[i]!;
       const b = cfg.sites[j]!;
-      if (cidrOverlaps(a.lan, b.lan)) {
-        out.push(err("overlap", `site "${a.id}" lan ${a.lan} overlaps site "${b.id}" lan ${b.lan}`));
+      for (const la of a.lans) {
+        for (const lb of b.lans) {
+          // Guest segments are never routed, so an overlap involving one is
+          // harmless — and common (every office uses 192.168.1.0/24 for guests).
+          if (la.role === "guest" || lb.role === "guest") continue;
+          if (cidrOverlaps(la.cidr, lb.cidr)) {
+            out.push(
+              err("overlap", `site "${a.id}" network ${la.cidr} overlaps site "${b.id}" network ${lb.cidr}`),
+            );
+          }
+        }
       }
     }
   }

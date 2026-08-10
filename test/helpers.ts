@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadSitesYaml, type ResolvedConfig } from "../lib/schema.js";
 
-export const FIXTURES = ["reference", "custom-ports", "single-hub", "multi-hub"] as const;
+export const FIXTURES = ["reference", "custom-ports", "single-hub", "multi-hub", "multi-vlan"] as const;
 export type FixtureName = (typeof FIXTURES)[number];
 
 export function fixtureText(name: FixtureName): string {
