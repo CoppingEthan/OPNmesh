@@ -142,3 +142,4 @@ config/repo/
 .env*.local
 *.key
 *.pem
+docker/state/

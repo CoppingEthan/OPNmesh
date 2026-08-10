@@ -1,0 +1,149 @@
+# Simulated mesh: three sites (gateway + LAN host each), a roaming client on
+# the WAN, a control-node placeholder, and an optional traffic generator.
+# Addresses mirror the reference topology; WAN uses TEST-NET-2.
+name: opnmesh-sim
+
+networks:
+  wan:
+    ipam:
+      config:
+        - subnet: 198.51.100.0/24
+  lan-a:
+    ipam:
+      config:
+        - subnet: 10.10.0.0/16
+  lan-b:
+    ipam:
+      config:
+        - subnet: 10.20.0.0/16
+  lan-c:
+    ipam:
+      config:
+        - subnet: 10.30.0.0/16
+
+x-node: &node
+  build: .
+  image: opnmesh-sim-node
+  cap_add:
+    - NET_ADMIN
+  restart: "no"
+
+x-wg-node: &wg-node
+  <<: *node
+  devices:
+    - /dev/net/tun
+
+services:
+  gw-a:
+    <<: *wg-node
+    container_name: opnmesh-gw-a
+    sysctls:
+      net.ipv4.ip_forward: 1
+    networks:
+      wan:
+        ipv4_address: 198.51.100.10
+      lan-a:
+        ipv4_address: 10.10.0.2
+    volumes:
+      - ./state/site-a:/etc/opnmesh
+    command: /opt/opnmesh/gateway.sh
+
+  gw-b:
+    <<: *wg-node
+    container_name: opnmesh-gw-b
+    sysctls:
+      net.ipv4.ip_forward: 1
+    networks:
+      wan:
+        ipv4_address: 198.51.100.20
+      lan-b:
+        ipv4_address: 10.20.0.2
+    volumes:
+      - ./state/site-b:/etc/opnmesh
+    command: /opt/opnmesh/gateway.sh
+
+  gw-c:
+    <<: *wg-node
+    container_name: opnmesh-gw-c
+    sysctls:
+      net.ipv4.ip_forward: 1
+    networks:
+      wan:
+        ipv4_address: 198.51.100.30
+      lan-c:
+        ipv4_address: 10.30.0.2
+    volumes:
+      - ./state/site-c:/etc/opnmesh
+    command: /opt/opnmesh/gateway.sh
+
+  host-a:
+    <<: *node
+    container_name: opnmesh-host-a
+    networks:
+      lan-a:
+        ipv4_address: 10.10.5.20
+    environment:
+      GW_IP: 10.10.0.2
+    depends_on:
+      - gw-a
+    command: /opt/opnmesh/host.sh
+
+  host-b:
+    <<: *node
+    container_name: opnmesh-host-b
+    networks:
+      lan-b:
+        ipv4_address: 10.20.5.20
+    environment:
+      GW_IP: 10.20.0.2
+    depends_on:
+      - gw-b
+    command: /opt/opnmesh/host.sh
+
+  host-c:
+    <<: *node
+    container_name: opnmesh-host-c
+    networks:
+      lan-c:
+        ipv4_address: 10.30.5.20
+    environment:
+      GW_IP: 10.30.0.2
+    depends_on:
+      - gw-c
+    command: /opt/opnmesh/host.sh
+
+  client:
+    <<: *wg-node
+    container_name: opnmesh-client
+    networks:
+      wan:
+        ipv4_address: 198.51.100.100
+    volumes:
+      - ./state/clients/laptop:/etc/opnmesh
+    depends_on:
+      - gw-a
+      - gw-b
+      - gw-c
+    command: /opt/opnmesh/client.sh
+
+  control:
+    <<: *node
+    container_name: opnmesh-control
+    networks:
+      lan-a:
+        ipv4_address: 10.10.7.10
+    command: /opt/opnmesh/control.sh
+
+  traffic-gen:
+    <<: *node
+    container_name: opnmesh-traffic
+    profiles:
+      - traffic
+    networks:
+      lan-a:
+        ipv4_address: 10.10.5.99
+    environment:
+      GW_IP: 10.10.0.2
+    depends_on:
+      - gw-a
+    command: /opt/opnmesh/traffic.sh
