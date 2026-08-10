@@ -15,4 +15,9 @@ if [ -f /etc/opnmesh/wg0.conf ]; then
   echo "gateway up: $(wg show wg0 public-key)"
 fi
 
-exec opnmesh-agent -config /etc/opnmesh/agent.json
+# A/B installs: prefer the flipped-in version if one exists (§11 layer 5).
+AGENT=/usr/bin/opnmesh-agent
+if [ -x /var/lib/opnmesh/current/opnmesh-agent ]; then
+  AGENT=/var/lib/opnmesh/current/opnmesh-agent
+fi
+exec "$AGENT" -config /etc/opnmesh/agent.json

@@ -91,6 +91,8 @@ for (const [siteId, node] of Object.entries(bundle.nodes)) {
         state_dir: "/var/lib/opnmesh",
         wg_interface: "wg0",
         poll_interval_sec: AGENT_POLL_SEC,
+        commit_confirm_sec: 20,
+        boot_watchdog_sec: 45,
       },
       null,
       2,

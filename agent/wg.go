@@ -227,6 +227,28 @@ func wgPeerStats(iface string) []PeerStat {
 	return stats
 }
 
+// pingPeerTunnels sends one short ping to each peer's tunnel address (the
+// first /32 in its AllowedIPs) to trigger immediate handshakes after a
+// WireGuard apply. Best-effort; failures are expected while peers converge.
+func pingPeerTunnels(conf string) {
+	for _, raw := range strings.Split(conf, "\n") {
+		line := strings.TrimSpace(raw)
+		if !strings.HasPrefix(line, "AllowedIPs") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		first := strings.TrimSpace(strings.Split(parts[1], ",")[0])
+		ip := strings.TrimSuffix(first, "/32")
+		if ip == first {
+			continue // not a /32 — not a tunnel address
+		}
+		_ = exec.Command("ping", "-c", "1", "-W", "2", ip).Run()
+	}
+}
+
 func applyNftables(path string) error {
 	_, err := runCmd("nft", "-f", path)
 	return err

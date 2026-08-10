@@ -149,6 +149,10 @@ func (r *Reconciler) Apply() bool {
 			}
 			return false
 		}
+		// Nudge every peer so sessions re-establish immediately rather than
+		// waiting for user traffic — after a port change this is what heals
+		// the mesh instead of leaving tunnels dark until someone talks.
+		go pingPeerTunnels(newWg)
 	}
 
 	r.lastErr = ""

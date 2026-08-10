@@ -64,6 +64,22 @@ groups:
           summary: "Enrolment token used — node pending approval"
           description: "{{ $value }} node(s) are waiting in the pending queue. Review the key fingerprint and approve or reject."
 
+      - alert: UpdateFailedAndRolledBack
+        expr: opnmesh_node_update_error == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: "Update failed and rolled back on {{ $labels.node }}"
+          description: "{{ $labels.node }} attempted an update, commit-confirm failed, and it automatically restored the previous version. The node is healthy on the old version; investigate the release before retrying."
+
+      - alert: RolloutAborted
+        expr: opnmesh_rollout_aborted == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: "Update rollout aborted"
+          description: "A staged rollout aborted on its first failure. No further nodes will update. See the updates audit log for the failing node and reason."
+
       - alert: DeadMansSwitchMissed
         # The control node could not reach its external heartbeat endpoint.
         expr: (time() - opnmesh_deadman_last_success_timestamp_seconds > 300) and (opnmesh_deadman_last_success_timestamp_seconds > 0)

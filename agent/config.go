@@ -15,18 +15,24 @@ type AgentConfig struct {
 	ServerURL       string `json:"server_url"`
 	TokenFile       string `json:"token_file"`
 	ConfDir         string `json:"conf_dir"`  // where wg0.conf / nftables.conf / sysctl.conf live
-	StateDir        string `json:"state_dir"` // snapshots + agent bookkeeping
+	StateDir        string `json:"state_dir"` // snapshots + agent bookkeeping + A/B versions
 	WgInterface     string `json:"wg_interface"`
 	PollIntervalSec int    `json:"poll_interval_sec"`
+	// Commit-confirm window after a self-update (§11 layer 4). Local timer.
+	CommitConfirmSec int `json:"commit_confirm_sec"`
+	// Boot watchdog window (§11 layer 6). 0 disables.
+	BootWatchdogSec int `json:"boot_watchdog_sec"`
 }
 
 func defaultConfig() AgentConfig {
 	return AgentConfig{
-		TokenFile:       "/etc/opnmesh/agent.token",
-		ConfDir:         "/etc/opnmesh",
-		StateDir:        "/var/lib/opnmesh",
-		WgInterface:     "wg0",
-		PollIntervalSec: 10,
+		TokenFile:        "/etc/opnmesh/agent.token",
+		ConfDir:          "/etc/opnmesh",
+		StateDir:         "/var/lib/opnmesh",
+		WgInterface:      "wg0",
+		PollIntervalSec:  10,
+		CommitConfirmSec: 90,
+		BootWatchdogSec:  0,
 	}
 }
 
@@ -44,6 +50,9 @@ func LoadConfig(path string) (AgentConfig, error) {
 	}
 	if cfg.PollIntervalSec < 1 {
 		cfg.PollIntervalSec = 10
+	}
+	if cfg.CommitConfirmSec < 1 {
+		cfg.CommitConfirmSec = 90
 	}
 	return cfg, nil
 }

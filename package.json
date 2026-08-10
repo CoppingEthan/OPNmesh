@@ -17,7 +17,8 @@
     "mesh:down": "docker compose -f docker/docker-compose.yml --profile traffic --profile obs --profile enrol down -v",
     "mesh:obs": "docker compose -f docker/docker-compose.yml --profile obs up -d prometheus alertmanager grafana mailpit",
     "mesh:logs": "docker compose -f docker/docker-compose.yml logs -f",
-    "mesh:test": "cross-env RUN_MESH_TESTS=1 vitest run test/integration --testTimeout 180000 --no-file-parallelism",
+    "mesh:test": "cross-env RUN_MESH_TESTS=1 vitest run test/integration --testTimeout 600000 --no-file-parallelism",
+    "mesh:update-test": "cross-env RUN_MESH_TESTS=1 vitest run test/integration/update.test.ts --testTimeout 600000 --no-file-parallelism",
     "mesh:traffic": "docker compose -f docker/docker-compose.yml --profile traffic up -d traffic-gen",
     "mesh:chaos": "tsx docker/chaos.ts"
   },

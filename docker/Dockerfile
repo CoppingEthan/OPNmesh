@@ -24,6 +24,7 @@ RUN apk add --no-cache \
     tcpdump \
     netcat-openbsd \
     conntrack-tools \
+    minisign \
     curl
 
 COPY --from=wg-go /wireguard-go /usr/bin/wireguard-go

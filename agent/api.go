@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -19,12 +20,14 @@ type DesiredConfig struct {
 // Report is what the agent tells the control node every cycle. It never
 // contains key material.
 type Report struct {
-	NodeID      string     `json:"nodeId"`
-	AppliedHash string     `json:"appliedHash"`
-	DiskHash    string     `json:"diskHash"`
-	LastError   string     `json:"lastError,omitempty"`
-	Peers       []PeerStat `json:"peers"`
-	AgentUptime int64      `json:"agentUptimeSec"`
+	NodeID          string     `json:"nodeId"`
+	Version         string     `json:"version"`
+	AppliedHash     string     `json:"appliedHash"`
+	DiskHash        string     `json:"diskHash"`
+	LastError       string     `json:"lastError,omitempty"`
+	LastUpdateError string     `json:"lastUpdateError,omitempty"`
+	Peers           []PeerStat `json:"peers"`
+	AgentUptime     int64      `json:"agentUptimeSec"`
 }
 
 // PeerStat is one row of `wg show <if> dump`.
@@ -86,6 +89,64 @@ func (c *APIClient) FetchConfig() (*DesiredConfig, bool, error) {
 	default:
 		return nil, false, fmt.Errorf("config fetch: HTTP %d", resp.StatusCode)
 	}
+}
+
+// FetchUpdate asks whether this node should update right now. nil means no.
+func (c *APIClient) FetchUpdate() (*UpdateInstruction, error) {
+	req, err := http.NewRequest(http.MethodGet, c.baseURL+"/api/v1/agent/update", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("update check: HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	var instr UpdateInstruction
+	if err := json.Unmarshal(body, &instr); err != nil {
+		return nil, err
+	}
+	if instr.TargetVersion == "" {
+		return nil, nil
+	}
+	return &instr, nil
+}
+
+// DownloadFile streams an authenticated API path to a local file.
+func (c *APIClient) DownloadFile(apiPath, dst string) error {
+	req, err := http.NewRequest(http.MethodGet, c.baseURL+apiPath, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download: HTTP %d", resp.StatusCode)
+	}
+	f, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func (c *APIClient) SendFlows(flows []FlowRecord) error {
