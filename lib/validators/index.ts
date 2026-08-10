@@ -255,6 +255,11 @@ export function validatePorts(cfg: ResolvedConfig): Finding[] {
         warn("privileged-port", `site "${s.id}" listens on privileged port ${s.gateway.listenPort} — the WireGuard service needs the capability to bind it`),
       );
     }
+    if (s.gateway.metricsPort === s.gateway.listenPort) {
+      out.push(
+        err("port-collision", `site "${s.id}": metrics_port and listen_port are both ${s.gateway.listenPort} on the same host`),
+      );
+    }
   }
   // Two gateways published behind the same host cannot share a port.
   const byEndpoint = new Map<string, string>();

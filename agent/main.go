@@ -61,7 +61,11 @@ func newClient(cfg AgentConfig) (*APIClient, error) {
 func runLoop(cfg AgentConfig, rec *Reconciler) {
 	log.Printf("agent: polling %s every %s", cfg.ServerURL, cfg.PollInterval())
 	start := time.Now()
+	metrics := NewMetricsServer(cfg, rec)
+	flowReporter := NewFlowReporter(cfg)
 	for {
+		settings := loadSettings(cfg.ConfDir)
+		metrics.Ensure(settings.MetricsPort)
 		client, err := newClient(cfg)
 		if err != nil {
 			// Token file missing/unreadable: nothing to do but wait; the
@@ -71,6 +75,7 @@ func runLoop(cfg AgentConfig, rec *Reconciler) {
 			rec.Fetch(client)
 			rec.Apply()
 			reportWithUptime(cfg, rec, client, int64(time.Since(start).Seconds()))
+			flowReporter.MaybeReport(client, loadSettings(cfg.ConfDir))
 		}
 		// Jitter so a fleet of agents does not thundering-herd the control node.
 		jitter := time.Duration(rand.Int63n(int64(cfg.PollInterval() / 4)))

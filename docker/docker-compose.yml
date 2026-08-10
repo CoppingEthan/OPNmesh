@@ -45,6 +45,10 @@ services:
     container_name: opnmesh-gw-a
     sysctls:
       net.ipv4.ip_forward: 1
+      # Runtime sysctl writes under /proc/sys/net/netfilter are read-only in
+      # containers; set conntrack accounting at creation for the sim. On real
+      # hosts the agent applies it from the generated sysctl.conf.
+      net.netfilter.nf_conntrack_acct: 1
     networks:
       wan:
         ipv4_address: 198.51.100.10
@@ -59,6 +63,10 @@ services:
     container_name: opnmesh-gw-b
     sysctls:
       net.ipv4.ip_forward: 1
+      # Runtime sysctl writes under /proc/sys/net/netfilter are read-only in
+      # containers; set conntrack accounting at creation for the sim. On real
+      # hosts the agent applies it from the generated sysctl.conf.
+      net.netfilter.nf_conntrack_acct: 1
     networks:
       wan:
         ipv4_address: 198.51.100.20
@@ -73,6 +81,10 @@ services:
     container_name: opnmesh-gw-c
     sysctls:
       net.ipv4.ip_forward: 1
+      # Runtime sysctl writes under /proc/sys/net/netfilter are read-only in
+      # containers; set conntrack accounting at creation for the sim. On real
+      # hosts the agent applies it from the generated sysctl.conf.
+      net.netfilter.nf_conntrack_acct: 1
     networks:
       wan:
         ipv4_address: 198.51.100.30
@@ -153,6 +165,10 @@ services:
     environment:
       STATE_DIR: /state
       PORT: 8080
+      # Dead-man's switch heartbeat target (§10). In the sim it pings
+      # Prometheus's health endpoint once the obs profile is up.
+      OPNMESH_DEADMAN_URL: http://prometheus:9090/-/healthy
+      OPNMESH_DEADMAN_INTERVAL_MS: 15000
     ports:
       - "18080:8080"
     depends_on:
@@ -174,6 +190,10 @@ services:
       - enrol
     sysctls:
       net.ipv4.ip_forward: 1
+      # Runtime sysctl writes under /proc/sys/net/netfilter are read-only in
+      # containers; set conntrack accounting at creation for the sim. On real
+      # hosts the agent applies it from the generated sysctl.conf.
+      net.netfilter.nf_conntrack_acct: 1
     networks:
       wan:
         ipv4_address: 198.51.100.40
@@ -197,6 +217,64 @@ services:
     depends_on:
       - gw-d
     command: /opt/opnmesh/host.sh
+
+  # --- observability profile (§13): Prometheus, Alertmanager, Grafana, and a
+  # mailpit SMTP sink standing in for the operator's mail server ---
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: opnmesh-prometheus
+    profiles:
+      - obs
+    networks:
+      - wan
+    volumes:
+      - ./state/obs/prometheus:/etc/prometheus
+    ports:
+      - "19090:9090"
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: opnmesh-alertmanager
+    profiles:
+      - obs
+    networks:
+      - wan
+    volumes:
+      - ./state/obs/alertmanager:/etc/alertmanager
+    # TEST-NET WAN addresses are technically public, so gossip clustering
+    # finds no private advertise address and aborts startup — disable it.
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --cluster.listen-address=
+    ports:
+      - "19093:9093"
+
+  mailpit:
+    image: axllent/mailpit:v1.20
+    container_name: opnmesh-mailpit
+    profiles:
+      - obs
+    networks:
+      - wan
+    ports:
+      - "18025:8025"
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: opnmesh-grafana
+    profiles:
+      - obs
+    networks:
+      - wan
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ../deploy/grafana/provisioning:/etc/grafana/provisioning
+      - ../deploy/grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "13000:3000"
 
   traffic-gen:
     <<: *node

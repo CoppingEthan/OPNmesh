@@ -185,6 +185,11 @@ describe("ports", () => {
     expect(codes(validatePorts(bad))).toContain("port-collision");
   });
 
+  it("errors when metrics and WireGuard share a port on one node", () => {
+    const bad = mutate(cfg, (c) => (c.sites[0]!.gateway.metricsPort = c.sites[0]!.gateway.listenPort));
+    expect(codes(validatePorts(bad))).toContain("port-collision");
+  });
+
   it("allows the same host on different ports", () => {
     const ok = mutate(cfg, (c) => {
       c.sites[1]!.gateway.endpoint = c.sites[0]!.gateway.endpoint;

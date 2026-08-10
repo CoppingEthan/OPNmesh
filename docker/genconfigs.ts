@@ -113,6 +113,28 @@ for (const [clientId, { config }] of Object.entries(bundle.clients)) {
   writeFileSync(join(dir, "wg0.conf"), withKey, { encoding: "utf8", mode: 0o600 });
 }
 
+// Observability stack config for the sim: Prometheus + rules verbatim from
+// deploy/, Alertmanager rendered with the sim's mailpit SMTP sink (real
+// deployments substitute their own environment).
+const obsDir = join(stateDir, "obs");
+mkdirSync(join(obsDir, "prometheus", "rules"), { recursive: true });
+copyFileSync(
+  join(here, "..", "deploy", "prometheus", "prometheus.yml"),
+  join(obsDir, "prometheus", "prometheus.yml"),
+);
+copyFileSync(
+  join(here, "..", "deploy", "prometheus", "rules", "opnmesh.yml"),
+  join(obsDir, "prometheus", "rules", "opnmesh.yml"),
+);
+mkdirSync(join(obsDir, "alertmanager"), { recursive: true });
+const amTemplate = readFileSync(join(here, "..", "deploy", "alertmanager", "alertmanager.yml"), "utf8");
+const amRendered = amTemplate
+  .replace(/\$\{OPNMESH_SMTP_HOST\}/g, "mailpit")
+  .replace(/\$\{OPNMESH_SMTP_PORT\}/g, "1025")
+  .replace(/\$\{OPNMESH_SMTP_FROM\}/g, "opnmesh@example.test")
+  .replace(/\$\{OPNMESH_ALERT_TO\}/g, "ops@example.test");
+writeFileSync(join(obsDir, "alertmanager", "alertmanager.yml"), amRendered, "utf8");
+
 // Bundle the control dev server so the control container only needs plain Node.
 await build({
   entryPoints: [join(here, "..", "scripts", "control-dev.ts")],

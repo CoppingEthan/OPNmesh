@@ -11,7 +11,7 @@ import (
 )
 
 // ManagedFiles are the files the agent reconciles, relative to ConfDir.
-var ManagedFiles = []string{"wg0.conf", "nftables.conf", "sysctl.conf"}
+var ManagedFiles = []string{"wg0.conf", "nftables.conf", "sysctl.conf", "agent-settings.json"}
 
 func runCmd(name string, args ...string) (string, error) {
 	out, err := exec.Command(name, args...).CombinedOutput()
@@ -233,8 +233,20 @@ func applyNftables(path string) error {
 }
 
 func applySysctl(path string) {
+	// Apply key-by-key with -w (portable across busybox/procps sysctl).
 	// Best-effort: containers may not allow every key; a real node will.
-	_ = exec.Command("sysctl", "-p", path).Run()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		kv := strings.Replace(line, " = ", "=", 1)
+		_ = exec.Command("sysctl", "-w", kv).Run()
+	}
 }
 
 func writeFileAtomic(path, content string, mode os.FileMode) error {

@@ -1,0 +1,21 @@
+# OPNmesh Alertmanager configuration template.
+# SMTP credentials come from the environment (amtool/alertmanager expand
+# $SMTP_* via --config.expand-external-env or an envsubst step; the sim
+# mounts a rendered copy). Never commit credentials.
+global:
+  smtp_smarthost: "${OPNMESH_SMTP_HOST}:${OPNMESH_SMTP_PORT}"
+  smtp_from: "${OPNMESH_SMTP_FROM}"
+  smtp_require_tls: false
+
+route:
+  receiver: mail
+  group_by: [alertname, node]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 4h
+
+receivers:
+  - name: mail
+    email_configs:
+      - to: "${OPNMESH_ALERT_TO}"
+        send_resolved: true

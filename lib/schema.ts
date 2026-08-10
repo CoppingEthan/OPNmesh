@@ -54,6 +54,10 @@ const gatewaySchema = z
     public_key: wgKeySchema,
     mtu: z.number().int().optional(),
     private_key_path: z.string().min(1).optional(),
+    /** Prometheus exporter port on this node. */
+    metrics_port: portSchema.optional(),
+    /** Tier-3 per-host flow records — opt-in per gateway (§13). */
+    flows: z.boolean().default(false),
   })
   .strict();
 
@@ -87,8 +91,11 @@ const networkSchema = z
     client_subnet: cidrSchema.default("10.99.1.0/24"),
     /** Default only — every node may override. Never hardcoded downstream. */
     default_listen_port: portSchema.default(51820),
+    default_metrics_port: portSchema.default(9586),
     default_mtu: z.number().int().default(1420),
     keepalive: z.number().int().min(1).max(3600).default(25),
+    /** Tier-3 flow record retention, days (§13: default 7). */
+    flow_retention_days: z.number().int().min(1).max(365).default(7),
   })
   .strict();
 
@@ -137,6 +144,8 @@ export interface ResolvedGateway {
   publicKey: string;
   mtu: number;
   privateKeyPath: string;
+  metricsPort: number;
+  flows: boolean;
 }
 
 export interface ResolvedSite {
@@ -163,8 +172,10 @@ export interface ResolvedConfig {
     gatewaySubnet: string;
     clientSubnet: string;
     defaultListenPort: number;
+    defaultMetricsPort: number;
     defaultMtu: number;
     keepalive: number;
+    flowRetentionDays: number;
   };
   topology: {
     shape: "full-mesh" | "multi-hub" | "single-hub";
@@ -247,6 +258,8 @@ export function resolveConfig(file: SitesFile): ResolvedConfig {
       publicKey: s.gateway.public_key,
       mtu: s.gateway.mtu ?? file.network.default_mtu,
       privateKeyPath: s.gateway.private_key_path ?? DEFAULT_PRIVATE_KEY_PATH,
+      metricsPort: s.gateway.metrics_port ?? file.network.default_metrics_port,
+      flows: s.gateway.flows,
     },
   }));
 
@@ -293,8 +306,10 @@ export function resolveConfig(file: SitesFile): ResolvedConfig {
       gatewaySubnet: file.network.gateway_subnet,
       clientSubnet: file.network.client_subnet,
       defaultListenPort: file.network.default_listen_port,
+      defaultMetricsPort: file.network.default_metrics_port,
       defaultMtu: file.network.default_mtu,
       keepalive: file.network.keepalive,
+      flowRetentionDays: file.network.flow_retention_days,
     },
     topology: { shape, hubs },
     sites,

@@ -1,0 +1,6 @@
+{
+  "metrics_port": 19586,
+  "flows": true,
+  "flow_interval_sec": 30,
+  "needs_reresolve": true
+}

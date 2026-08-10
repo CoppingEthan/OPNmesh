@@ -20,6 +20,18 @@ export interface NodeMeta {
   privateKeyPath: string;
 }
 
+/**
+ * Runtime settings for the agent itself, shipped as a reconciled file so the
+ * control panel drives exporter/flow behaviour centrally with no agent
+ * restarts or redeploys.
+ */
+export interface AgentSettings {
+  metrics_port: number;
+  flows: boolean;
+  flow_interval_sec: number;
+  needs_reresolve: boolean;
+}
+
 export interface NodeBundle {
   /** Relative target path → file content. */
   files: Record<string, string>;
@@ -39,11 +51,18 @@ export function generateAll(cfg: ResolvedConfig): GeneratedBundle {
     const peerEndpointsAreHostnames = cfg.sites.some(
       (p) => p.id !== s.id && p.gateway.endpointIsHostname && arePeered(cfg, s.id, p.id),
     );
+    const settings: AgentSettings = {
+      metrics_port: s.gateway.metricsPort,
+      flows: s.gateway.flows,
+      flow_interval_sec: 30,
+      needs_reresolve: peerEndpointsAreHostnames,
+    };
     nodes[s.id] = {
       files: {
         "wg0.conf": wgConf,
         "nftables.conf": generateNftables(cfg, s.id),
         "sysctl.conf": generateSysctl(cfg, s.id),
+        "agent-settings.json": JSON.stringify(settings, null, 2) + "\n",
       },
       meta: {
         nodeId: s.id,

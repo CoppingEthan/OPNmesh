@@ -88,6 +88,28 @@ func (c *APIClient) FetchConfig() (*DesiredConfig, bool, error) {
 	}
 }
 
+func (c *APIClient) SendFlows(flows []FlowRecord) error {
+	payload, err := json.Marshal(map[string]any{"flows": flows})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/api/v1/agent/flows", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("flows: HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (c *APIClient) SendReport(r Report) error {
 	payload, err := json.Marshal(r)
 	if err != nil {

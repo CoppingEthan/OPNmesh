@@ -1,0 +1,74 @@
+# OPNmesh minimum alert set (§13). Every alert names the node/peer and what
+# to check. Thresholds follow the brief; `for:` keeps flapping down.
+groups:
+  - name: opnmesh
+    rules:
+      - alert: TunnelDown
+        # No handshake for 180s on a peer that has handshaked before.
+        expr: (time() - wireguard_peer_latest_handshake_seconds > 180) and (wireguard_peer_latest_handshake_seconds > 0)
+        labels:
+          severity: critical
+        annotations:
+          summary: "Tunnel down on {{ $labels.node }}"
+          description: "Peer {{ $labels.public_key }} on {{ $labels.node }} has not completed a handshake for over 180s. Check the remote gateway's power/WAN, then its listen port and endpoint."
+
+      - alert: NodeUnreachable
+        expr: up{job="gateways"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node {{ $labels.node }} unreachable"
+          description: "Prometheus cannot scrape {{ $labels.node }}. The node or its exporter is down; existing tunnels may still be fine."
+
+      - alert: NodeDegraded
+        # Node scrapeable but at least one peer stale while another is fresh.
+        expr: count by (node) ((time() - wireguard_peer_latest_handshake_seconds > 180) and (wireguard_peer_latest_handshake_seconds > 0)) > 0 and count by (node) (time() - wireguard_peer_latest_handshake_seconds <= 180) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.node }} degraded"
+          description: "{{ $labels.node }} is up but a subset of its peers have stale handshakes — a specific tunnel path is failing, not the node."
+
+      - alert: ConfigDrift
+        expr: opnmesh_node_drift == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Config drift on {{ $labels.node }}"
+          description: "{{ $labels.node }} has been running config that differs from desired for 2m. Check the node's agent log; the agent normally heals drift in one poll."
+
+      - alert: PortBindFailure
+        expr: opnmesh_agent_port_bind_error == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: "Port bind failure reported by an agent"
+          description: "An agent refused a config because its WireGuard port is already bound on the node. The old config keeps running; free the port or pick another."
+
+      - alert: ReconcileError
+        expr: opnmesh_node_reconcile_error == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Reconcile error on {{ $labels.node }}"
+          description: "{{ $labels.node }} reports a reconcile error. See the node detail page for the exact message."
+
+      - alert: NodePendingApproval
+        expr: opnmesh_pending_nodes > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "Enrolment token used — node pending approval"
+          description: "{{ $value }} node(s) are waiting in the pending queue. Review the key fingerprint and approve or reject."
+
+      - alert: DeadMansSwitchMissed
+        # The control node could not reach its external heartbeat endpoint.
+        expr: (time() - opnmesh_deadman_last_success_timestamp_seconds > 300) and (opnmesh_deadman_last_success_timestamp_seconds > 0)
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dead-man's switch heartbeat failing"
+          description: "The control node has not completed its external heartbeat for 5m — its own alerting may be about to go blind. Check the control node's outbound connectivity."

@@ -23,6 +23,7 @@ RUN apk add --no-cache \
     iperf3 \
     tcpdump \
     netcat-openbsd \
+    conntrack-tools \
     curl
 
 COPY --from=wg-go /wireguard-go /usr/bin/wireguard-go

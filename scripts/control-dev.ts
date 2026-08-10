@@ -42,9 +42,13 @@ import {
   type NodeRole,
   type Registry,
 } from "../lib/enrol/registry.js";
+import { JsonlFlowStore } from "../lib/flows/store.js";
 
 const STATE_DIR = process.env["STATE_DIR"] ?? "docker/state";
 const PORT = Number(process.env["PORT"] ?? 8080);
+/** Dead-man's switch (§10): heartbeat to an external endpoint so the control node's own death is noticed. */
+const DEADMAN_URL = process.env["OPNMESH_DEADMAN_URL"] ?? "";
+const DEADMAN_INTERVAL_MS = Number(process.env["OPNMESH_DEADMAN_INTERVAL_MS"] ?? 60_000);
 const REGISTRY_PATH = join(STATE_DIR, "control", "registry.json");
 const SITES_PATH = join(STATE_DIR, "sites.yml");
 const INSTALL_SH_PATH = join(STATE_DIR, "control", "install.sh");
@@ -58,6 +62,34 @@ interface NodeStatus {
 }
 
 const reports = new Map<string, NodeStatus>();
+const flowStore = new JsonlFlowStore(join(STATE_DIR, "control", "flows.jsonl"));
+let deadmanLastSuccess = 0;
+
+if (DEADMAN_URL) {
+  const beat = async () => {
+    try {
+      const res = await fetch(DEADMAN_URL, { method: "GET" });
+      if (res.ok) deadmanLastSuccess = Date.now();
+    } catch {
+      /* alerting notices via the metric */
+    }
+  };
+  void beat();
+  setInterval(beat, DEADMAN_INTERVAL_MS).unref();
+}
+
+function flowRetentionCutoff(): number {
+  const cfg = loadSitesYaml(readFileSync(SITES_PATH, "utf8"));
+  return Math.floor(Date.now() / 1000) - cfg.network.flowRetentionDays * 86400;
+}
+// Retention is enforced continuously, not just at query time.
+setInterval(() => {
+  try {
+    flowStore.prune(flowRetentionCutoff());
+  } catch {
+    /* next round */
+  }
+}, 60_000).unref();
 
 function loadRegistry(): Registry {
   if (!existsSync(REGISTRY_PATH)) return emptyRegistry();
@@ -157,6 +189,69 @@ const server = createServer(async (req, res) => {
       saveRegistry(reg);
       console.log(`enrol: pending node ${result.pendingId} (${body.hostname})`);
       return json(res, 200, { status: "pending", nodeToken: result.nodeToken, pendingId: result.pendingId });
+    }
+
+    if (req.method === "POST" && url === "/api/v1/agent/flows") {
+      const token = bearerToken(req);
+      if (!token) return json(res, 401, { error: "unauthorized" });
+      const auth = authenticate(loadRegistry(), token);
+      if (auth.status !== "active") return json(res, 401, { error: "unauthorized" });
+      const body = await readBody(req);
+      const flows = Array.isArray(body.flows) ? body.flows : [];
+      flowStore.ingest(
+        flows.map((f: any) => ({
+          node: auth.siteId,
+          proto: String(f.proto ?? ""),
+          src: String(f.src ?? ""),
+          dst: String(f.dst ?? ""),
+          dstPort: Number(f.dstPort ?? 0),
+          bytes: Number(f.bytes ?? 0),
+          packets: Number(f.packets ?? 0),
+          reported: Number(f.reported ?? Math.floor(Date.now() / 1000)),
+        })),
+      );
+      return json(res, 200, { ok: true });
+    }
+
+    if (req.method === "GET" && url.startsWith("/api/v1/flows/top")) {
+      const params = new URL(url, "http://x").searchParams;
+      const windowSec = Number(params.get("window") ?? 3600);
+      const limit = Number(params.get("limit") ?? 20);
+      const since = Math.floor(Date.now() / 1000) - windowSec;
+      return json(res, 200, { top: flowStore.topTalkers(since, limit) });
+    }
+
+    if (req.method === "POST" && url === "/api/v1/admin/flows/purge") {
+      flowStore.purge();
+      return json(res, 200, { ok: true });
+    }
+
+    if (req.method === "GET" && url === "/metrics") {
+      // Control-side metrics: node convergence, enrolment queue, dead-man.
+      const reg = loadRegistry();
+      const lines: string[] = [
+        "# TYPE opnmesh_node_drift gauge",
+        "# TYPE opnmesh_node_last_seen_timestamp_seconds gauge",
+        "# TYPE opnmesh_node_reconcile_error gauge",
+      ];
+      for (const siteId of Object.keys(reg.bindings)) {
+        const desired = desiredFor(siteId);
+        const report = reports.get(siteId);
+        const drift = desired && report && report.diskHash !== desired.hash ? 1 : 0;
+        lines.push(`opnmesh_node_drift{node="${siteId}"} ${drift}`);
+        lines.push(
+          `opnmesh_node_last_seen_timestamp_seconds{node="${siteId}"} ${report ? Math.floor(report.lastSeen / 1000) : 0}`,
+        );
+        lines.push(`opnmesh_node_reconcile_error{node="${siteId}"} ${report && report.lastError !== "" ? 1 : 0}`);
+      }
+      lines.push("# TYPE opnmesh_pending_nodes gauge", `opnmesh_pending_nodes ${reg.pending.length}`);
+      lines.push(
+        "# TYPE opnmesh_deadman_last_success_timestamp_seconds gauge",
+        `opnmesh_deadman_last_success_timestamp_seconds ${Math.floor(deadmanLastSuccess / 1000)}`,
+      );
+      lines.push("# TYPE opnmesh_flow_records gauge", `opnmesh_flow_records ${flowStore.count()}`);
+      res.writeHead(200, { "content-type": "text/plain; version=0.0.4" });
+      return res.end(lines.join("\n") + "\n");
     }
 
     if (req.method === "GET" && url === "/install.sh") {
