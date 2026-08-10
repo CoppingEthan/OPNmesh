@@ -1,0 +1,7 @@
+{
+  "nodeId": "site-b",
+  "role": "gateway",
+  "listenPort": 51999,
+  "needsReresolve": false,
+  "privateKeyPath": "/etc/opnmesh/keys/wg0.key"
+}

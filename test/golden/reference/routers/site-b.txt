@@ -1,0 +1,20 @@
+# Router instructions for site "site-b" (Site B)
+# Next hop for all mesh routes: the WireGuard gateway at 10.20.0.2
+
+## Static routes
+10.10.0.0/16 via 10.20.0.2    # site-a LAN
+10.30.0.0/16 via 10.20.0.2    # site-c LAN
+10.99.0.0/24 via 10.20.0.2    # mesh tunnel addresses
+10.99.1.0/24 via 10.20.0.2    # roaming clients (aggregate only — never per-client routes)
+
+## Firewall
+# Block LAN hosts from opening connections to roaming clients (defense in
+# depth — the gateway already enforces this with conntrack):
+LAN-IN: drop NEW connections from 10.20.0.0/16 to 10.99.1.0/24
+
+## WAN
+Forward UDP port 51820 to 10.20.0.2 (WireGuard on this gateway).
+
+## Note for UniFi gateways
+A static route alone is NOT enough on UniFi: traffic is silently dropped
+unless a matching LAN-IN firewall rule allows the routed subnets.

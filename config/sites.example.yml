@@ -1,0 +1,78 @@
+# OPNmesh example configuration.
+#
+# Copy to sites.yml and adapt. sites.yml is gitignored in THIS repository on
+# purpose: it describes your entire network topology and belongs only in the
+# local, private config repository OPNmesh maintains on your control node.
+#
+# Only PUBLIC keys appear here. Private keys are generated on each node and
+# never leave it.
+version: 1
+
+network:
+  name: example
+  # Tunnel address space. Gateways get /32s from gateway_subnet, roaming
+  # clients from client_subnet.
+  gateway_subnet: 10.99.0.0/24
+  client_subnet: 10.99.1.0/24
+  # Defaults only — every node can override. Nothing in OPNmesh hardcodes a port.
+  default_listen_port: 51820
+  default_mtu: 1420          # use 1380 on PPPoE links
+  keepalive: 25
+
+# Topology shape:
+#   full-mesh  — every site can open a UDP port; every pair connects directly.
+#   multi-hub  — sites that can open a port are hubs; NAT-bound sites dial every hub.
+#   single-hub — one open port total; ALL inter-site traffic depends on that hub.
+topology:
+  shape: full-mesh
+
+sites:
+  - id: site-a
+    name: Site A
+    lan: 10.10.0.0/16
+    gateway:
+      name: Gateway A          # display name — cosmetic, never appears in generated config
+      lan_ip: 10.10.0.2        # the gateway's address on its own LAN (router next hop)
+      tunnel_ip: 10.99.0.1
+      endpoint: 198.51.100.10  # public IP or DDNS hostname; null if no inbound UDP
+      listen_port: 51820       # per-node; omit to use default_listen_port
+      public_key: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=
+  - id: site-b
+    name: Site B
+    lan: 10.20.0.0/16
+    gateway:
+      name: Gateway B
+      lan_ip: 10.20.0.2
+      tunnel_ip: 10.99.0.2
+      endpoint: 198.51.100.20
+      public_key: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=
+  - id: site-c
+    name: Site C
+    lan: 10.30.0.0/16
+    gateway:
+      name: Gateway C
+      lan_ip: 10.30.0.2
+      tunnel_ip: 10.99.0.3
+      endpoint: 198.51.100.30
+      public_key: ccccccccccccccccccccccccccccccccccccccccccc=
+
+clients:
+  - id: laptop
+    name: Laptop
+    tunnel_ip: 10.99.1.10
+    public_key: ddddddddddddddddddddddddddddddddddddddddddd=
+    # entry_points: ordered preference of sites whose gateway the client dials.
+    # Omit to use every site with an inbound endpoint. Entry point does not
+    # limit reach — a client entering at one site reaches every site.
+    home_site: site-b          # cosmetic + DNS-level only; any site is allowed
+
+# Optional management ACLs, generated into every gateway's nftables ruleset:
+# admin sources may reach management destinations; nothing else may; and
+# management devices never initiate connections across the mesh.
+policy:
+  management:
+    admin_sources:
+      - 10.10.5.0/24
+    management_destinations:
+      - 10.10.9.0/24
+      - 10.30.9.0/24

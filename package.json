@@ -1,0 +1,27 @@
+{
+  "name": "opnmesh",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted WireGuard mesh management for small multi-site networks",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "goldens:update": "cross-env UPDATE_GOLDENS=1 vitest run test/golden.test.ts"
+  },
+  "dependencies": {
+    "yaml": "^2.6.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "cross-env": "^7.0.3",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
