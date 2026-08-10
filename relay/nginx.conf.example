@@ -1,0 +1,23 @@
+# OPNmesh relay — publish the control node's API/UI on a public address and
+# forward over the mesh. Replace the placeholders; do not hardcode ports.
+#
+#   RELAY_LISTEN      public port agents dial       e.g. 8443
+#   CONTROL_UPSTREAM  control node over the mesh     e.g. 10.99.0.1:8080
+#   UI_UPSTREAM       control UI over the mesh       e.g. 10.99.0.1:3000
+#
+# TLS is terminated at the control node, not here: the relay forwards the
+# encrypted stream so agents keep verifying the control node's own certificate.
+# For plain HTTP behind your own TLS, swap the stream block for a proxy_pass.
+
+events {}
+
+stream {
+  upstream control_api {
+    server CONTROL_UPSTREAM;   # e.g. 10.99.0.1:8080
+  }
+  server {
+    listen RELAY_LISTEN;       # e.g. 8443
+    proxy_pass control_api;
+    proxy_connect_timeout 5s;
+  }
+}

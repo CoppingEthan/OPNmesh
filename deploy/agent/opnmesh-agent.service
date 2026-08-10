@@ -1,0 +1,20 @@
+# OPNmesh agent — pulls config from the control node and reconciles it.
+# Installed by install.sh. The A/B wrapper prefers a flipped-in version if one
+# exists (§11 layer 5), so self-updates survive a restart.
+[Unit]
+Description=OPNmesh agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/opnmesh-agent-wrapper
+Restart=always
+RestartSec=5
+# The agent writes wg0.conf / nftables and runs wg-quick, so it needs root.
+User=root
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

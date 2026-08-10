@@ -1,0 +1,11 @@
+# Re-resolve peer hostnames and update endpoints. wg-quick resolves hostnames
+# once at interface start and never again; a peer on DDNS therefore needs
+# periodic re-resolution. install.sh enables the matching timer automatically
+# whenever a peer endpoint is a hostname (agent-settings.json needs_reresolve).
+[Unit]
+Description=OPNmesh re-resolve WireGuard peer DNS
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/opnmesh-reresolve-dns wg0

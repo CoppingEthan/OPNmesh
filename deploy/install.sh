@@ -101,14 +101,33 @@ cat > /etc/opnmesh/agent.json <<EOF
   "conf_dir": "/etc/opnmesh",
   "state_dir": "/var/lib/opnmesh",
   "wg_interface": "wg0",
-  "poll_interval_sec": 10
+  "poll_interval_sec": 10,
+  "commit_confirm_sec": 90,
+  "boot_watchdog_sec": 180
 }
 EOF
+
+# 5. Install units if they were staged alongside the script (real installer
+#    ships them next to install.sh). The agent binary and helpers go in
+#    /usr/local/bin; the A/B wrapper prefers a flipped-in version.
+STAGE="$(dirname "$0")"
+for unit in opnmesh-agent.service opnmesh-reresolve-dns.service opnmesh-reresolve-dns.timer; do
+  [ -f "$STAGE/$unit" ] && install -m 0644 "$STAGE/$unit" /etc/systemd/system/ 2>/dev/null || true
+done
+for bin in opnmesh-agent-wrapper opnmesh-reresolve-dns; do
+  [ -f "$STAGE/$bin" ] && install -m 0755 "$STAGE/$bin" /usr/local/bin/ 2>/dev/null || true
+done
 
 echo "enrolled: node is PENDING approval (key fingerprint follows for out-of-band verification)"
 printf '%s' "$PUBKEY" | sha256sum | cut -c1-16
 echo "approve this node in the OPNmesh UI; it will pull its configuration on the next poll"
 
 if [ "$START_AGENT" = "1" ] && command -v systemctl >/dev/null 2>&1; then
-  systemctl enable --now opnmesh-agent 2>/dev/null || echo "start the agent manually: opnmesh-agent -config /etc/opnmesh/agent.json"
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable --now opnmesh-agent 2>/dev/null \
+    || echo "start the agent manually: opnmesh-agent -config /etc/opnmesh/agent.json"
+  # The reresolve-dns timer is enabled once config arrives and a peer endpoint
+  # is a hostname (agent-settings.json needs_reresolve); enabling it here is
+  # harmless when no hostname peers exist.
+  systemctl enable --now opnmesh-reresolve-dns.timer 2>/dev/null || true
 fi
