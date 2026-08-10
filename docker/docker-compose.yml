@@ -22,7 +22,9 @@ networks:
         - subnet: 10.30.0.0/16
 
 x-node: &node
-  build: .
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
   image: opnmesh-sim-node
   cap_add:
     - NET_ADMIN
@@ -127,12 +129,32 @@ services:
     command: /opt/opnmesh/client.sh
 
   control:
-    <<: *node
+    # Plain Node image: runs the bundled dev control server. The data plane
+    # must keep working when this container is killed. Like any host on a
+    # site LAN, it reaches the mesh via its site's WireGuard gateway.
+    image: node:22-alpine
     container_name: opnmesh-control
+    restart: "no"
+    cap_add:
+      - NET_ADMIN
     networks:
       lan-a:
         ipv4_address: 10.10.7.10
-    command: /opt/opnmesh/control.sh
+    volumes:
+      - ./state:/state
+    environment:
+      STATE_DIR: /state
+      PORT: 8080
+    ports:
+      - "18080:8080"
+    depends_on:
+      - gw-a
+    command:
+      [
+        "sh",
+        "-c",
+        "ip route replace default via 10.10.0.2 && exec node /state/control/server.mjs",
+      ]
 
   traffic-gen:
     <<: *node

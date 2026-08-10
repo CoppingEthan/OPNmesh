@@ -7,6 +7,11 @@ RUN git clone --depth 1 https://git.zx2c4.com/wireguard-go /src \
     && cd /src \
     && go build -o /wireguard-go .
 
+# The OPNmesh agent, built from ./agent (build context is the repo root).
+FROM golang:1.23-alpine AS agent
+COPY agent/ /build/
+RUN cd /build && go vet ./... && go test ./... && go build -o /opnmesh-agent .
+
 FROM alpine:3.20
 
 RUN apk add --no-cache \
@@ -20,8 +25,9 @@ RUN apk add --no-cache \
     netcat-openbsd
 
 COPY --from=wg-go /wireguard-go /usr/bin/wireguard-go
+COPY --from=agent /opnmesh-agent /usr/bin/opnmesh-agent
 
 ENV WG_QUICK_USERSPACE_IMPLEMENTATION=wireguard-go
 
-COPY entrypoints/ /opt/opnmesh/
+COPY docker/entrypoints/ /opt/opnmesh/
 RUN chmod +x /opt/opnmesh/*.sh

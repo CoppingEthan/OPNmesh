@@ -3,31 +3,33 @@
  * generated real keypairs, runs the production generator, and writes each
  * node's files into docker/state/ for the compose mesh to mount.
  *
- * Keys are x25519 via Node's crypto — byte-compatible with WireGuard.
+ * Also produces everything the phase-3 agent/control loop needs:
+ *   - state/sites.yml            source of truth served by the control server
+ *   - state/<site>/agent.json    agent configuration (poll URL, paths)
+ *   - state/<site>/agent.token   per-node bearer token
+ *   - state/control/tokens.json  token → node map for the control server
+ *   - state/control/server.mjs   bundled control dev server (esbuild)
+ *
  * SIMULATION ONLY: a real deployment generates keys on each node and they
  * never leave it; here the harness plays the role of every node at once.
  * docker/state/ is gitignored.
  */
-import { generateKeyPairSync } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parse as parseYaml } from "yaml";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { build } from "esbuild";
 import { sitesFileSchema, resolveConfig } from "../lib/schema.js";
 import { generateAll } from "../lib/generator/index.js";
 import { runValidators } from "../lib/validators/index.js";
 import { CLIENT_PRIVATE_KEY_PLACEHOLDER } from "../lib/generator/wireguard.js";
+import { wgKeypair, agentToken } from "./simkeys.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const stateDir = join(here, "state");
 
-function wgKeypair(): { privateKey: string; publicKey: string } {
-  const { publicKey, privateKey } = generateKeyPairSync("x25519");
-  // Raw keys are the last 32 bytes of the DER encodings.
-  const pub = (publicKey.export({ type: "spki", format: "der" }) as Buffer).subarray(-32);
-  const priv = (privateKey.export({ type: "pkcs8", format: "der" }) as Buffer).subarray(-32);
-  return { publicKey: pub.toString("base64"), privateKey: priv.toString("base64") };
-}
+const CONTROL_URL = "http://10.10.7.10:8080";
+const AGENT_POLL_SEC = 3;
 
 const fixture = readFileSync(join(here, "..", "test", "fixtures", "reference.yml"), "utf8");
 const raw = sitesFileSchema.parse(parseYaml(fixture));
@@ -55,6 +57,12 @@ if (errors.length > 0) {
 }
 
 rmSync(stateDir, { recursive: true, force: true });
+mkdirSync(join(stateDir, "control"), { recursive: true });
+
+// Source of truth for the control server (public keys only, like the real thing).
+writeFileSync(join(stateDir, "sites.yml"), stringifyYaml(raw), "utf8");
+
+const tokenMap: Record<string, string> = {};
 
 for (const [siteId, node] of Object.entries(bundle.nodes)) {
   const dir = join(stateDir, siteId);
@@ -67,7 +75,33 @@ for (const [siteId, node] of Object.entries(bundle.nodes)) {
     encoding: "utf8",
     mode: 0o600,
   });
+
+  const token = agentToken();
+  tokenMap[token] = siteId;
+  writeFileSync(join(dir, "agent.token"), token + "\n", { encoding: "utf8", mode: 0o600 });
+  writeFileSync(
+    join(dir, "agent.json"),
+    JSON.stringify(
+      {
+        server_url: CONTROL_URL,
+        token_file: "/etc/opnmesh/agent.token",
+        conf_dir: "/etc/opnmesh",
+        state_dir: "/var/lib/opnmesh",
+        wg_interface: "wg0",
+        poll_interval_sec: AGENT_POLL_SEC,
+      },
+      null,
+      2,
+    ) + "\n",
+    "utf8",
+  );
 }
+
+writeFileSync(
+  join(stateDir, "control", "tokens.json"),
+  JSON.stringify(tokenMap, null, 2) + "\n",
+  { encoding: "utf8", mode: 0o600 },
+);
 
 for (const [clientId, { config }] of Object.entries(bundle.clients)) {
   const dir = join(stateDir, "clients", clientId);
@@ -75,6 +109,19 @@ for (const [clientId, { config }] of Object.entries(bundle.clients)) {
   const withKey = config.replace(CLIENT_PRIVATE_KEY_PLACEHOLDER, keys.get(clientId)!.privateKey);
   writeFileSync(join(dir, "wg0.conf"), withKey, { encoding: "utf8", mode: 0o600 });
 }
+
+// Bundle the control dev server so the control container only needs plain Node.
+await build({
+  entryPoints: [join(here, "..", "scripts", "control-dev.ts")],
+  bundle: true,
+  platform: "node",
+  target: "node22",
+  format: "esm",
+  outfile: join(stateDir, "control", "server.mjs"),
+  banner: {
+    js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);",
+  },
+});
 
 console.log(
   `wrote simulation state for ${cfg.sites.length} gateways and ${cfg.clients.length} client(s) to ${stateDir}`,
