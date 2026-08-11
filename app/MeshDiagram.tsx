@@ -31,6 +31,8 @@ interface Body {
   degree: number;
   /** Held in place by the pointer. */
   pinned: boolean;
+  /** When this node first appeared, so it can fade in rather than pop. */
+  appeared: number;
 }
 
 const INK = "228, 228, 231"; // zinc-200, as an rgb triple for rgba()
@@ -56,6 +58,14 @@ export default function MeshDiagram({ initial, refreshMs = 5000 }: { initial: Me
 
   const graphRef = useRef<MeshGraph>(initial);
   const bodiesRef = useRef<Map<string, Body>>(new Map());
+  /**
+   * Displayed link load, eased toward the measured value. Polling gives a new
+   * number every few seconds; without this the whole picture steps.
+   */
+  const shownRef = useRef<Map<string, { out: number; in: number }>>(new Map());
+  const peakRef = useRef(1);
+  /** Node/link membership, so we only reheat physics when the shape changes. */
+  const shapeRef = useRef("");
   const alphaRef = useRef(1);
   const viewRef = useRef({ scale: 1, ox: 0, dy: 0, ready: false });
   const sizeRef = useRef({ w: 800, h: 520, dpr: 1 });
@@ -100,11 +110,28 @@ export default function MeshDiagram({ initial, refreshMs = 5000 }: { initial: Me
           node: n,
           degree: degree.get(n.id) ?? 0,
           pinned: false,
+          appeared: performance.now(),
         });
       }
     }
     for (const id of [...bodies.keys()]) if (!seen.has(id)) bodies.delete(id);
-    alphaRef.current = Math.max(alphaRef.current, 0.6); // reheat so it re-settles
+
+    // Reheat the simulation only when the graph's SHAPE changes. A poll that
+    // merely brings new traffic numbers must not jolt the layout.
+    const shape = [
+      graph.nodes.map((n) => n.id).sort().join(","),
+      graph.links.map((l) => l.id).sort().join(","),
+    ].join("|");
+    if (shape !== shapeRef.current) {
+      shapeRef.current = shape;
+      alphaRef.current = Math.max(alphaRef.current, 0.6);
+    }
+
+    // Drop smoothing state for links that no longer exist.
+    const liveLinks = new Set(graph.links.map((l) => l.id));
+    for (const id of [...shownRef.current.keys()]) {
+      if (!liveLinks.has(id)) shownRef.current.delete(id);
+    }
     setSummary({
       gateways: graph.nodes.filter((n) => n.kind === "gateway").length,
       clients: graph.nodes.filter((n) => n.kind === "client").length,
@@ -224,14 +251,23 @@ export default function MeshDiagram({ initial, refreshMs = 5000 }: { initial: Me
           b.vy -= fy;
         }
 
+        // Shape the potential well to the container. Pulling harder along Y
+        // than X makes the graph settle wide and flat, matching the box it
+        // lives in, instead of drifting into a tall column that wastes the
+        // horizontal space and then gets scaled down to fit.
+        const aspect = Math.max(1, sizeRef.current.w / Math.max(1, sizeRef.current.h));
+        const bias = Math.pow(aspect, 1.5);
+        const cx = CENTERING / bias;
+        const cy = CENTERING * bias;
+
         for (const b of bodies) {
           if (b.pinned) {
             b.vx = 0;
             b.vy = 0;
             continue;
           }
-          b.vx -= b.x * CENTERING * alpha;
-          b.vy -= b.y * CENTERING * alpha;
+          b.vx -= b.x * cx * alpha;
+          b.vy -= b.y * cy * alpha;
           b.vx *= DAMPING;
           b.vy *= DAMPING;
           b.x += b.vx;
@@ -305,8 +341,19 @@ export default function MeshDiagram({ initial, refreshMs = 5000 }: { initial: Me
         }
       }
 
+      // Ease displayed load toward the measured value so the picture breathes
+      // between polls rather than stepping. ~1s to converge at 60fps.
+      const EASE = 0.06;
+      for (const l of graph.links) {
+        const shown = shownRef.current.get(l.id) ?? { out: l.rateOut, in: l.rateIn };
+        shown.out += (l.rateOut - shown.out) * EASE;
+        shown.in += (l.rateIn - shown.in) * EASE;
+        shownRef.current.set(l.id, shown);
+      }
+      peakRef.current += ((graph.peakRate || 1) - peakRef.current) * EASE;
+
       // Links: one colour, one width. Opacity carries how busy the tunnel is.
-      const peak = graph.peakRate || 1;
+      const peak = Math.max(1, peakRef.current);
       ctx.lineWidth = 1;
       for (const l of graph.links) {
         const a = bodiesRef.current.get(l.from);
@@ -314,7 +361,8 @@ export default function MeshDiagram({ initial, refreshMs = 5000 }: { initial: Me
         if (!a || !b) continue;
         const sa = toScreen(a);
         const sb = toScreen(b);
-        const busiest = Math.max(l.rateOut, l.rateIn);
+        const shown = shownRef.current.get(l.id) ?? { out: l.rateOut, in: l.rateIn };
+        const busiest = Math.max(shown.out, shown.in);
         // Square root so a quiet-but-alive link is still visible next to a
         // saturated one, rather than being crushed to nothing.
         const load = busiest > 0 ? Math.sqrt(busiest / peak) : 0;
@@ -340,8 +388,8 @@ export default function MeshDiagram({ initial, refreshMs = 5000 }: { initial: Me
             ctx.arc(from.x + (to.x - from.x) * k, from.y + (to.y - from.y) * k, 1.6, 0, Math.PI * 2);
             ctx.fill();
           };
-          if (l.rateOut > 0) dot(sa, sb, 0);
-          if (l.rateIn > 0) dot(sb, sa, 0.5);
+          if (shown.out > 0) dot(sa, sb, 0);
+          if (shown.in > 0) dot(sb, sa, 0.5);
         }
       }
 
@@ -350,7 +398,9 @@ export default function MeshDiagram({ initial, refreshMs = 5000 }: { initial: Me
       for (const b of bodies) {
         const s = toScreen(b);
         const r = radiusOf(b);
-        const dim = focus ? (neighbours.has(b.id) ? 1 : 0.22) : 1;
+        // New nodes ease in over ~600ms so an enrolment does not pop.
+        const age = Math.min(1, (performance.now() - b.appeared) / 600);
+        const dim = (focus ? (neighbours.has(b.id) ? 1 : 0.22) : 1) * age;
         const status = STATUS[b.node.health] ?? STATUS["unknown"]!;
         // Healthy nodes stay neutral so that anything coloured means trouble.
         const ring = b.node.health === "active" ? (b.node.kind === "gateway" ? "#a1a1aa" : MUTED) : status;
@@ -389,16 +439,18 @@ export default function MeshDiagram({ initial, refreshMs = 5000 }: { initial: Me
         ctx.textAlign = "center";
         for (const l of graph.links) {
           if (l.from !== focus && l.to !== focus) continue;
-          if (l.rateOut <= 0 && l.rateIn <= 0) continue;
+          const shown = shownRef.current.get(l.id) ?? { out: l.rateOut, in: l.rateIn };
+          if (shown.out <= 0 && shown.in <= 0) continue;
           const a = bodiesRef.current.get(l.from);
           const b = bodiesRef.current.get(l.to);
           if (!a || !b) continue;
           const sa = toScreen(a);
           const sb = toScreen(b);
           // Rate away from the focused node, so the number always reads
-          // "leaving the thing you are looking at".
-          const away = l.from === focus ? l.rateOut : l.rateIn;
-          const towards = l.from === focus ? l.rateIn : l.rateOut;
+          // "leaving the thing you are looking at". Uses the same eased value
+          // the line is drawn from, so the label and the picture agree.
+          const away = l.from === focus ? shown.out : shown.in;
+          const towards = l.from === focus ? shown.in : shown.out;
           const mx = (sa.x + sb.x) / 2;
           const my = (sa.y + sb.y) / 2;
           ctx.fillStyle = `rgba(${INK}, 0.75)`;
