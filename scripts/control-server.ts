@@ -17,12 +17,12 @@
  */
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, X509Certificate } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, basename } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import { loadSitesYaml } from "../lib/schema.js";
-import { generateAll } from "../lib/generator/index.js";
+import { loadSitesYaml, type ResolvedConfig } from "../lib/schema.js";
+import { generateAll, type GeneratedBundle } from "../lib/generator/index.js";
 import {
   authenticate,
   approve,
@@ -68,6 +68,24 @@ function adminTokenFromEnv(): string | undefined {
   return process.env["OPNMESH_ADMIN_TOKEN"];
 }
 const adminAuth = new AdminAuth(adminTokenFromEnv);
+
+/**
+ * SHA-256 of our own certificate's public key (SPKI), in the same form the
+ * agent pins and the installer's --pin expects. Publishing it lets an operator
+ * verify the control node out-of-band instead of trusting whatever answers
+ * during enrolment. It is derived from the public certificate only.
+ */
+function ownCertPin(): string | null {
+  if (!TLS_CERT) return null;
+  try {
+    const cert = new X509Certificate(readFileSync(TLS_CERT));
+    const der = cert.publicKey.export({ type: "spki", format: "der" }) as Buffer;
+    return createHash("sha256").update(der).digest("hex");
+  } catch (e) {
+    console.error("could not derive the certificate pin from OPNMESH_TLS_CERT:", e);
+    return null;
+  }
+}
 
 /** Enrolment is public, so it is the one endpoint an attacker can hammer. */
 const enrolLimiter = new RateLimiter(10, 15 * 60 * 1000);
@@ -125,7 +143,7 @@ function sortedPair(a: string, b: string): string {
 
 /** Cumulative bytes per link, normalised to "lower id → higher id". */
 function peerTotals(): Map<string, { aToB: number; bToA: number }> {
-  const cfg = loadSitesYaml(readFileSync(SITES_PATH, "utf8"));
+  const { cfg } = currentBundle();
   const keyToId = new Map<string, string>([
     ...cfg.sites.map((s) => [s.gateway.publicKey, s.id] as const),
     ...cfg.clients.map((c) => [c.publicKey, c.id] as const),
@@ -242,8 +260,7 @@ function manifestFor(version: string): ReleaseManifest | null {
 
 /** Digest of the full generated bundle for the current topology. */
 function currentConfigDigest(): string {
-  const cfg = loadSitesYaml(readFileSync(SITES_PATH, "utf8"));
-  const bundle = generateAll(cfg);
+  const { bundle } = currentBundle();
   const h = createHash("sha256");
   for (const id of Object.keys(bundle.nodes).sort()) {
     h.update(hashFiles(bundle.nodes[id]!.files));
@@ -302,8 +319,7 @@ function loadPortChange(): PortChange | null {
 function tickPortChange(): void {
   const pc = loadPortChange();
   if (!pc) return;
-  const cfg = loadSitesYaml(readFileSync(SITES_PATH, "utf8"));
-  const gateways = cfg.sites.map((s) => s.id);
+  const gateways = currentBundle().cfg.sites.map((s) => s.id);
   const now = Math.floor(Date.now() / 1000);
   const allConverged = gateways.every((id) => {
     const desired = desiredFor(id);
@@ -398,7 +414,7 @@ async function sendTestEmail(): Promise<{ ok: boolean; error?: string }> {
 }
 
 function flowRetentionCutoff(): number {
-  const cfg = loadSitesYaml(readFileSync(SITES_PATH, "utf8"));
+  const { cfg } = currentBundle();
   return Math.floor(Date.now() / 1000) - cfg.network.flowRetentionDays * 86400;
 }
 // Retention is enforced continuously, not just at query time.
@@ -431,10 +447,35 @@ function hashFiles(files: Record<string, string>): string {
   return h.digest("hex");
 }
 
-function desiredFor(nodeId: string): { files: Record<string, string>; hash: string } | null {
-  const cfg = loadSitesYaml(readFileSync(SITES_PATH, "utf8"));
+/**
+ * Parsed config + generated bundle for the current sites.yml, memoised on the
+ * file's contents.
+ *
+ * Regenerating per call does not scale and is trivially abusable: generating
+ * one node's config builds the bundle for EVERY node, so a 100-node mesh made
+ * each agent poll O(100) node-configs, and /api/v1/state and /metrics repeated
+ * that once per node again. Routine polling alone was enough to saturate the
+ * single-threaded event loop and stall the API the whole mesh depends on.
+ *
+ * Keying on content rather than mtime keeps this correct: writers replace
+ * sites.yml through writeFileSync, and the next read produces a different
+ * digest, so a stale bundle can never be served. Reading a few KB of YAML is
+ * negligible next to parsing and generating it.
+ */
+let bundleCache: { key: string; cfg: ResolvedConfig; bundle: GeneratedBundle } | null = null;
+
+function currentBundle(): { cfg: ResolvedConfig; bundle: GeneratedBundle } {
+  const raw = readFileSync(SITES_PATH, "utf8");
+  const key = createHash("sha256").update(raw).digest("hex");
+  if (bundleCache?.key === key) return bundleCache;
+  const cfg = loadSitesYaml(raw);
   const bundle = generateAll(cfg);
-  const node = bundle.nodes[nodeId];
+  bundleCache = { key, cfg, bundle };
+  return bundleCache;
+}
+
+function desiredFor(nodeId: string): { files: Record<string, string>; hash: string } | null {
+  const node = currentBundle().bundle.nodes[nodeId];
   if (!node) return null;
   return { files: node.files, hash: hashFiles(node.files) };
 }
@@ -756,6 +797,9 @@ const handler = async (req: IncomingMessage, res: ServerResponse) => {
         role,
         expiresAt: reg.enrolTokens[reg.enrolTokens.length - 1]!.expiresAt,
         installShSha256: script ? createHash("sha256").update(script).digest("hex") : null,
+        // So the operator can pass --pin and verify the control node rather
+        // than trusting whichever host answers during enrolment.
+        certPin: ownCertPin(),
       });
     }
 

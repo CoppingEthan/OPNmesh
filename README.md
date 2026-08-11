@@ -236,16 +236,28 @@ every gateway, so the trust boundaries are explicit.
   certificate unless you explicitly set `OPNMESH_ALLOW_INSECURE_HTTP=1` for an
   isolated lab. `install.sh` records the control node's certificate public key
   and the agent **pins** it, so a private mesh needs no public CA and a swapped
-  certificate is refused.
+  certificate is refused. The pin must match the **leaf** certificate — the one
+  whose private key the peer proved it holds — so an interceptor cannot satisfy
+  it by stapling a copy of the real (public) certificate behind their own.
+  Pass `--pin <sha256>` to `install.sh`, using the value the UI prints beside
+  the enrolment command: without it the first connection is trusted blind, and
+  whoever answers it is trusted from then on.
 - **The agent does not trust the control node with paths or commands.** It
   writes only its own known filenames (no traversal), validates release
   versions before they touch a path, and refuses any packet-capture filter
   containing a `-` token — tcpdump would read that as an option, and `-z` runs
   a command as root.
 - **UI auth**: one local admin, argon2id, server-side sessions stored *hashed*,
-  idle + absolute timeouts, per-source login throttling that only counts
-  failures (so nobody can lock you out of your own panel), and a one-time
-  bootstrap token for first-run setup printed to the server log.
+  idle + absolute timeouts, login throttling that only counts failures (so
+  nobody can lock you out of your own panel), and a one-time bootstrap token
+  for first-run setup printed to the server log. First-run setup is throttled
+  on the same ledger, so the setup code cannot be guessed at speed either.
+- **Throttling does not trust request headers.** `X-Forwarded-For` is only read
+  when you set `OPNMESH_TRUST_PROXY=1`, which you should do **only** when the
+  panel really is behind a reverse proxy that overwrites it. Anything else
+  would let a caller vary the header per request, land in a fresh bucket every
+  time, and guess the admin password without limit. A global failure ceiling
+  backstops the per-source count either way.
 - **Exporters bind to the tunnel address only.** Prometheus scrapes gateways
   over the mesh; the metrics port is not reachable from the WAN.
 - **No secrets in URLs.** Enrolment tokens are shown once from a server-side

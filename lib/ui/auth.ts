@@ -9,6 +9,9 @@
  *  - Login throttling is per source address and only counts FAILURES, so an
  *    attacker cannot lock the single admin out of their own panel during an
  *    incident — the thing they would most want to do first.
+ *  - The source address is only read from proxy headers when the operator
+ *    states the panel is behind a proxy, and a global ceiling backstops it.
+ *    Both exist because those headers are attacker-supplied (see below).
  *  - Changing the password invalidates every existing session.
  *  - First-run setup is gated by a one-time bootstrap token printed to the
  *    server log, so whoever reaches the port first cannot claim the panel.
@@ -31,6 +34,26 @@ const COOKIE_INSECURE = "opnmesh_session";
 const MIN_PASSWORD_LENGTH = 12;
 const FAILURES_BEFORE_THROTTLE = 5;
 const THROTTLE_WINDOW_MS = 15 * 60 * 1000;
+/**
+ * Ceiling on failures from ALL sources combined. The per-source limit is the
+ * primary control, but its key comes from a request header whenever proxy
+ * trust is enabled, and a header can be varied per request. This bound cannot
+ * be moved by anything the caller sends, so brute force stays bounded even if
+ * the per-source key is being manipulated. Set well above any plausible run of
+ * genuine typos so a real operator never meets it.
+ */
+const GLOBAL_FAILURES_BEFORE_THROTTLE = 50;
+
+/**
+ * X-Forwarded-For and X-Real-IP are supplied by whoever opens the connection.
+ * Honouring them unconditionally meant an attacker could send a different
+ * value on every request, land in a fresh throttle bucket each time, and guess
+ * the admin password without limit — the rate limit looked present and did
+ * nothing. They are now read only when the operator confirms the panel really
+ * is behind a reverse proxy that overwrites them; otherwise every request
+ * shares one bucket, which is the honest picture of a directly-reachable port.
+ */
+const TRUST_PROXY_HEADERS = process.env["OPNMESH_TRUST_PROXY"] === "1";
 
 /**
  * Cookies must be Secure in production. The one exception is an explicitly
@@ -58,6 +81,15 @@ function getDb(): Database.Database {
     CREATE INDEX IF NOT EXISTS login_failures_ts ON login_failures (ts);
   `);
   return db;
+}
+
+/**
+ * Release the SQLite handle. Used on shutdown and by tests, which cannot
+ * remove their temp directory on Windows while the file is still open.
+ */
+export function closeDb(): void {
+  db?.close();
+  db = null;
 }
 
 const hashToken = (token: string): string => createHash("sha256").update(token, "utf8").digest("hex");
@@ -121,6 +153,10 @@ export async function setAdminPassword(password: string): Promise<void> {
     // A password change revokes existing sessions — otherwise a stolen
     // session survives the very action taken to stop it.
     d.prepare("DELETE FROM sessions").run();
+    // Whoever sets the password has proven themselves (bootstrap token, or an
+    // authenticated change). Clearing the ledger stops a throttle built up by
+    // an attacker from blocking the sign-in that follows.
+    d.prepare("DELETE FROM login_failures").run();
   })();
 }
 
@@ -132,22 +168,46 @@ export async function createAdminAccount(password: string, token: string): Promi
   return true;
 }
 
-async function sourceAddress(): Promise<string> {
-  const h = await headers();
-  // Behind a reverse proxy the first XFF hop is the client.
-  const xff = h.get("x-forwarded-for");
-  if (xff) return xff.split(",")[0]!.trim();
-  return h.get("x-real-ip") ?? "local";
+/**
+ * Setup is the one pre-authentication endpoint that accepts a secret, so it
+ * gets the same treatment as sign-in. The token is 192 bits and not guessable
+ * by brute force, but an unthrottled endpoint that checks a credential is a
+ * free oracle and a free way to make the panel do work.
+ */
+export async function setupThrottled(): Promise<boolean> {
+  return throttled(`setup:${await sourceAddress()}`);
 }
 
+export async function recordSetupFailure(): Promise<void> {
+  getDb()
+    .prepare("INSERT INTO login_failures (source, ts) VALUES (?, ?)")
+    .run(`setup:${await sourceAddress()}`, Date.now());
+}
+
+async function sourceAddress(): Promise<string> {
+  if (!TRUST_PROXY_HEADERS) return "direct";
+  const h = await headers();
+  // Behind a reverse proxy the first XFF hop is the client. Only reachable
+  // when the operator has set OPNMESH_TRUST_PROXY=1.
+  const xff = h.get("x-forwarded-for");
+  if (xff) return xff.split(",")[0]!.trim();
+  return h.get("x-real-ip") ?? "direct";
+}
+
+/**
+ * True when this source has spent its attempts, or when failures from every
+ * source together have hit the global ceiling.
+ */
 function throttled(source: string): boolean {
   const d = getDb();
   const cutoff = Date.now() - THROTTLE_WINDOW_MS;
   d.prepare("DELETE FROM login_failures WHERE ts < ?").run(cutoff);
-  const row = d.prepare("SELECT COUNT(*) AS n FROM login_failures WHERE source = ?").get(source) as {
+  const perSource = d.prepare("SELECT COUNT(*) AS n FROM login_failures WHERE source = ?").get(source) as {
     n: number;
   };
-  return row.n >= FAILURES_BEFORE_THROTTLE;
+  if (perSource.n >= FAILURES_BEFORE_THROTTLE) return true;
+  const total = d.prepare("SELECT COUNT(*) AS n FROM login_failures").get() as { n: number };
+  return total.n >= GLOBAL_FAILURES_BEFORE_THROTTLE;
 }
 
 export interface LoginResult {
@@ -169,9 +229,11 @@ export async function login(password: string): Promise<LoginResult> {
     return { ok: false, throttled: false };
   }
 
-  // Success clears this source's failures so a legitimate admin is never
-  // locked out by someone else's guessing.
-  d.prepare("DELETE FROM login_failures WHERE source = ?").run(source);
+  // A correct password proves the operator is present, so the whole failure
+  // ledger is cleared — not just this source's. Otherwise an attacker could
+  // park failures just under the global ceiling and leave the admin one typo
+  // away from being locked out of their own panel.
+  d.prepare("DELETE FROM login_failures").run();
 
   const token = randomBytes(32).toString("hex");
   const now = Date.now();

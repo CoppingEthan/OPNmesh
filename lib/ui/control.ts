@@ -78,10 +78,11 @@ export const control = {
       "/api/v1/admin/pending",
     ),
   issueToken: (role: string, note: string) =>
-    req<{ token: string; expiresAt: number; installShSha256: string | null }>("POST", "/api/v1/admin/enrol-tokens", {
-      role,
-      note,
-    }),
+    req<{ token: string; expiresAt: number; installShSha256: string | null; certPin: string | null }>(
+      "POST",
+      "/api/v1/admin/enrol-tokens",
+      { role, note },
+    ),
   approve: (pendingId: string, site: unknown) => req("POST", "/api/v1/admin/approve", { pendingId, site }),
   reject: (pendingId: string) => req("POST", "/api/v1/admin/reject", { pendingId }),
   removeNode: (siteId: string) => req("POST", "/api/v1/admin/remove", { siteId }),

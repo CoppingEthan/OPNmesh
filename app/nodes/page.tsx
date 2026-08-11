@@ -45,7 +45,12 @@ async function issueToken(formData: FormData) {
   );
   // The token is held server-side and shown once. Putting it in the URL would
   // leak it into browser history, proxy logs and Referer headers.
-  const ref = stash({ token: res.token, sha: res.installShSha256, expiresAt: res.expiresAt });
+  const ref = stash({
+    token: res.token,
+    sha: res.installShSha256,
+    expiresAt: res.expiresAt,
+    certPin: res.certPin,
+  });
   const { redirect } = await import("next/navigation");
   redirect(`/nodes?issued=${ref}`);
 }
@@ -90,7 +95,9 @@ export default async function NodesPage({
 }) {
   await requireAdmin();
   const params = await searchParams;
-  const issued = take<{ token: string; sha: string | null; expiresAt: number }>(params.issued);
+  const issued = take<{ token: string; sha: string | null; expiresAt: number; certPin: string | null }>(
+    params.issued,
+  );
   const sites = loadSites();
   const [state, pending, rollout] = await Promise.all([
     control.state().catch(() => ({ nodes: {} as Record<string, any> })),
@@ -196,7 +203,19 @@ export default async function NodesPage({
             </div>
             <pre className="conf">{`curl -fsSL https://<control-host>:<port>/install.sh | sudo bash -s -- \\
   --token ${issued.token} \\
-  --server https://<control-host>:<port>`}</pre>
+  --server https://<control-host>:<port>${issued.certPin ? ` \\\n  --pin ${issued.certPin}` : ""}`}</pre>
+            {issued.certPin ? (
+              <p className="mt-2 text-xs text-zinc-500">
+                <span className="text-emerald-400">--pin</span> ties enrolment to this control
+                node&rsquo;s certificate. Without it, the new node trusts whatever answers it — so
+                anyone able to intercept that first connection would be trusted from then on.
+              </p>
+            ) : (
+              <p className="status-warn mt-2 text-xs">
+                This control node is not serving TLS, so there is no certificate to pin. Enrol only
+                over a network you trust until TLS is configured.
+              </p>
+            )}
             {issued.sha && (
               <p className="mono mt-2 text-xs text-zinc-500">
                 install.sh SHA-256: {issued.sha}

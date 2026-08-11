@@ -7,6 +7,11 @@ const nextConfig: NextConfig = {
   ...(process.env.OPNMESH_STANDALONE === "1" ? { output: "standalone" as const } : {}),
   // Native modules used server-side only.
   serverExternalPackages: ["better-sqlite3", "argon2", "simple-git"],
+  // The panel renders no next/image components — the only image is a QR code
+  // built as a data URI. Turning optimisation off means image bytes are never
+  // handed to sharp/libvips, whose CVEs are the outstanding advisories against
+  // this dependency tree. Nothing in the UI changes.
+  images: { unoptimized: true },
   webpack: (config) => {
     // lib/ uses NodeNext-style ".js" specifiers (shared with tsx/vitest).
     config.resolve.extensionAlias = {

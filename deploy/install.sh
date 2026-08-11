@@ -22,6 +22,12 @@
 #   --token-file <f>  read the enrolment token from a file instead
 #   --server <url>    control node base URL, e.g. https://mesh.example:8443
 #                     (required; HTTPS enforced unless --insecure-http)
+#   --pin <sha256>    expected SHA-256 of the control node's certificate public
+#                     key. STRONGLY RECOMMENDED when enrolling across an
+#                     untrusted network: without it the pin recorded here is
+#                     whatever answered, so an attacker sitting in the path at
+#                     enrolment time is trusted from then on. The UI prints the
+#                     correct value beside the enrolment command.
 #   --insecure-http   allow http:// (simulation / lab use only)
 #   --no-deps         skip package installation
 #   --no-start        do not start the agent (the sim's entrypoint starts it)
@@ -29,6 +35,7 @@ set -eu
 
 TOKEN="${OPNMESH_TOKEN:-}"
 SERVER=""
+EXPECTED_PIN="${OPNMESH_PIN:-}"
 ALLOW_HTTP=0
 INSTALL_DEPS=1
 START_AGENT=1
@@ -38,6 +45,7 @@ while [ $# -gt 0 ]; do
     --token) TOKEN="$2"; shift 2 ;;
     --token-file) TOKEN="$(cat "$2")"; shift 2 ;;
     --server) SERVER="$2"; shift 2 ;;
+    --pin) EXPECTED_PIN="$2"; shift 2 ;;
     --insecure-http) ALLOW_HTTP=1; shift ;;
     --no-deps) INSTALL_DEPS=0; shift ;;
     --no-start) START_AGENT=0; shift ;;
@@ -101,6 +109,25 @@ if [ "$ALLOW_HTTP" != "1" ]; then
   if [ -z "$PIN" ]; then
     echo "could not read the control node's certificate in order to pin it" >&2
     exit 1
+  fi
+  # Compare against the operator-supplied value before trusting anything. This
+  # is what turns "trust whoever answered" into real verification: an attacker
+  # in the path presents their own certificate, the pin differs, and enrolment
+  # stops before the one-time token is sent to them.
+  if [ -n "$EXPECTED_PIN" ]; then
+    EXPECTED_PIN="$(printf '%s' "$EXPECTED_PIN" | tr 'A-Z' 'a-z' | tr -cd 'a-f0-9')"
+    if [ "$PIN" != "$EXPECTED_PIN" ]; then
+      echo "ABORTING: the control node's certificate does not match --pin." >&2
+      echo "  expected: $EXPECTED_PIN" >&2
+      echo "  observed: $PIN" >&2
+      echo "Someone may be intercepting this connection. No token has been sent." >&2
+      exit 1
+    fi
+    echo "control node certificate matches the expected pin"
+  else
+    echo "WARNING: no --pin given, so the certificate presented right now is" >&2
+    echo "trusted permanently. If this network is not trusted, stop and re-run" >&2
+    echo "with the --pin value shown in the OPNmesh UI." >&2
   fi
   echo "pinning control node certificate: ${PIN}"
 fi

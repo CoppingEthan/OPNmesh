@@ -8,21 +8,19 @@
  * the Origin header, so setup and sign-in are exercised for real.
  */
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
-import { spawn, type ChildProcess } from "node:child_process";
 import { cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { startNextServer, stopNextServer, type RunningServer } from "./helpers/next-server.js";
 
 const enabled = process.env["RUN_UI_TESTS"] === "1";
 const PORT = 3988;
 const BASE = `http://127.0.0.1:${PORT}`;
 const PASSWORD = "correct-horse-battery-staple";
 
-let server: ChildProcess | null = null;
+let server: RunningServer | null = null;
 let stateDir = "";
 let dataDir = "";
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** The hidden field name Next uses to route a form post to its server action. */
 async function actionIdOf(path: string): Promise<string> {
@@ -61,12 +59,9 @@ describe.skipIf(!enabled)("UI form flows", () => {
     cpSync(join(process.cwd(), "test", "fixtures", "reference.yml"), join(stateDir, "sites.yml"));
     mkdirSync(join(stateDir, "control"), { recursive: true });
 
-    server = spawn("npx", ["next", "start", "-p", String(PORT)], {
-      cwd: process.cwd(),
-      shell: true,
-      stdio: "ignore",
-      env: {
-        ...process.env,
+    server = await startNextServer(
+      PORT,
+      {
         OPNMESH_STATE_DIR: stateDir,
         OPNMESH_DATA_DIR: dataDir,
         OPNMESH_CONTROL_URL: "http://127.0.0.1:9",
@@ -74,31 +69,15 @@ describe.skipIf(!enabled)("UI form flows", () => {
         OPNMESH_ADMIN_TOKEN: "t".repeat(64),
         OPNMESH_ALLOW_INSECURE_HTTP: "1",
       },
-    });
-    const deadline = Date.now() + 60_000;
-    while (Date.now() < deadline) {
-      try {
-        await fetch(`${BASE}/setup`);
-        return;
-      } catch {
-        await sleep(1000);
-      }
-    }
-    throw new Error("next start did not come up");
-  }, 90_000);
+      "/setup",
+    );
+  }, 120_000);
 
-  afterAll(() => {
-    if (server?.pid) {
-      try {
-        process.kill(server.pid);
-        spawn("taskkill", ["/pid", String(server.pid), "/T", "/F"], { shell: true });
-      } catch {
-        /* already gone */
-      }
-    }
+  afterAll(async () => {
+    await stopNextServer(server);
     rmSync(stateDir, { recursive: true, force: true });
     rmSync(dataDir, { recursive: true, force: true });
-  });
+  }, 30_000);
 
   it("a form post with a normal browser Origin is accepted, not a 500", async () => {
     // Guards the exact regression: a security header that nulls the Origin

@@ -5,11 +5,11 @@
  * session handling, and that every page renders its content.
  */
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
-import { spawn, type ChildProcess } from "node:child_process";
 import { cpSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { startNextServer, stopNextServer, type RunningServer } from "./helpers/next-server.js";
 
 const enabled = process.env["RUN_UI_TESTS"] === "1";
 const PORT = 3987;
@@ -17,12 +17,10 @@ const PORT = 3987;
 // flake on redirect follows.
 const BASE = `http://127.0.0.1:${PORT}`;
 
-let server: ChildProcess | null = null;
+let server: RunningServer | null = null;
 let stateDir = "";
 let dataDir = "";
 let sessionToken = "";
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function get(path: string, redirect: "follow" | "manual" = "follow"): Promise<Response> {
   try {
@@ -42,46 +40,38 @@ describe.skipIf(!enabled)("UI (phase 7)", () => {
     cpSync(join(process.cwd(), "test", "fixtures", "reference.yml"), join(stateDir, "sites.yml"));
     mkdirSync(join(stateDir, "control"), { recursive: true });
 
-    server = spawn("npx", ["next", "start", "-p", String(PORT)], {
-      cwd: process.cwd(),
-      shell: true,
-      stdio: "ignore",
-      env: {
-        ...process.env,
-        OPNMESH_STATE_DIR: stateDir,
-        OPNMESH_DATA_DIR: dataDir,
-        // Unreachable on purpose: the UI must render without the control server.
-        OPNMESH_CONTROL_URL: "http://127.0.0.1:9",
-        OPNMESH_PROM_URL: "http://127.0.0.1:9",
-        OPNMESH_ADMIN_TOKEN: "t".repeat(64),
-        // Plain HTTP under test, so cookies drop the __Host- prefix.
-        OPNMESH_ALLOW_INSECURE_HTTP: "1",
-      },
+    server = await startNextServer(PORT, {
+      OPNMESH_STATE_DIR: stateDir,
+      OPNMESH_DATA_DIR: dataDir,
+      // Unreachable on purpose: the UI must render without the control server.
+      OPNMESH_CONTROL_URL: "http://127.0.0.1:9",
+      OPNMESH_PROM_URL: "http://127.0.0.1:9",
+      OPNMESH_ADMIN_TOKEN: "t".repeat(64),
+      // Plain HTTP under test, so cookies drop the __Host- prefix.
+      OPNMESH_ALLOW_INSECURE_HTTP: "1",
     });
-    const deadline = Date.now() + 60_000;
-    while (Date.now() < deadline) {
-      try {
-        await fetch(`${BASE}/login`);
-        return;
-      } catch {
-        await sleep(1000);
-      }
-    }
-    throw new Error("next start did not come up");
-  }, 90_000);
+  }, 120_000);
 
-  afterAll(() => {
-    if (server?.pid) {
+  afterAll(async () => {
+    await stopNextServer(server);
+    // One test opens ui.db in this process; Windows will not unlink a file
+    // that still has a handle.
+    try {
+      const { closeDb } = await import("../lib/ui/auth.js");
+      closeDb();
+    } catch {
+      /* module never loaded */
+    }
+    // Best effort: a leftover temp directory is harmless, and failing the
+    // suite over it would hide the real result.
+    for (const dir of [stateDir, dataDir]) {
       try {
-        process.kill(server.pid);
-        spawn("taskkill", ["/pid", String(server.pid), "/T", "/F"], { shell: true });
+        rmSync(dir, { recursive: true, force: true });
       } catch {
-        /* gone */
+        /* the OS will reap it */
       }
     }
-    rmSync(stateDir, { recursive: true, force: true });
-    rmSync(dataDir, { recursive: true, force: true });
-  });
+  }, 30_000);
 
   it("first run redirects to setup; after admin exists, to login", async () => {
     const res = await get("/");

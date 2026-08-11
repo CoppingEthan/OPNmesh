@@ -69,17 +69,27 @@ func NewAPIClient(cfg AgentConfig, token string) *APIClient {
 		// swapped one is refused even if it chains to a public CA.
 		transport.TLSClientConfig.InsecureSkipVerify = true
 		transport.TLSClientConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			for _, raw := range rawCerts {
-				cert, err := x509.ParseCertificate(raw)
-				if err != nil {
-					continue
-				}
-				sum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
-				if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(pin)) == 1 {
-					return nil
-				}
+			// ONLY the leaf may satisfy the pin.
+			//
+			// Chain validation is off, so every certificate after rawCerts[0] is
+			// an unauthenticated attachment — the handshake proves possession of
+			// the leaf's private key and nothing else. Scanning the whole chain
+			// therefore accepted any attacker who appended the control node's
+			// (public) certificate behind their own leaf: the pin matched a cert
+			// they did not hold the key for, and the agent handed its bearer
+			// token to them.
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("control node presented no certificate")
 			}
-			return fmt.Errorf("control node certificate does not match the pin recorded at enrolment")
+			cert, err := x509.ParseCertificate(rawCerts[0])
+			if err != nil {
+				return fmt.Errorf("control node certificate is unparseable: %w", err)
+			}
+			sum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+			if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(pin)) != 1 {
+				return fmt.Errorf("control node certificate does not match the pin recorded at enrolment")
+			}
+			return nil
 		}
 	}
 	return &APIClient{

@@ -5,6 +5,8 @@ import {
   createAdminAccount,
   login,
   passwordProblem,
+  recordSetupFailure,
+  setupThrottled,
 } from "../../lib/ui/auth.js";
 
 // Auth state is read from the database per request — never prerendered.
@@ -21,8 +23,16 @@ async function doSetup(formData: FormData) {
   const problem = passwordProblem(password);
   if (problem) redirect("/setup?err=" + encodeURIComponent(problem));
 
+  if (await setupThrottled()) {
+    redirect(
+      "/setup?err=" +
+        encodeURIComponent("Too many incorrect setup codes. Wait a few minutes and try again."),
+    );
+  }
+
   const created = await createAdminAccount(password, token);
   if (!created) {
+    await recordSetupFailure();
     redirect("/setup?err=" + encodeURIComponent("That setup token is not valid."));
   }
   await login(password);
