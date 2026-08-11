@@ -64,6 +64,14 @@ export default function MeshDiagram({ initial, refreshMs = 5000 }: { initial: Me
    */
   const shownRef = useRef<Map<string, { out: number; in: number }>>(new Map());
   const peakRef = useRef(1);
+  /**
+   * Per-link animation phase, integrated frame by frame. It must NOT be
+   * derived from absolute time divided by a period: the period varies with
+   * load, and Date.now() is ~1.8e12, so a 1ms change in the divisor moves the
+   * result by hundreds of cycles and the dot teleports.
+   */
+  const phasesRef = useRef<Map<string, number>>(new Map());
+  const lastFrameRef = useRef(0);
   /** Node/link membership, so we only reheat physics when the shape changes. */
   const shapeRef = useRef("");
   const alphaRef = useRef(1);
@@ -132,6 +140,9 @@ export default function MeshDiagram({ initial, refreshMs = 5000 }: { initial: Me
     for (const id of [...shownRef.current.keys()]) {
       if (!liveLinks.has(id)) shownRef.current.delete(id);
     }
+    for (const id of [...phasesRef.current.keys()]) {
+      if (!liveLinks.has(id)) phasesRef.current.delete(id);
+    }
     setSummary({
       gateways: graph.nodes.filter((n) => n.kind === "gateway").length,
       clients: graph.nodes.filter((n) => n.kind === "client").length,
@@ -199,7 +210,11 @@ export default function MeshDiagram({ initial, refreshMs = 5000 }: { initial: Me
       return base + Math.min(4, b.degree * 0.45);
     };
 
-    const step = () => {
+    const step = (ts: number) => {
+      // Clamped: a backgrounded tab produces an enormous gap, and an
+      // unclamped dt would fling every dot down its line at once.
+      const dt = Math.min(50, lastFrameRef.current ? ts - lastFrameRef.current : 16);
+      lastFrameRef.current = ts;
       const bodies = [...bodiesRef.current.values()];
       const graph = graphRef.current;
       const alpha = alphaRef.current;
@@ -380,12 +395,18 @@ export default function MeshDiagram({ initial, refreshMs = 5000 }: { initial: Me
         // Direction, shown only where there is something to show: a single
         // faint travelling dot per active direction.
         if (l.up && busiest > 0) {
-          const t = ((Date.now() / (2600 - load * 1500)) % 1);
-          const dot = (from: { x: number; y: number }, to: { x: number; y: number }, phase: number) => {
-            const k = (t + phase) % 1;
-            ctx.fillStyle = `rgba(${INK}, ${Math.min(0.75, 0.25 + load * 0.5)})`;
+          // One unhurried traversal every 5.5s when barely moving, 3s when
+          // saturated. The range is deliberately narrow: speed is a hint that
+          // something is flowing, not a second load gauge competing with
+          // opacity.
+          const period = 5500 - load * 2500;
+          const t = ((phasesRef.current.get(l.id) ?? 0) + dt / period) % 1;
+          phasesRef.current.set(l.id, t);
+          const dot = (from: { x: number; y: number }, to: { x: number; y: number }, offset: number) => {
+            const k = (t + offset) % 1;
+            ctx.fillStyle = `rgba(${INK}, ${Math.min(0.7, 0.22 + load * 0.45)})`;
             ctx.beginPath();
-            ctx.arc(from.x + (to.x - from.x) * k, from.y + (to.y - from.y) * k, 1.6, 0, Math.PI * 2);
+            ctx.arc(from.x + (to.x - from.x) * k, from.y + (to.y - from.y) * k, 1.5, 0, Math.PI * 2);
             ctx.fill();
           };
           if (shown.out > 0) dot(sa, sb, 0);
