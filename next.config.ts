@@ -1,8 +1,10 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // Self-contained server bundle for the control-node image.
-  output: "standalone",
+  // Self-contained server bundle, but ONLY for the container image: the
+  // standalone layout is incompatible with `next start`, which is what local
+  // runs and the UI tests use. The Dockerfile sets OPNMESH_STANDALONE=1.
+  ...(process.env.OPNMESH_STANDALONE === "1" ? { output: "standalone" as const } : {}),
   // Native modules used server-side only.
   serverExternalPackages: ["better-sqlite3", "argon2", "simple-git"],
   webpack: (config) => {

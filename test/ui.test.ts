@@ -120,13 +120,13 @@ describe.skipIf(!enabled)("UI (phase 7)", () => {
     // Topology is known from sites.yml even with no live data.
     expect(html).toContain("connects directly");
     // The diagram renders from config alone.
-    expect(html).toContain("Your network right now");
+    expect(html).toContain("Force-directed diagram");
   }, 30_000);
 
   it("feature pages render with config-derived content, control server down", async () => {
     const checks: Array<[string, string]> = [
       ["/nodes", "Issue one-time token"],
-      ["/", "Your network right now"],
+      ["/", "Force-directed diagram"],
       ["/clients", "Entry points (preference order)"],
       ["/config", "wg0.conf"],
       ["/routes", "UniFi"],

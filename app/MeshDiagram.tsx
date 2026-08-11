@@ -1,329 +1,515 @@
 "use client";
 
 /**
- * The mesh diagram: every site, every client, and every link between them.
+ * The mesh, drawn as a force-directed graph.
  *
- * Reading the picture:
- *  - each line is a real WireGuard tunnel; thickness is how much traffic it is
- *    carrying right now, and the moving dots show which way the bytes go
- *  - a line with dots travelling both ways is busy in both directions
- *  - grey dashed means the tunnel exists but is idle or has not handshaked
- *  - red means down
+ * Design rules, deliberately restrictive:
+ *  - One stroke colour for every link. Intensity is carried by OPACITY alone —
+ *    a busy tunnel is simply more visible. Varying colour and width together
+ *    made the picture noisy and neither channel readable.
+ *  - Colour is reserved for exceptions. Everything healthy is neutral grey, so
+ *    the one amber or red node draws the eye immediately.
+ *  - Labels only where they help: locations always, devices on hover, and
+ *    nothing at all once the graph is dense enough that text would collide.
+ *  - The view auto-fits. Nodes drift under physics but the whole graph is
+ *    always scaled to sit inside its box, whatever the browser size.
  *
- * It refreshes itself on an interval so the page is live without a reload.
+ * Positions are seeded from the deterministic server layout, so the graph
+ * settles the same way every reload instead of reshuffling.
  */
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { MeshGraph, GraphNode, GraphLink } from "../lib/ui/graph.js";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { MeshGraph, GraphLink, GraphNode } from "../lib/ui/graph.js";
 import { formatRate } from "../lib/ui/graph.js";
 
-const HEALTH_COLOUR: Record<string, string> = {
-  active: "#34d399",
-  degraded: "#fbbf24",
-  offline: "#f87171",
-  pending: "#a78bfa",
-  unknown: "#71717a",
-};
-
-function linkColour(link: GraphLink, busy: number): string {
-  if (!link.up) return "#7f1d1d";
-  if (busy <= 0) return "#3f3f46";
-  // Warmer as the link gets busier relative to the mesh's current peak.
-  if (busy > 0.66) return "#f59e0b";
-  if (busy > 0.33) return "#38bdf8";
-  return "#22d3ee";
+interface Body {
+  id: string;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  node: GraphNode;
+  degree: number;
+  /** Held in place by the pointer. */
+  pinned: boolean;
 }
 
-export default function MeshDiagram({
-  initial,
-  refreshMs = 5000,
-}: {
-  initial: MeshGraph;
-  refreshMs?: number;
-}) {
-  const [graph, setGraph] = useState<MeshGraph>(initial);
+const INK = "228, 228, 231"; // zinc-200, as an rgb triple for rgba()
+const MUTED = "#52525b";
+const STATUS: Record<string, string> = {
+  active: "#a1a1aa",
+  degraded: "#fbbf24",
+  offline: "#f87171",
+  unknown: "#52525b",
+};
+
+/** Physics constants, tuned for legibility rather than realism. */
+const REPULSION = 5200;
+const SPRING = 0.035;
+const REST_LENGTH = 110;
+const CENTERING = 0.006;
+const DAMPING = 0.86;
+const MIN_ALPHA = 0.004;
+
+export default function MeshDiagram({ initial, refreshMs = 5000 }: { initial: MeshGraph; refreshMs?: number }) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+
+  const graphRef = useRef<MeshGraph>(initial);
+  const bodiesRef = useRef<Map<string, Body>>(new Map());
+  const alphaRef = useRef(1);
+  const viewRef = useRef({ scale: 1, ox: 0, dy: 0, ready: false });
+  const sizeRef = useRef({ w: 800, h: 520, dpr: 1 });
+  const pointerRef = useRef<{ x: number; y: number; down: boolean; dragging: string | null }>({
+    x: -1e6,
+    y: -1e6,
+    down: false,
+    dragging: null,
+  });
+
+  // The animation loop reads focus from refs so it is created once and never
+  // torn down; the matching state exists only to re-render the info panel.
+  const hoveredRef = useRef<string | null>(null);
+  const selectedRef = useRef<string | null>(null);
+  const [hovered, setHovered] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
-  const [paused, setPaused] = useState(false);
-  const timer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [summary, setSummary] = useState({ gateways: 0, clients: 0, links: 0 });
+
+  /** Rebuild bodies from graph data, preserving positions of nodes we know. */
+  const syncBodies = useCallback((graph: MeshGraph) => {
+    const bodies = bodiesRef.current;
+    const seen = new Set<string>();
+    const degree = new Map<string, number>();
+    for (const l of graph.links) {
+      degree.set(l.from, (degree.get(l.from) ?? 0) + 1);
+      degree.set(l.to, (degree.get(l.to) ?? 0) + 1);
+    }
+    for (const n of graph.nodes) {
+      seen.add(n.id);
+      const existing = bodies.get(n.id);
+      if (existing) {
+        existing.node = n;
+        existing.degree = degree.get(n.id) ?? 0;
+      } else {
+        // Seed from the server's deterministic layout, centred on the origin.
+        bodies.set(n.id, {
+          id: n.id,
+          x: n.x - graph.width / 2,
+          y: n.y - graph.height / 2,
+          vx: 0,
+          vy: 0,
+          node: n,
+          degree: degree.get(n.id) ?? 0,
+          pinned: false,
+        });
+      }
+    }
+    for (const id of [...bodies.keys()]) if (!seen.has(id)) bodies.delete(id);
+    alphaRef.current = Math.max(alphaRef.current, 0.6); // reheat so it re-settles
+    setSummary({
+      gateways: graph.nodes.filter((n) => n.kind === "gateway").length,
+      clients: graph.nodes.filter((n) => n.kind === "client").length,
+      links: graph.links.length,
+    });
+  }, []);
 
   useEffect(() => {
-    if (paused) return;
+    syncBodies(initial);
+  }, [initial, syncBodies]);
+
+  // --- live data ---------------------------------------------------------
+  useEffect(() => {
+    let stop = false;
     const tick = async () => {
+      if (document.hidden) return;
       try {
         const res = await fetch("/api/mesh-graph", { cache: "no-store" });
-        if (res.ok) setGraph((await res.json()) as MeshGraph);
+        if (!res.ok || stop) return;
+        const graph = (await res.json()) as MeshGraph;
+        graphRef.current = graph;
+        syncBodies(graph);
       } catch {
-        /* keep showing the last good picture */
+        /* keep drawing the last good picture */
       }
     };
-    timer.current = setInterval(tick, refreshMs);
+    const id = setInterval(tick, refreshMs);
     return () => {
-      if (timer.current) clearInterval(timer.current);
+      stop = true;
+      clearInterval(id);
     };
-  }, [paused, refreshMs]);
+  }, [refreshMs, syncBodies]);
 
-  const byId = useMemo(() => new Map(graph.nodes.map((n) => [n.id, n])), [graph.nodes]);
-  const chosen = selected ? byId.get(selected) : null;
+  // --- sizing ------------------------------------------------------------
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    const canvas = canvasRef.current;
+    if (!wrap || !canvas) return;
+    const apply = () => {
+      const rect = wrap.getBoundingClientRect();
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      sizeRef.current = { w: rect.width, h: rect.height, dpr };
+      canvas.width = Math.max(1, Math.round(rect.width * dpr));
+      canvas.height = Math.max(1, Math.round(rect.height * dpr));
+      canvas.style.width = `${rect.width}px`;
+      canvas.style.height = `${rect.height}px`;
+      alphaRef.current = Math.max(alphaRef.current, 0.25);
+    };
+    apply();
+    const ro = new ResizeObserver(apply);
+    ro.observe(wrap);
+    return () => ro.disconnect();
+  }, []);
 
-  const scale = (rate: number): number => {
-    if (graph.peakRate <= 0 || rate <= 0) return 0;
-    // Square root keeps a busy link visibly fatter without letting one huge
-    // transfer flatten everything else to a hairline.
-    return Math.sqrt(rate / graph.peakRate);
+  // --- simulation + render ----------------------------------------------
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    let raf = 0;
+
+    const radiusOf = (b: Body) => {
+      const base = b.node.kind === "gateway" ? 7 : 4.5;
+      return base + Math.min(4, b.degree * 0.45);
+    };
+
+    const step = () => {
+      const bodies = [...bodiesRef.current.values()];
+      const graph = graphRef.current;
+      const alpha = alphaRef.current;
+
+      if (bodies.length > 0 && alpha > MIN_ALPHA) {
+        // Repulsion — every pair pushes apart, which is what spreads the
+        // graph out and stops clusters overlapping.
+        for (let i = 0; i < bodies.length; i++) {
+          const a = bodies[i]!;
+          for (let j = i + 1; j < bodies.length; j++) {
+            const b = bodies[j]!;
+            let dx = b.x - a.x;
+            let dy = b.y - a.y;
+            let d2 = dx * dx + dy * dy;
+            if (d2 < 0.01) {
+              // Perfectly coincident nodes would divide by zero; nudge apart.
+              dx = (Math.random() - 0.5) * 0.1;
+              dy = (Math.random() - 0.5) * 0.1;
+              d2 = dx * dx + dy * dy;
+            }
+            const d = Math.sqrt(d2);
+            const f = (REPULSION / d2) * alpha;
+            const fx = (dx / d) * f;
+            const fy = (dy / d) * f;
+            a.vx -= fx;
+            a.vy -= fy;
+            b.vx += fx;
+            b.vy += fy;
+          }
+        }
+
+        // Springs — linked nodes pull together toward a rest length.
+        for (const l of graph.links) {
+          const a = bodiesRef.current.get(l.from);
+          const b = bodiesRef.current.get(l.to);
+          if (!a || !b) continue;
+          const dx = b.x - a.x;
+          const dy = b.y - a.y;
+          const d = Math.hypot(dx, dy) || 0.01;
+          // Client tethers sit a little closer, which groups devices visibly
+          // around the location they enter at.
+          const rest = l.kind === "client" ? REST_LENGTH * 0.62 : REST_LENGTH;
+          const f = (d - rest) * SPRING * alpha;
+          const fx = (dx / d) * f;
+          const fy = (dy / d) * f;
+          a.vx += fx;
+          a.vy += fy;
+          b.vx -= fx;
+          b.vy -= fy;
+        }
+
+        for (const b of bodies) {
+          if (b.pinned) {
+            b.vx = 0;
+            b.vy = 0;
+            continue;
+          }
+          b.vx -= b.x * CENTERING * alpha;
+          b.vy -= b.y * CENTERING * alpha;
+          b.vx *= DAMPING;
+          b.vy *= DAMPING;
+          b.x += b.vx;
+          b.y += b.vy;
+        }
+        alphaRef.current = alpha * 0.985;
+      }
+
+      // --- auto-fit: keep the whole graph inside the box at any size ---
+      const { w, h, dpr } = sizeRef.current;
+      const pad = 46;
+      let minX = -1,
+        maxX = 1,
+        minY = -1,
+        maxY = 1;
+      for (const b of bodies) {
+        minX = Math.min(minX, b.x);
+        maxX = Math.max(maxX, b.x);
+        minY = Math.min(minY, b.y);
+        maxY = Math.max(maxY, b.y);
+      }
+      const spanX = Math.max(1, maxX - minX);
+      const spanY = Math.max(1, maxY - minY);
+      const target = Math.min((w - pad * 2) / spanX, (h - pad * 2) / spanY, 1.9);
+      const view = viewRef.current;
+      // Ease toward the target so resizing and new nodes glide rather than jump.
+      const ease = view.ready ? 0.12 : 1;
+      view.scale += (target - view.scale) * ease;
+      view.ox += (w / 2 - ((minX + maxX) / 2) * view.scale - view.ox) * ease;
+      view.dy += (h / 2 - ((minY + maxY) / 2) * view.scale - view.dy) * ease;
+      view.ready = true;
+
+      const toScreen = (b: Body) => ({ x: b.x * view.scale + view.ox, y: b.y * view.scale + view.dy });
+
+      // --- hover / drag ---
+      const p = pointerRef.current;
+      let nearest: string | null = null;
+      let nearestDist = 18;
+      for (const b of bodies) {
+        const s = toScreen(b);
+        const d = Math.hypot(s.x - p.x, s.y - p.y);
+        if (d < nearestDist) {
+          nearestDist = d;
+          nearest = b.id;
+        }
+      }
+      if (p.dragging) {
+        const body = bodiesRef.current.get(p.dragging);
+        if (body) {
+          body.x = (p.x - view.ox) / view.scale;
+          body.y = (p.y - view.dy) / view.scale;
+        }
+      }
+      if (hoveredRef.current !== nearest) {
+        hoveredRef.current = nearest;
+        setHovered(nearest);
+      }
+
+      // --- draw ---
+      ctx.save();
+      ctx.scale(dpr, dpr);
+      ctx.clearRect(0, 0, w, h);
+
+      const focus = p.dragging ?? hoveredRef.current ?? selectedRef.current;
+      const neighbours = new Set<string>();
+      if (focus) {
+        neighbours.add(focus);
+        for (const l of graph.links) {
+          if (l.from === focus) neighbours.add(l.to);
+          if (l.to === focus) neighbours.add(l.from);
+        }
+      }
+
+      // Links: one colour, one width. Opacity carries how busy the tunnel is.
+      const peak = graph.peakRate || 1;
+      ctx.lineWidth = 1;
+      for (const l of graph.links) {
+        const a = bodiesRef.current.get(l.from);
+        const b = bodiesRef.current.get(l.to);
+        if (!a || !b) continue;
+        const sa = toScreen(a);
+        const sb = toScreen(b);
+        const busiest = Math.max(l.rateOut, l.rateIn);
+        // Square root so a quiet-but-alive link is still visible next to a
+        // saturated one, rather than being crushed to nothing.
+        const load = busiest > 0 ? Math.sqrt(busiest / peak) : 0;
+        let opacity = l.up ? 0.07 + load * 0.55 : 0.05;
+        if (focus) opacity = neighbours.has(l.from) && neighbours.has(l.to) ? Math.max(opacity, 0.5) : opacity * 0.25;
+
+        ctx.strokeStyle = `rgba(${INK}, ${opacity})`;
+        ctx.setLineDash(l.up ? [] : [3, 4]);
+        ctx.beginPath();
+        ctx.moveTo(sa.x, sa.y);
+        ctx.lineTo(sb.x, sb.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Direction, shown only where there is something to show: a single
+        // faint travelling dot per active direction.
+        if (l.up && busiest > 0) {
+          const t = ((Date.now() / (2600 - load * 1500)) % 1);
+          const dot = (from: { x: number; y: number }, to: { x: number; y: number }, phase: number) => {
+            const k = (t + phase) % 1;
+            ctx.fillStyle = `rgba(${INK}, ${Math.min(0.75, 0.25 + load * 0.5)})`;
+            ctx.beginPath();
+            ctx.arc(from.x + (to.x - from.x) * k, from.y + (to.y - from.y) * k, 1.6, 0, Math.PI * 2);
+            ctx.fill();
+          };
+          if (l.rateOut > 0) dot(sa, sb, 0);
+          if (l.rateIn > 0) dot(sb, sa, 0.5);
+        }
+      }
+
+      // Nodes.
+      const showAllLabels = bodies.length <= 24;
+      for (const b of bodies) {
+        const s = toScreen(b);
+        const r = radiusOf(b);
+        const dim = focus ? (neighbours.has(b.id) ? 1 : 0.22) : 1;
+        const status = STATUS[b.node.health] ?? STATUS["unknown"]!;
+        // Healthy nodes stay neutral so that anything coloured means trouble.
+        const ring = b.node.health === "active" ? (b.node.kind === "gateway" ? "#a1a1aa" : MUTED) : status;
+
+        ctx.globalAlpha = dim;
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
+        ctx.fillStyle = "#18181b";
+        ctx.fill();
+        ctx.lineWidth = b.node.isHub ? 2 : 1.25;
+        ctx.strokeStyle = ring;
+        if (b.node.kind === "client") ctx.setLineDash([2, 2]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        if (b.node.isHub) {
+          ctx.beginPath();
+          ctx.arc(s.x, s.y, 2, 0, Math.PI * 2);
+          ctx.fillStyle = ring;
+          ctx.fill();
+        }
+
+        const labelled = showAllLabels || b.node.kind === "gateway" || b.id === focus;
+        if (labelled) {
+          ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
+          ctx.textAlign = "center";
+          ctx.fillStyle = `rgba(${INK}, ${b.id === focus ? 0.95 : 0.6})`;
+          ctx.fillText(b.node.label, s.x, s.y + r + 13);
+        }
+        ctx.globalAlpha = 1;
+      }
+
+      // Rates for the focused node's links only — always-on labels are noise.
+      if (focus) {
+        ctx.font = "10px ui-monospace, monospace";
+        ctx.textAlign = "center";
+        for (const l of graph.links) {
+          if (l.from !== focus && l.to !== focus) continue;
+          if (l.rateOut <= 0 && l.rateIn <= 0) continue;
+          const a = bodiesRef.current.get(l.from);
+          const b = bodiesRef.current.get(l.to);
+          if (!a || !b) continue;
+          const sa = toScreen(a);
+          const sb = toScreen(b);
+          // Rate away from the focused node, so the number always reads
+          // "leaving the thing you are looking at".
+          const away = l.from === focus ? l.rateOut : l.rateIn;
+          const towards = l.from === focus ? l.rateIn : l.rateOut;
+          const mx = (sa.x + sb.x) / 2;
+          const my = (sa.y + sb.y) / 2;
+          ctx.fillStyle = `rgba(${INK}, 0.75)`;
+          ctx.fillText(`↑ ${formatRate(away)}  ↓ ${formatRate(towards)}`, mx, my - 5);
+        }
+      }
+
+      ctx.restore();
+      raf = requestAnimationFrame(step);
+    };
+
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  // --- pointer -----------------------------------------------------------
+  const localPoint = (e: React.PointerEvent) => {
+    const rect = (e.target as HTMLCanvasElement).getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
   };
 
-  const gatewayCount = graph.nodes.filter((n) => n.kind === "gateway").length;
-  const clientCount = graph.nodes.length - gatewayCount;
-  const nodeRadius = graph.nodes.length > 40 ? 12 : graph.nodes.length > 20 ? 16 : 20;
+  const onPointerMove = (e: React.PointerEvent) => {
+    const { x, y } = localPoint(e);
+    pointerRef.current.x = x;
+    pointerRef.current.y = y;
+  };
+  const onPointerDown = (e: React.PointerEvent) => {
+    const { x, y } = localPoint(e);
+    const target = hoveredRef.current;
+    pointerRef.current = { x, y, down: true, dragging: target };
+    if (target) {
+      const b = bodiesRef.current.get(target);
+      if (b) b.pinned = true;
+      (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+    }
+  };
+  const onPointerUp = () => {
+    const dragged = pointerRef.current.dragging;
+    if (dragged) {
+      const b = bodiesRef.current.get(dragged);
+      if (b) b.pinned = false;
+      alphaRef.current = Math.max(alphaRef.current, 0.35);
+    }
+    pointerRef.current.down = false;
+    pointerRef.current.dragging = null;
+  };
+  const onPointerLeave = () => {
+    pointerRef.current.x = -1e6;
+    pointerRef.current.y = -1e6;
+    onPointerUp();
+  };
+  const onClick = () => {
+    const next = selectedRef.current === hoveredRef.current ? null : hoveredRef.current;
+    selectedRef.current = next;
+    setSelected(next);
+  };
+
+  const focusId = hovered ?? selected;
+  const focusNode = focusId ? graphRef.current.nodes.find((n) => n.id === focusId) : null;
 
   return (
     <div className="card">
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+      <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
         <div>
-          <div className="text-sm font-medium text-zinc-100">Your network right now</div>
+          <div className="text-sm font-medium text-zinc-100">Your network</div>
           <div className="text-xs text-zinc-500">
-            {gatewayCount} {gatewayCount === 1 ? "location" : "locations"} · {clientCount}{" "}
-            {clientCount === 1 ? "remote device" : "remote devices"} · {graph.links.length}{" "}
-            {graph.links.length === 1 ? "connection" : "connections"}
+            {summary.gateways} {summary.gateways === 1 ? "location" : "locations"} · {summary.clients}{" "}
+            {summary.clients === 1 ? "device" : "devices"} · {summary.links}{" "}
+            {summary.links === 1 ? "connection" : "connections"}
           </div>
         </div>
-        <div className="flex items-center gap-3 text-xs">
-          <Legend colour="#22d3ee" label="carrying traffic" />
-          <Legend colour="#3f3f46" label="connected, idle" dashed />
-          <Legend colour="#7f1d1d" label="down" />
-          <button className="btn" onClick={() => setPaused((p) => !p)}>
-            {paused ? "Resume" : "Pause"}
-          </button>
+        <div className="text-xs text-zinc-600">
+          brighter lines carry more traffic · drag to rearrange
         </div>
       </div>
 
-      <div className="overflow-x-auto">
-        <svg
-          viewBox={`0 0 ${graph.width} ${graph.height}`}
-          className="w-full"
-          style={{ maxHeight: "62vh" }}
+      {/* Fixed proportion of the viewport, and it follows the browser as you
+          resize — the graph rescales itself to fit whatever it is given. */}
+      <div
+        ref={wrapRef}
+        className="relative w-full rounded border border-zinc-800/60 bg-black/20"
+        style={{ height: "min(60vh, 560px)", minHeight: 300 }}
+      >
+        <canvas
+          ref={canvasRef}
+          onPointerMove={onPointerMove}
+          onPointerDown={onPointerDown}
+          onPointerUp={onPointerUp}
+          onPointerLeave={onPointerLeave}
+          onClick={onClick}
+          style={{ cursor: hovered ? "grab" : "default", display: "block" }}
           role="img"
-          aria-label="Diagram of your network showing every location, device and connection"
-        >
-          <defs>
-            <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
-              <feGaussianBlur stdDeviation="3" result="blur" />
-              <feMerge>
-                <feMergeNode in="blur" />
-                <feMergeNode in="SourceGraphic" />
-              </feMerge>
-            </filter>
-          </defs>
-
-          {/* Links first so nodes sit on top of them. */}
-          {graph.links.map((link) => {
-            const a = byId.get(link.from);
-            const b = byId.get(link.to);
-            if (!a || !b) return null;
-            const busiest = Math.max(link.rateOut, link.rateIn);
-            const intensity = scale(busiest);
-            const colour = linkColour(link, intensity);
-            const width = link.up ? 1.2 + intensity * 7 : 1;
-            const dim = selected !== null && link.from !== selected && link.to !== selected;
-
-            return (
-              <g key={link.id} opacity={dim ? 0.15 : 1}>
-                <line
-                  x1={a.x}
-                  y1={a.y}
-                  x2={b.x}
-                  y2={b.y}
-                  stroke={colour}
-                  strokeWidth={width}
-                  strokeLinecap="round"
-                  strokeDasharray={link.up ? (busiest > 0 ? undefined : "5 6") : "3 4"}
-                  opacity={link.kind === "client" ? 0.75 : 1}
-                />
-                {/* Direction of flow: dots travel from source to destination,
-                    one stream per busy direction. */}
-                {link.rateOut > 0 && (
-                  <FlowDots from={a} to={b} rate={link.rateOut} peak={graph.peakRate} colour={colour} />
-                )}
-                {link.rateIn > 0 && (
-                  <FlowDots from={b} to={a} rate={link.rateIn} peak={graph.peakRate} colour={colour} />
-                )}
-                {busiest > 0 && <RateLabel a={a} b={b} link={link} />}
-              </g>
-            );
-          })}
-
-          {graph.nodes.map((n) => {
-            const dim = selected !== null && selected !== n.id;
-            const colour = HEALTH_COLOUR[n.health] ?? HEALTH_COLOUR["unknown"]!;
-            const r = n.kind === "client" ? nodeRadius * 0.6 : nodeRadius;
-            return (
-              <g
-                key={n.id}
-                opacity={dim ? 0.25 : 1}
-                onClick={() => setSelected(selected === n.id ? null : n.id)}
-                style={{ cursor: "pointer" }}
-              >
-                {n.kind === "gateway" ? (
-                  <rect
-                    x={n.x - r}
-                    y={n.y - r * 0.8}
-                    width={r * 2}
-                    height={r * 1.6}
-                    rx={4}
-                    fill="#18181b"
-                    stroke={colour}
-                    strokeWidth={n.isHub ? 3 : 2}
-                    filter={n.throughput > 0 ? "url(#glow)" : undefined}
-                  />
-                ) : (
-                  <circle
-                    cx={n.x}
-                    cy={n.y}
-                    r={r}
-                    fill="#18181b"
-                    stroke={colour}
-                    strokeWidth={2}
-                    strokeDasharray="3 2"
-                  />
-                )}
-                <text
-                  x={n.x}
-                  y={n.y + (n.kind === "gateway" ? r * 1.6 + 12 : r + 13)}
-                  textAnchor="middle"
-                  fontSize={graph.nodes.length > 40 ? 10 : 12}
-                  fill="#e4e4e7"
-                >
-                  {n.label}
-                </text>
-                {n.kind === "gateway" && n.isHub && (
-                  <text x={n.x} y={n.y + 4} textAnchor="middle" fontSize={10} fill="#a1a1aa">
-                    HUB
-                  </text>
-                )}
-              </g>
-            );
-          })}
-        </svg>
-      </div>
-
-      {chosen ? (
-        <div className="mt-3 rounded border border-zinc-800 bg-black/40 p-3">
-          <div className="flex items-baseline justify-between">
-            <span className="text-sm font-medium text-zinc-100">{chosen.label}</span>
-            <span className="text-xs" style={{ color: HEALTH_COLOUR[chosen.health] }}>
-              {chosen.kind === "gateway" ? "Location" : "Remote device"} · {chosen.health}
-            </span>
-          </div>
-          <div className="mono mt-1 space-y-0.5 text-xs text-zinc-400">
-            {chosen.detail.map((d) => (
-              <div key={d}>{d}</div>
-            ))}
-            <div>currently moving {formatRate(chosen.throughput)}</div>
-          </div>
-          <button className="btn mt-2" onClick={() => setSelected(null)}>
-            Clear selection
-          </button>
-        </div>
-      ) : (
-        <p className="mt-3 text-xs text-zinc-500">
-          Click any box or circle to see its details. Squares are your locations, dashed circles are
-          remote devices, and moving dots show which way traffic is flowing.
-        </p>
-      )}
-    </div>
-  );
-}
-
-function Legend({ colour, label, dashed }: { colour: string; label: string; dashed?: boolean }) {
-  return (
-    <span className="flex items-center gap-1 text-zinc-400">
-      <svg width="22" height="8" aria-hidden="true">
-        <line
-          x1="1"
-          y1="4"
-          x2="21"
-          y2="4"
-          stroke={colour}
-          strokeWidth="3"
-          strokeLinecap="round"
-          strokeDasharray={dashed ? "4 4" : undefined}
+          aria-label="Force-directed diagram of every location, device and connection in your network"
         />
-      </svg>
-      {label}
-    </span>
-  );
-}
 
-/**
- * Animated dots travelling along a link. Speed tracks the rate, so a busier
- * link visibly moves faster as well as being thicker.
- */
-function FlowDots({
-  from,
-  to,
-  rate,
-  peak,
-  colour,
-}: {
-  from: GraphNode;
-  to: GraphNode;
-  rate: number;
-  peak: number;
-  colour: string;
-}) {
-  const share = peak > 0 ? Math.min(1, rate / peak) : 0;
-  const duration = 4.5 - share * 3; // seconds for one traversal
-  const count = share > 0.5 ? 3 : share > 0.15 ? 2 : 1;
-
-  return (
-    <>
-      {Array.from({ length: count }, (_, i) => (
-        <circle key={i} r={2.6} fill={colour}>
-          <animateMotion
-            dur={`${duration}s`}
-            repeatCount="indefinite"
-            begin={`${(duration / count) * i}s`}
-            path={`M ${from.x} ${from.y} L ${to.x} ${to.y}`}
-          />
-        </circle>
-      ))}
-    </>
-  );
-}
-
-/**
- * Both directions labelled on the link. `from → to` is shown with ▲ and the
- * reverse with ▼, so the arrows mean the same thing everywhere regardless of
- * which way the line happens to be drawn.
- */
-function RateLabel({ a, b, link }: { a: GraphNode; b: GraphNode; link: GraphLink }) {
-  const mx = (a.x + b.x) / 2;
-  const my = (a.y + b.y) / 2;
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const len = Math.hypot(dx, dy) || 1;
-  // Perpendicular offset keeps the text clear of the line itself.
-  const ox = (-dy / len) * 14;
-  const oy = (dx / len) * 14;
-  const lines = [
-    link.rateOut > 0 ? `▲ ${formatRate(link.rateOut)}` : null,
-    link.rateIn > 0 ? `▼ ${formatRate(link.rateIn)}` : null,
-  ].filter((s): s is string => s !== null);
-  const h = 6 + lines.length * 12;
-
-  return (
-    <g transform={`translate(${mx + ox}, ${my + oy})`} pointerEvents="none">
-      <rect x={-40} y={-h / 2} width={80} height={h} rx={4} fill="#09090b" opacity={0.85} />
-      {lines.map((text, i) => (
-        <text
-          key={text}
-          textAnchor="middle"
-          y={-h / 2 + 12 + i * 12}
-          fontSize={10}
-          fill={i === 0 ? "#67e8f9" : "#a5b4fc"}
-        >
-          {text}
-        </text>
-      ))}
-    </g>
+        {focusNode && (
+          <div className="pointer-events-none absolute left-3 top-3 max-w-xs rounded border border-zinc-800 bg-zinc-950/90 p-3">
+            <div className="text-sm font-medium text-zinc-100">{focusNode.label}</div>
+            <div className="text-xs" style={{ color: STATUS[focusNode.health] }}>
+              {focusNode.kind === "gateway" ? "Location" : "Remote device"}
+              {focusNode.isHub ? " · hub" : ""} · {focusNode.health}
+            </div>
+            <div className="mono mt-1 space-y-0.5 text-xs text-zinc-400">
+              {focusNode.detail.map((d) => (
+                <div key={d}>{d}</div>
+              ))}
+              <div>{formatRate(focusNode.throughput)} total</div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }

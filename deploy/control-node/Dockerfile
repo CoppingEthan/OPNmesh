@@ -5,6 +5,8 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
+# Standalone output is only correct inside the image (see next.config.ts).
+ENV OPNMESH_STANDALONE=1
 RUN npm run build \
     && npx esbuild scripts/control-server.ts --bundle --platform=node --format=esm \
        --outfile=dist/control-server.mjs \

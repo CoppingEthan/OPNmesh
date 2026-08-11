@@ -132,7 +132,7 @@ describe.skipIf(!enabled)("UI form flows", () => {
     // That session really works.
     const dash = await fetch(`${BASE}/`, { headers: { cookie: cookie! }, redirect: "manual" });
     expect(dash.status).toBe(200);
-    expect(await dash.text()).toContain("Your network right now");
+    expect(await dash.text()).toContain("Force-directed diagram");
   }, 60_000);
 
   it("setup is closed once an admin exists — the page itself is unreachable", async () => {
