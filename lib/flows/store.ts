@@ -90,6 +90,15 @@ export class JsonlFlowStore implements FlowStore {
   private readonly maxRecords: number;
   /** In-memory record count; null until first established from disk. */
   private cachedCount: number | null = null;
+  /**
+   * Oldest `reported` timestamp currently stored, or null when unknown/empty.
+   * Lets prune() skip reading the whole file when nothing is old enough to
+   * drop — the common steady state, where the file is well inside the
+   * retention window and the 60s prune would otherwise read it just to delete
+   * zero records (the residual event-loop hitch flagged in the audit).
+   */
+  private oldestReported: number | null = null;
+  private established = false;
   private capWarned = false;
 
   constructor(private readonly path: string, maxRecords: number = DEFAULT_MAX_FLOW_RECORDS) {
@@ -113,9 +122,27 @@ export class JsonlFlowStore implements FlowStore {
     return flows;
   }
 
+  /** Smallest `reported` in a list, or null if empty. Loop, not Math.min(...spread),
+   * which overflows the argument limit at hundreds of thousands of records. */
+  private static minReported(flows: StoredFlow[]): number | null {
+    if (flows.length === 0) return null;
+    let min = flows[0]!.reported;
+    for (let i = 1; i < flows.length; i++) if (flows[i]!.reported < min) min = flows[i]!.reported;
+    return min;
+  }
+
+  /** One-time read to seed the in-memory count and oldest-timestamp watermark. */
+  private establish(): void {
+    if (this.established) return;
+    const all = this.readAll();
+    this.cachedCount = all.length;
+    this.oldestReported = JsonlFlowStore.minReported(all);
+    this.established = true;
+  }
+
   private currentCount(): number {
-    if (this.cachedCount === null) this.cachedCount = this.readAll().length;
-    return this.cachedCount;
+    this.establish();
+    return this.cachedCount!;
   }
 
   ingest(flows: StoredFlow[]): void {
@@ -135,6 +162,9 @@ export class JsonlFlowStore implements FlowStore {
     const accepted = flows.length > room ? flows.slice(0, room) : flows;
     appendFileSync(this.path, accepted.map((f) => JSON.stringify(f)).join("\n") + "\n", "utf8");
     this.cachedCount = have + accepted.length;
+    for (const f of accepted) {
+      if (this.oldestReported === null || f.reported < this.oldestReported) this.oldestReported = f.reported;
+    }
   }
 
   topTalkers(sinceUnixSec: number, limit: number): TopTalker[] {
@@ -142,18 +172,25 @@ export class JsonlFlowStore implements FlowStore {
   }
 
   prune(cutoffUnixSec: number): number {
+    this.establish();
+    // Nothing is old enough to drop — skip the full-file read entirely. This
+    // is the steady state within the retention window.
+    if (this.oldestReported === null || this.oldestReported >= cutoffUnixSec) return 0;
     const all = this.readAll();
     const kept = all.filter((f) => f.reported >= cutoffUnixSec);
     if (kept.length !== all.length) {
       writeFileSync(this.path, kept.map((f) => JSON.stringify(f)).join("\n") + (kept.length ? "\n" : ""), "utf8");
     }
     this.cachedCount = kept.length;
+    this.oldestReported = JsonlFlowStore.minReported(kept);
     this.capWarned = false;
     return all.length - kept.length;
   }
 
   purge(): void {
     writeFileSync(this.path, "", "utf8");
+    this.oldestReported = null;
+    this.established = true;
     this.cachedCount = 0;
     this.capWarned = false;
   }

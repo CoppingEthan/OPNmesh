@@ -53,4 +53,23 @@ describe("JsonlFlowStore", () => {
     store.purge();
     expect(store.count()).toBe(0);
   });
+
+  it("enforces a hard record cap so one flood cannot grow the store unbounded", () => {
+    const store = new JsonlFlowStore(join(dir, "capped.jsonl"), 100);
+    for (let i = 0; i < 10; i++) {
+      store.ingest(Array.from({ length: 50 }, (_, j) => flow({ src: `10.0.${i}.${j}`, reported: 5000 })));
+    }
+    expect(store.count()).toBe(100); // 500 offered, capped at 100
+  });
+
+  it("prune skips work (returns 0) when nothing is old enough to drop", () => {
+    const store = new JsonlFlowStore(join(dir, "watermark.jsonl"), 1000);
+    store.ingest([flow({ reported: 9000 }), flow({ src: "10.0.0.2", reported: 9500 })]);
+    // Cutoff older than everything stored → nothing to prune, no rewrite.
+    expect(store.prune(1000)).toBe(0);
+    expect(store.count()).toBe(2);
+    // A cutoff past the oldest still prunes correctly.
+    expect(store.prune(9200)).toBe(1);
+    expect(store.count()).toBe(1);
+  });
 });
