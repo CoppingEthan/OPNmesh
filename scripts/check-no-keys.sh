@@ -27,6 +27,25 @@ if git grep -nIE "private_key[\"']?[[:space:]]*[:=][[:space:]]*[\"']?[A-Za-z0-9+
   fail=1
 fi
 
+# 4. minisign secret (release-signing) keys. This is the trust root for agent
+#    self-updates — a leak lets an attacker sign malicious releases. Its format
+#    has no PEM header, so the checks above miss it; match the content marker.
+if git grep -nI -e "minisign encrypted secret key" -e "minisign secret key" -- ':!scripts/check-no-keys.sh'; then
+  echo "ERROR: minisign secret key material found." >&2
+  fail=1
+fi
+
+# 5. Secret-bearing files that must never be tracked. Node/admin bearer tokens
+#    and the bootstrap token are bare hex (indistinguishable from the sha256
+#    digests that legitimately appear in golden files), so match by filename
+#    rather than by a blanket hex pattern that would false-positive.
+if git ls-files \
+  | grep -E '(^|/)(admin\.token|agent\.token|bootstrap-token|.*\.sec|.*\.key)$' \
+  | grep -vE '(^|/)(sites\.example\.yml)$'; then
+  echo "ERROR: a secret-bearing file (token/signing key) is tracked in git." >&2
+  fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
   exit 1
 fi
