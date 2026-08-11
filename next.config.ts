@@ -15,6 +15,7 @@ const nextConfig: NextConfig = {
   // Do not advertise the framework or version to an attacker.
   poweredByHeader: false,
   async headers() {
+    const isDev = process.env.NODE_ENV !== "production";
     return [
       {
         source: "/:path*",
@@ -25,12 +26,17 @@ const nextConfig: NextConfig = {
             key: "Content-Security-Policy",
             value: [
               "default-src 'self'",
-              // Next injects inline bootstrap scripts; styles are emitted inline by Tailwind.
-              "script-src 'self' 'unsafe-inline'",
+              // Next injects inline bootstrap scripts; styles are emitted
+              // inline by Tailwind. The dev server additionally compiles
+              // modules with eval() for hot reload — without 'unsafe-eval'
+              // there, every client script is blocked, forms lose their
+              // JavaScript handlers, and the app silently half-works.
+              `script-src 'self' 'unsafe-inline'${isDev ? " 'unsafe-eval'" : ""}`,
               "style-src 'self' 'unsafe-inline'",
               "img-src 'self' data:",
               "font-src 'self'",
-              "connect-src 'self'",
+              // Dev uses a websocket for hot reload.
+              `connect-src 'self'${isDev ? " ws: wss:" : ""}`,
               "frame-ancestors 'none'",
               "base-uri 'none'",
               "form-action 'self'",
@@ -39,8 +45,11 @@ const nextConfig: NextConfig = {
           },
           { key: "X-Frame-Options", value: "DENY" },
           { key: "X-Content-Type-Options", value: "nosniff" },
-          // Keeps one-time tokens and node names out of third-party referers.
-          { key: "Referrer-Policy", value: "no-referrer" },
+          // Deliberately NOT "no-referrer": browsers then send `Origin: null`
+          // on form posts, and Next's server-action CSRF check rejects that,
+          // which breaks every form in the app. "same-origin" still sends
+          // nothing to third parties, which is the property we actually want.
+          { key: "Referrer-Policy", value: "same-origin" },
           { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=(), interest-cohort=()" },
           { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
           {
