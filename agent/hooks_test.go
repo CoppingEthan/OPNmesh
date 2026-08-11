@@ -45,3 +45,22 @@ func TestValidateWgHooksRejectsInjectedHooks(t *testing.T) {
 		}
 	}
 }
+
+func TestSafeSysctlKeyBlocksKernelExecVectors(t *testing.T) {
+	// kernel.core_pattern with a "|prog" value, and the other kernel.* helper
+	// keys, are root command execution on a server-controlled managed file.
+	for _, blocked := range []string{
+		"kernel.core_pattern", "kernel.modprobe", "kernel.hotplug",
+		"kernel.uevent_helper", "-net.ipv4.ip_forward",
+	} {
+		if safeSysctlKey(blocked) {
+			t.Fatalf("SECURITY: sysctl key %q must be refused", blocked)
+		}
+	}
+	// The keys the generator actually emits must still be allowed.
+	for _, ok := range []string{"net.ipv4.ip_forward", "net.netfilter.nf_conntrack_acct"} {
+		if !safeSysctlKey(ok) {
+			t.Fatalf("legitimate sysctl key %q must be allowed", ok)
+		}
+	}
+}

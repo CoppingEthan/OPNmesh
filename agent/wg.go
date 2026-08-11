@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -330,6 +331,20 @@ func applyNftables(path string) error {
 	return err
 }
 
+// safeSysctlKey reports whether the control node may set this sysctl key.
+//
+// sysctl.conf is a server-controlled managed file, so — exactly like
+// wg0.conf's hooks — it must not be a root RCE. Several kernel.* keys ARE
+// command execution: kernel.core_pattern with a "|program" value is run by the
+// kernel as root on the next coredump; kernel.modprobe/hotplug/uevent_helper
+// name programs the kernel execs as root. The generated fragment only ever
+// tunes forwarding and conntrack accounting, all under net.*, and no net.* key
+// runs a program — so the allowlist is simply the net.* namespace. Requiring
+// the net. prefix also rules out a leading "-" being read as a sysctl option.
+func safeSysctlKey(key string) bool {
+	return strings.HasPrefix(key, "net.")
+}
+
 func applySysctl(path string) {
 	// Apply key-by-key with -w (portable across busybox/procps sysctl).
 	// Best-effort: containers may not allow every key; a real node will.
@@ -343,6 +358,19 @@ func applySysctl(path string) {
 			continue
 		}
 		kv := strings.Replace(line, " = ", "=", 1)
+		eq := strings.IndexByte(kv, '=')
+		if eq < 0 {
+			continue
+		}
+		key := strings.TrimSpace(kv[:eq])
+		if !safeSysctlKey(key) {
+			log.Printf("sysctl: refusing control-node key %q (only net.* is permitted; kernel.* keys can run commands as root)", key)
+			continue
+		}
+		if strings.Contains(kv[eq+1:], "|") {
+			log.Printf("sysctl: refusing value with a pipe for %q", key)
+			continue
+		}
 		_ = exec.Command("sysctl", "-w", kv).Run()
 	}
 }

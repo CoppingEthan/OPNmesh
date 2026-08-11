@@ -47,6 +47,7 @@ import {
 } from "../lib/update/rollout.js";
 import { runValidators } from "../lib/validators/index.js";
 import { AdminAuth, RateLimiter, bearerToken as parseBearer } from "../lib/control/auth.js";
+import { writeFileAtomic } from "../lib/fs-atomic.js";
 import * as S from "../lib/control/schemas.js";
 
 const STATE_DIR = process.env["STATE_DIR"] ?? "docker/state";
@@ -342,7 +343,7 @@ function tickPortChange(): void {
   }
   if (Date.now() > pc.verifyUntilMs) {
     // Transaction rollback: every node reverts together.
-    writeFileSync(SITES_PATH, pc.prevYaml, "utf8");
+    writeFileAtomic(SITES_PATH, pc.prevYaml);
     rmSync(PORTCHANGE_PATH, { force: true });
     appendAudit(
       "port-change:reverted",
@@ -888,7 +889,7 @@ const handler = async (req: IncomingMessage, res: ServerResponse) => {
       doc.sites.push({ ...site, gateway: { ...site.gateway, public_key: node.publicKey } });
       // Validate before persisting; a bad approval must not corrupt truth.
       loadSitesYaml(stringifyYaml(doc));
-      writeFileSync(SITES_PATH, stringifyYaml(doc), "utf8");
+      writeFileAtomic(SITES_PATH, stringifyYaml(doc));
       saveRegistry(reg);
       appendAudit("enrol:approved", `${node.hostname} bound to ${site.id}`);
       return json(res, 200, { ok: true, siteId: site.id });
@@ -1050,7 +1051,7 @@ const handler = async (req: IncomingMessage, res: ServerResponse) => {
         affectedTunnels,
       };
       writeFileSync(PORTCHANGE_PATH, JSON.stringify(pc, null, 2) + "\n", "utf8");
-      writeFileSync(SITES_PATH, nextYaml, "utf8");
+      writeFileAtomic(SITES_PATH, nextYaml);
       appendAudit(
         "port-change:started",
         `${siteId} → udp/${port}; brief interruption expected on: ${affectedTunnels.join(", ")}`,
@@ -1189,7 +1190,7 @@ const handler = async (req: IncomingMessage, res: ServerResponse) => {
       const doc = parseYaml(readFileSync(SITES_PATH, "utf8"));
       doc.sites = doc.sites.filter((s: any) => s.id !== siteId);
       loadSitesYaml(stringifyYaml(doc));
-      writeFileSync(SITES_PATH, stringifyYaml(doc), "utf8");
+      writeFileAtomic(SITES_PATH, stringifyYaml(doc));
       saveRegistry(reg);
       reports.delete(siteId);
       appendAudit("node:removed", siteId);

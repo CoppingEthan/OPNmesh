@@ -4,9 +4,10 @@
  * in place, no remote, never pushed anywhere). SQLite is never involved:
  * configuration truth lives in the file and its history in git.
  */
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { simpleGit } from "simple-git";
+import { writeFileAtomic } from "../fs-atomic.js";
 import { loadSitesYaml, type ResolvedConfig } from "../schema.js";
 import { generateAll, type GeneratedBundle } from "../generator/index.js";
 import { runValidators, type Finding } from "../validators/index.js";
@@ -63,7 +64,7 @@ export async function editSites(message: string, fn: (doc: any) => void): Promis
   if (errors.length > 0) {
     throw new Error(`change blocked by validators:\n${errors.map((e) => `- ${e.message}`).join("\n")}`);
   }
-  writeFileSync(SITES_PATH, next, "utf8");
+  writeFileAtomic(SITES_PATH, next);
   await commitConfig(message);
   return findings.filter((f) => f.level === "warning");
 }
