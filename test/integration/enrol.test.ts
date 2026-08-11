@@ -5,7 +5,7 @@
  * once approved — pulls config and joins the mesh without disturbing the
  * existing tunnels. Plus negative paths: single-use, TTL, pending refusal.
  */
-import { describe, expect, it, afterAll } from "vitest";
+import { describe, expect, it, beforeAll, afterAll } from "vitest";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -70,6 +70,32 @@ const SITE_D = {
 };
 
 describe.skipIf(!enabled)("enrolment (§12)", () => {
+  // Do not assume pristine state: a previous run (or `npm run mesh:demo`)
+  // may already have enrolled site-d.
+  beforeAll(async () => {
+    try {
+      await api("POST", "/api/v1/admin/remove", { siteId: "site-d" });
+    } catch {
+      /* not present */
+    }
+    // Clear any pending entries left by an earlier run: approving a stale one
+    // binds a token that no live node holds, and the node stays pending.
+    try {
+      const { body } = await api("GET", "/api/v1/admin/pending");
+      for (const p of body.pending ?? []) {
+        await api("POST", "/api/v1/admin/reject", { pendingId: p.id });
+      }
+    } catch {
+      /* nothing pending */
+    }
+    try {
+      sh(`${COMPOSE} --profile enrol rm -sf gw-d host-d`);
+    } catch {
+      /* not running */
+    }
+    await sleep(5000);
+  }, 60_000);
+
   afterAll(async () => {
     // Decommission site-d regardless of test outcome and let the mesh settle.
     try {
@@ -151,7 +177,10 @@ describe.skipIf(!enabled)("enrolment (§12)", () => {
     const pending = await waitFor(
       async () => {
         const { body } = await api("GET", "/api/v1/admin/pending");
-        return body.pending.find((p: any) => p.hostname === "gw-d") ?? null;
+        const mine = (body.pending as any[])
+          .filter((p) => p.hostname === "gw-d")
+          .sort((a, b) => b.enrolledAt - a.enrolledAt);
+        return mine[0] ?? null;
       },
       60_000,
       "pending node gw-d",

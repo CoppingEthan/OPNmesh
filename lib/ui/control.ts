@@ -92,6 +92,11 @@ export const control = {
     ),
   flowsPurge: () => req("POST", "/api/v1/admin/flows/purge"),
   rollout: () => req<{ rollout: any; settings: { frozen: boolean; updateWindow: string; pinned: Record<string, boolean> } }>("GET", "/api/v1/admin/rollout"),
+  releases: () =>
+    req<{ releases: Array<{ version: string; sha256: string; configDigest: string | null }> }>(
+      "GET",
+      "/api/v1/admin/releases",
+    ),
   createRollout: (body: unknown) => req<any>("POST", "/api/v1/admin/rollout", body),
   cancelRollout: () => req("POST", "/api/v1/admin/rollout/cancel"),
   freeze: (frozen: boolean) => req("POST", "/api/v1/admin/freeze", { frozen }),

@@ -2,7 +2,6 @@ import { revalidatePath } from "next/cache";
 import { requireAdmin } from "../../lib/ui/auth.js";
 import { loadSites } from "../../lib/ui/sites.js";
 import { control } from "../../lib/ui/control.js";
-import { CONTROL_URL } from "../../lib/ui/env.js";
 import { ago } from "../ui.js";
 
 export const dynamic = "force-dynamic";
@@ -57,9 +56,7 @@ export default async function UpdatesPage({
       .catch(() => ({ rollout: null, settings: { frozen: false, updateWindow: "always", pinned: {} as Record<string, boolean> } })),
     control.audit().catch(() => ({ audit: [] })),
     control.state().catch(() => ({ nodes: {} as Record<string, any> })),
-    fetch(`${CONTROL_URL}/api/v1/admin/releases`, { cache: "no-store" })
-      .then((r) => r.json() as Promise<{ releases: Array<{ version: string; sha256: string; configDigest: string | null }> }>)
-      .catch(() => ({ releases: [] })),
+    control.releases().catch(() => ({ releases: [] })),
   ]);
 
   return (

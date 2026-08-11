@@ -182,6 +182,28 @@ export function buildMeshGraph(
   const keyToSite = new Map(cfg.sites.map((s) => [s.gateway.publicKey, s.id]));
   const keyToClient = new Map(cfg.clients.map((c) => [c.publicKey, c.id]));
 
+  /**
+   * A client is "active" only if some gateway has actually handshaked with it
+   * recently. A configured-but-switched-off phone must not be drawn as
+   * connected — the diagram is only useful if it tells the truth.
+   */
+  const clientHealth = new Map<string, string>();
+  for (const c of cfg.clients) {
+    let best: number | null = null;
+    for (const state of Object.values(liveStates)) {
+      if (!state) continue;
+      for (const p of state.peers) {
+        if (p.publicKey !== c.publicKey || !p.latestHandshake) continue;
+        const age = Math.floor(Date.now() / 1000) - p.latestHandshake;
+        if (best === null || age < best) best = age;
+      }
+    }
+    clientHealth.set(c.id, best === null ? "offline" : best < 180 ? "active" : "degraded");
+  }
+  for (const n of nodes) {
+    if (n.kind === "client") n.health = clientHealth.get(n.id) ?? "offline";
+  }
+
   /** Most recent handshake seen for a pair, from either end's report. */
   function handshakeFor(a: string, b: string): number | null {
     let newest: number | null = null;

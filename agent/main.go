@@ -155,6 +155,12 @@ func runLoop(cfg AgentConfig, rec *Reconciler) {
 			// when not already mid-confirm.
 			if loadUpdateState(cfg).Pending == "" {
 				if instr, err := client.FetchUpdate(); err == nil && instr != nil && instr.TargetVersion != version {
+					// Clear any error from a previous attempt first. Without
+					// this the agent reports an old failure forever, and the
+					// control node aborts the next rollout on stale news —
+					// even after the original cause has been fixed.
+					state.lastUpdateError.Store("")
+					saveUpdateState(cfg, updateState{})
 					if err := applyUpdate(cfg, rec, client, *instr); err != nil {
 						log.Printf("update to %s failed before switch: %v", instr.TargetVersion, err)
 						state.lastUpdateError.Store(
