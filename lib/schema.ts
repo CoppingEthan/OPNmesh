@@ -31,6 +31,23 @@ const wgKeySchema = z
 
 const portSchema = z.number().int().min(1).max(65535);
 
+/**
+ * A human-readable name. `name` is the only free-form string that reaches a
+ * generated artifact — the router-setup instructions interpolate site and LAN
+ * names into a page an operator copies into their edge router. A newline or
+ * control character in a name could forge an extra static-route or firewall
+ * line that looks OPNmesh-authored, so they are refused at the boundary.
+ * (Names never reach WireGuard/nftables config; this guards the router page.)
+ */
+const nameSchema = z
+  .string()
+  .min(1)
+  .max(120)
+  // eslint-disable-next-line no-control-regex
+  .refine((s) => !/[\u0000-\u001f\u007f]/.test(s), {
+    message: "name may not contain control characters or line breaks",
+  });
+
 /** Endpoint is a host only — the port is always derived from the owning node's listen_port. */
 const endpointSchema = z
   .string()
@@ -44,7 +61,7 @@ const endpointSchema = z
 const gatewaySchema = z
   .object({
     /** Display name — cosmetic, never appears in generated WireGuard config. */
-    name: z.string().min(1).optional(),
+    name: nameSchema.optional(),
     /** The gateway's address on its own site LAN — the next hop the site router points at. */
     lan_ip: ipv4Schema,
     tunnel_ip: ipv4Schema,
@@ -74,7 +91,7 @@ const lanSchema = z
   .object({
     cidr: cidrSchema,
     /** Display name, e.g. "Staff", "Voice", "CCTV". Cosmetic. */
-    name: z.string().min(1).optional(),
+    name: nameSchema.optional(),
     /** 802.1Q VLAN id, documentation only — OPNmesh never configures switches. */
     vlan: z.number().int().min(1).max(4094).optional(),
     role: z.enum(["standard", "management", "guest"]).default("standard"),
@@ -84,7 +101,7 @@ const lanSchema = z
 const siteSchema = z
   .object({
     id: idSchema,
-    name: z.string().min(1),
+    name: nameSchema,
     /** Single-subnet shorthand. Exactly one of `lan` or `lans` is required. */
     lan: cidrSchema.optional(),
     /** Multi-VLAN sites list every segment here. */
@@ -99,7 +116,7 @@ const siteSchema = z
 const clientSchema = z
   .object({
     id: idSchema,
-    name: z.string().min(1).optional(),
+    name: nameSchema.optional(),
     tunnel_ip: ipv4Schema,
     public_key: wgKeySchema,
     /** Ordered preference. Omitted = every eligible site (has an inbound endpoint). */
@@ -112,7 +129,7 @@ const clientSchema = z
 
 const networkSchema = z
   .object({
-    name: z.string().min(1).optional(),
+    name: nameSchema.optional(),
     gateway_subnet: cidrSchema.default("10.99.0.0/24"),
     client_subnet: cidrSchema.default("10.99.1.0/24"),
     /** Default only — every node may override. Never hardcoded downstream. */

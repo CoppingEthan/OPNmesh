@@ -163,14 +163,30 @@ function parsePeers(conf: string): ParsedPeer[] {
 export function validateAllowedIps(cfg: ResolvedConfig, bundle: GeneratedBundle): Finding[] {
   const out: Finding[] = [];
 
+  // A /0 is the obvious default route, but the danger is a near-default
+  // supernet too: /1–/7 each crypto-route a huge slice of the public internet
+  // (e.g. 128.0.0.0/1 is half of IPv4) into the mesh and onto every peer and
+  // client. Advertised prefixes are LANs, which have no business being that
+  // broad, so anything shorter than this floor is refused — closing the gap
+  // where a /1 sailed past a literal "/0"-only check.
+  const MIN_ADVERTISED_PREFIX = 8;
   const checkNoDefaultRoute = (owner: string, ips: string[]) => {
     for (const ip of ips) {
-      if (ip === "0.0.0.0/0" || ip.endsWith("/0")) {
-        out.push(err("default-route", `${owner}: AllowedIPs contains a default route (${ip})`));
-      }
       const bare = ip.split("/")[0]!;
       if (!isValidIpv4(bare)) {
         out.push(err("allowedips-parse", `${owner}: unparseable AllowedIPs entry "${ip}"`));
+        continue;
+      }
+      const prefix = ip.includes("/") ? Number(ip.split("/")[1]) : 32;
+      if (ip === "0.0.0.0/0" || prefix === 0) {
+        out.push(err("default-route", `${owner}: AllowedIPs contains a default route (${ip})`));
+      } else if (Number.isFinite(prefix) && prefix < MIN_ADVERTISED_PREFIX) {
+        out.push(
+          err(
+            "default-route",
+            `${owner}: AllowedIPs contains a near-default supernet (${ip}); prefixes shorter than /${MIN_ADVERTISED_PREFIX} route most of the internet into the mesh`,
+          ),
+        );
       }
     }
   };

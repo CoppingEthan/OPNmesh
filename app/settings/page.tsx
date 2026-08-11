@@ -1,7 +1,13 @@
 import { revalidatePath } from "next/cache";
 import { existsSync } from "node:fs";
 import { simpleGit } from "simple-git";
-import { requireAdmin, logout, setAdminPassword, passwordProblem } from "../../lib/ui/auth.js";
+import {
+  requireAdmin,
+  logout,
+  setAdminPassword,
+  passwordProblem,
+  verifyAdminPassword,
+} from "../../lib/ui/auth.js";
 import { loadSites, editSites } from "../../lib/ui/sites.js";
 import { STATE_DIR, CONTROL_URL } from "../../lib/ui/env.js";
 
@@ -56,9 +62,17 @@ async function removeRemote() {
 async function changePassword(formData: FormData) {
   "use server";
   await requireAdmin();
+  const current = String(formData.get("current") ?? "");
   const password = String(formData.get("password") ?? "");
   const confirm = String(formData.get("confirm") ?? "");
   const { redirect } = await import("next/navigation");
+  // Require the CURRENT password. Without it, any momentarily-open session (a
+  // walk-up to an unlocked browser) could set a new password known only to the
+  // attacker — which also wipes every session, evicting the real operator with
+  // no recovery path since /setup is closed once an admin exists.
+  if (!(await verifyAdminPassword(current))) {
+    redirect("/settings?err=" + encodeURIComponent("Your current password is not correct."));
+  }
   if (password !== confirm) redirect("/settings?err=" + encodeURIComponent("Passwords do not match."));
   const problem = passwordProblem(password);
   if (problem) redirect("/settings?err=" + encodeURIComponent(problem));
@@ -160,8 +174,9 @@ export default async function SettingsPage({
           Changing your password signs out every device, including this one.
         </p>
         <form action={changePassword} className="flex flex-wrap items-end gap-2">
-          <input className="input w-56" type="password" name="password" placeholder="New password" />
-          <input className="input w-56" type="password" name="confirm" placeholder="Repeat it" />
+          <input className="input w-56" type="password" name="current" placeholder="Current password" autoComplete="current-password" />
+          <input className="input w-56" type="password" name="password" placeholder="New password" autoComplete="new-password" />
+          <input className="input w-56" type="password" name="confirm" placeholder="Repeat it" autoComplete="new-password" />
           <button className="btn" type="submit">Change password</button>
         </form>
       </div>

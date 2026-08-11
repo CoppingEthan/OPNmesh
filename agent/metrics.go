@@ -49,7 +49,28 @@ func loadSettings(confDir string) AgentSettings {
 	if s.MetricsBind == "" {
 		s.MetricsBind = "127.0.0.1"
 	}
+	if safe := safeMetricsBind(s.MetricsBind); safe != s.MetricsBind {
+		log.Printf("metrics: refusing exporter bind %q (unauthenticated, serves peer keys); using %s", s.MetricsBind, safe)
+		s.MetricsBind = safe
+	}
 	return s
+}
+
+// safeMetricsBind constrains the exporter bind address. The exporter is
+// unauthenticated and serves peer public keys and byte counters, so a
+// server-supplied wildcard ("0.0.0.0"/"::") or public address — which on a
+// gateway would publish that data on the WAN — is refused and replaced with
+// loopback. Only loopback and private/link-local addresses (e.g. the tunnel
+// address Prometheus scrapes over the mesh) are permitted.
+func safeMetricsBind(bind string) string {
+	ip := net.ParseIP(bind)
+	if ip == nil {
+		return "127.0.0.1"
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return bind
+	}
+	return "127.0.0.1"
 }
 
 // MetricsServer exposes tier-1 (wg peer counters/handshakes) and tier-2

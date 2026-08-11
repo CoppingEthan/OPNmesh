@@ -59,6 +59,25 @@ describe("login throttling", () => {
     }
   });
 
+  it("admits the correct password even while throttled — the operator is never locked out", async () => {
+    // Fill the shared bucket so throttled() is true for everyone.
+    for (let i = 0; i < 8; i++) await guess(`wrong-${i}-cccccccc`, "203.0.113.9");
+    expect((await guess("still-wrong-cccc", "203.0.113.9")).throttled).toBe(true);
+
+    // The regression this guards: a full failure ledger used to block the
+    // success path too, so an attacker could lock the sole admin out. A
+    // correct password must win regardless of the throttle state.
+    const good = await guess("the-real-admin-password", "203.0.113.9");
+    expect(good.ok).toBe(true);
+
+    // Success clears the ledger, so the next caller starts clean.
+    const Database = (await import("better-sqlite3")).default;
+    const db = new Database(join(process.env["OPNMESH_DATA_DIR"]!, "ui.db"));
+    const row = db.prepare("SELECT COUNT(*) AS n FROM login_failures").get() as { n: number };
+    db.close();
+    expect(row.n).toBe(0);
+  });
+
   it("lets the real operator back in, and clears the ledger on success", async () => {
     // Throttling is time-boxed, not permanent, so the window is stepped over
     // by ageing the recorded failures rather than by sleeping.

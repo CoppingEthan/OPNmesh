@@ -91,9 +91,17 @@ function ownCertPin(): string | null {
 const enrolLimiter = new RateLimiter(10, 15 * 60 * 1000);
 /** Blunt backstop against unauthenticated flooding of everything else. */
 const publicLimiter = new RateLimiter(300, 60 * 1000);
+/**
+ * Per-node cap on flow submissions. Each POST may carry 5000 flows, so without
+ * a dedicated limit one authenticated node could bury the flow store (and the
+ * event loop that reads it) far faster than the blunt per-IP limiter allows.
+ * 30/min × 5000 = 150k flows/min/node is ample for honest reporting.
+ */
+const flowIngestLimiter = new RateLimiter(30, 60 * 1000);
 setInterval(() => {
   enrolLimiter.sweep();
   publicLimiter.sweep();
+  flowIngestLimiter.sweep();
 }, 60_000).unref();
 
 const MAX_BODY_BYTES = 1 << 20; // 1 MiB for JSON endpoints
@@ -232,16 +240,14 @@ interface ControlSettings {
 }
 
 function loadSettings(): ControlSettings {
-  if (!existsSync(SETTINGS_PATH)) return { frozen: false, updateWindow: "always", pinned: {} };
-  return JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as ControlSettings;
+  return readJsonOr<ControlSettings>(SETTINGS_PATH, { frozen: false, updateWindow: "always", pinned: {} });
 }
 function saveSettings(s: ControlSettings): void {
   writeFileSync(SETTINGS_PATH, JSON.stringify(s, null, 2) + "\n", "utf8");
 }
 
 function loadRollout(): RolloutState | null {
-  if (!existsSync(ROLLOUT_PATH)) return null;
-  return JSON.parse(readFileSync(ROLLOUT_PATH, "utf8")) as RolloutState;
+  return readJsonOr<RolloutState | null>(ROLLOUT_PATH, null);
 }
 function saveRollout(r: RolloutState): void {
   writeFileSync(ROLLOUT_PATH, JSON.stringify(r, null, 2) + "\n", "utf8");
@@ -253,9 +259,7 @@ function appendAudit(type: string, detail: string): void {
 }
 
 function manifestFor(version: string): ReleaseManifest | null {
-  const p = join(RELEASES_DIR, version, "manifest.json");
-  if (!existsSync(p)) return null;
-  return JSON.parse(readFileSync(p, "utf8")) as ReleaseManifest;
+  return readJsonOr<ReleaseManifest | null>(join(RELEASES_DIR, version, "manifest.json"), null);
 }
 
 /** Digest of the full generated bundle for the current topology. */
@@ -312,8 +316,7 @@ interface PortChange {
 }
 
 function loadPortChange(): PortChange | null {
-  if (!existsSync(PORTCHANGE_PATH)) return null;
-  return JSON.parse(readFileSync(PORTCHANGE_PATH, "utf8")) as PortChange;
+  return readJsonOr<PortChange | null>(PORTCHANGE_PATH, null);
 }
 
 function tickPortChange(): void {
@@ -349,11 +352,18 @@ function tickPortChange(): void {
 }
 
 setInterval(() => {
+  // Independent try blocks: a fault in the rollout tick must not skip the
+  // port-change tick, which is what performs the mesh-wide auto-revert. One
+  // stuck state file cannot be allowed to leave tunnels down indefinitely.
   try {
     tickRollout();
+  } catch (e) {
+    console.error("rollout tick error:", e);
+  }
+  try {
     tickPortChange();
   } catch (e) {
-    console.error("tick error:", e);
+    console.error("port-change tick error:", e);
   }
 }, 2000).unref();
 
@@ -380,8 +390,7 @@ function capturesPath(): string {
   return join(CAPTURES_DIR, "jobs.json");
 }
 function loadCaptures(): CaptureJob[] {
-  if (!existsSync(capturesPath())) return [];
-  return JSON.parse(readFileSync(capturesPath(), "utf8")) as CaptureJob[];
+  return readJsonOr<CaptureJob[]>(capturesPath(), []);
 }
 function saveCaptures(jobs: CaptureJob[]): void {
   mkdirSync(CAPTURES_DIR, { recursive: true });
@@ -427,8 +436,7 @@ setInterval(() => {
 }, 60_000).unref();
 
 function loadRegistry(): Registry {
-  if (!existsSync(REGISTRY_PATH)) return emptyRegistry();
-  return JSON.parse(readFileSync(REGISTRY_PATH, "utf8")) as Registry;
+  return readJsonOr<Registry>(REGISTRY_PATH, emptyRegistry());
 }
 
 function saveRegistry(reg: Registry): void {
@@ -482,6 +490,41 @@ function desiredFor(nodeId: string): { files: Record<string, string>; hash: stri
 
 function bearerToken(req: IncomingMessage): string | null {
   return parseBearer(req.headers.authorization);
+}
+
+/**
+ * Escape a Prometheus label VALUE per the exposition format: backslash,
+ * double-quote and newline are the three characters that can break out of a
+ * `name="value"` label or terminate the line early.
+ *
+ * A node reports its own `version`, which lands in a `/metrics` label. Without
+ * escaping, a node could set version to `x"} 1\nopnmesh_node_drift{node="other"} 0`
+ * and forge another node's health line, or embed a newline so Prometheus
+ * rejects the whole scrape and every alert goes blind. The schema also
+ * constrains version, but escaping here is the durable guarantee: any future
+ * label sourced from node- or config-supplied text is safe by construction.
+ */
+function promLabel(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+}
+
+/**
+ * Read and JSON-parse a state file, returning `fallback` if it is missing OR
+ * truncated. These files are written non-atomically and frequently (the 2s
+ * tick, every agent report), so a crash mid-write leaves half a line. An
+ * unguarded JSON.parse would then throw on every subsequent load — and because
+ * the ticks shared one try, a single corrupt rollout.json used to disable
+ * port-change auto-revert for the whole mesh. Failing safe keeps the control
+ * plane running; the next write heals the file.
+ */
+function readJsonOr<T>(path: string, fallback: T): T {
+  if (!existsSync(path)) return fallback;
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as T;
+  } catch {
+    console.error(`state file ${path} is unreadable/corrupt; using a safe default until it is rewritten`);
+    return fallback;
+  }
 }
 
 function json(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
@@ -666,8 +709,21 @@ const handler = async (req: IncomingMessage, res: ServerResponse) => {
       if (!token) return json(res, 401, { error: "unauthorized" });
       const auth = authenticate(loadRegistry(), token);
       if (auth.status !== "active") return json(res, 401, { error: "unauthorized" });
+      if (!flowIngestLimiter.allow(auth.siteId)) {
+        return json(res, 429, { error: "too many flow submissions" });
+      }
       const payload = await body(req, S.agentFlowsSchema);
       const now = Math.floor(Date.now() / 1000);
+      // Clamp the reported time into a sane band. A far-future value would
+      // otherwise survive every retention prune forever (prune keeps
+      // reported >= cutoff), letting a node defeat retention and grow the
+      // store without bound.
+      const clampReported = (r: number | undefined): number => {
+        if (r === undefined) return now;
+        if (r > now + 300) return now; // no meaningful future flows
+        if (r < now - 366 * 86400) return now - 366 * 86400; // older than any retention window
+        return r;
+      };
       flowStore.ingest(
         payload.flows.map((f) => ({
           node: auth.siteId,
@@ -677,7 +733,7 @@ const handler = async (req: IncomingMessage, res: ServerResponse) => {
           dstPort: f.dstPort,
           bytes: f.bytes,
           packets: f.packets,
-          reported: f.reported ?? now,
+          reported: clampReported(f.reported),
         })),
       );
       return json(res, 200, { ok: true });
@@ -717,11 +773,11 @@ const handler = async (req: IncomingMessage, res: ServerResponse) => {
         const desired = desiredFor(siteId);
         const report = reports.get(siteId);
         const drift = desired && report && report.diskHash !== desired.hash ? 1 : 0;
-        lines.push(`opnmesh_node_drift{node="${siteId}"} ${drift}`);
+        lines.push(`opnmesh_node_drift{node="${promLabel(siteId)}"} ${drift}`);
         lines.push(
-          `opnmesh_node_last_seen_timestamp_seconds{node="${siteId}"} ${report ? Math.floor(report.lastSeen / 1000) : 0}`,
+          `opnmesh_node_last_seen_timestamp_seconds{node="${promLabel(siteId)}"} ${report ? Math.floor(report.lastSeen / 1000) : 0}`,
         );
-        lines.push(`opnmesh_node_reconcile_error{node="${siteId}"} ${report && report.lastError !== "" ? 1 : 0}`);
+        lines.push(`opnmesh_node_reconcile_error{node="${promLabel(siteId)}"} ${report && report.lastError !== "" ? 1 : 0}`);
       }
       lines.push("# TYPE opnmesh_pending_nodes gauge", `opnmesh_pending_nodes ${reg.pending.length}`);
       lines.push(
@@ -739,8 +795,8 @@ const handler = async (req: IncomingMessage, res: ServerResponse) => {
       lines.push("# TYPE opnmesh_node_update_error gauge", "# TYPE opnmesh_node_info gauge");
       for (const siteId of Object.keys(reg.bindings)) {
         const r = reports.get(siteId);
-        lines.push(`opnmesh_node_update_error{node="${siteId}"} ${r && r.lastUpdateError !== "" ? 1 : 0}`);
-        if (r?.version) lines.push(`opnmesh_node_info{node="${siteId}",version="${r.version}"} 1`);
+        lines.push(`opnmesh_node_update_error{node="${promLabel(siteId)}"} ${r && r.lastUpdateError !== "" ? 1 : 0}`);
+        if (r?.version) lines.push(`opnmesh_node_info{node="${siteId}",version="${promLabel(r.version)}"} 1`);
       }
       res.writeHead(200, { "content-type": "text/plain; version=0.0.4" });
       return res.end(lines.join("\n") + "\n");
@@ -962,6 +1018,15 @@ const handler = async (req: IncomingMessage, res: ServerResponse) => {
       const request = await body(req, S.changePortSchema);
       const siteId = request.siteId;
       const port = request.port;
+      // One port change at a time. A second overlapping change would overwrite
+      // the singleton transaction record — leaving the first change untracked
+      // (never auto-reverted if its mesh never re-forms) and snapshotting the
+      // first change's unverified port as the second's rollback target.
+      if (loadPortChange()) {
+        return json(res, 409, {
+          error: "a port change is already in progress; wait for it to verify or revert before starting another",
+        });
+      }
       const prevYaml = readFileSync(SITES_PATH, "utf8");
       const doc = parseYaml(prevYaml);
       const site = doc.sites.find((s: any) => s.id === siteId);

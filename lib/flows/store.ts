@@ -66,23 +66,75 @@ export function aggregate(flows: StoredFlow[], sinceUnixSec: number, limit: numb
   return [...byKey.values()].sort((a, b) => b.bytes - a.bytes).slice(0, limit);
 }
 
-/** JSONL-backed store for the dev server and simulation. */
+/**
+ * JSONL-backed store for the dev server, simulation, and single-node
+ * deployments.
+ *
+ * Hardened against a flow-flood DoS: an authenticated node can post up to 5000
+ * flows per request, and the naive version read and JSON-parsed the ENTIRE
+ * file on every count()/topTalkers()/prune() — so a single node token could
+ * grow the file unbounded and freeze the single-threaded control-plane event
+ * loop for seconds per synchronous slurp, stalling config pulls for the whole
+ * mesh. Three guards fix that here:
+ *  - a HARD RECORD CAP bounds the file, so every read is bounded too;
+ *  - count() is served from an in-memory counter, so /metrics scrapes and the
+ *    like never touch the disk;
+ *  - callers clamp the `reported` timestamp before ingest (see the control
+ *    server) so a far-future value cannot dodge retention pruning forever.
+ * A SQLite-backed store (indexed prune/aggregate/count, no full read) remains
+ * the right choice at large scale; this keeps the file store safe until then.
+ */
+export const DEFAULT_MAX_FLOW_RECORDS = 200_000;
+
 export class JsonlFlowStore implements FlowStore {
-  constructor(private readonly path: string) {
+  private readonly maxRecords: number;
+  /** In-memory record count; null until first established from disk. */
+  private cachedCount: number | null = null;
+  private capWarned = false;
+
+  constructor(private readonly path: string, maxRecords: number = DEFAULT_MAX_FLOW_RECORDS) {
     mkdirSync(dirname(path), { recursive: true });
+    this.maxRecords = maxRecords;
   }
 
   private readAll(): StoredFlow[] {
     if (!existsSync(this.path)) return [];
-    return readFileSync(this.path, "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as StoredFlow);
+    const flows: StoredFlow[] = [];
+    for (const line of readFileSync(this.path, "utf8").split("\n")) {
+      if (!line) continue;
+      // A truncated final line (crash mid-append) must not throw and take the
+      // whole endpoint down with it.
+      try {
+        flows.push(JSON.parse(line) as StoredFlow);
+      } catch {
+        /* skip corrupt trailing record */
+      }
+    }
+    return flows;
+  }
+
+  private currentCount(): number {
+    if (this.cachedCount === null) this.cachedCount = this.readAll().length;
+    return this.cachedCount;
   }
 
   ingest(flows: StoredFlow[]): void {
     if (flows.length === 0) return;
-    appendFileSync(this.path, flows.map((f) => JSON.stringify(f)).join("\n") + "\n", "utf8");
+    const have = this.currentCount();
+    const room = this.maxRecords - have;
+    if (room <= 0) {
+      if (!this.capWarned) {
+        console.warn(
+          `flow store at capacity (${this.maxRecords} records) — dropping new flows until retention prunes older ones`,
+        );
+        this.capWarned = true;
+      }
+      return;
+    }
+    // Never let one flood exceed the cap in a single append.
+    const accepted = flows.length > room ? flows.slice(0, room) : flows;
+    appendFileSync(this.path, accepted.map((f) => JSON.stringify(f)).join("\n") + "\n", "utf8");
+    this.cachedCount = have + accepted.length;
   }
 
   topTalkers(sinceUnixSec: number, limit: number): TopTalker[] {
@@ -95,14 +147,18 @@ export class JsonlFlowStore implements FlowStore {
     if (kept.length !== all.length) {
       writeFileSync(this.path, kept.map((f) => JSON.stringify(f)).join("\n") + (kept.length ? "\n" : ""), "utf8");
     }
+    this.cachedCount = kept.length;
+    this.capWarned = false;
     return all.length - kept.length;
   }
 
   purge(): void {
     writeFileSync(this.path, "", "utf8");
+    this.cachedCount = 0;
+    this.capWarned = false;
   }
 
   count(): number {
-    return this.readAll().length;
+    return this.currentCount();
   }
 }

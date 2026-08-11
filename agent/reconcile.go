@@ -105,6 +105,17 @@ func (r *Reconciler) Apply() bool {
 	wgChanged = wgChanged && disk["wg0.conf"] != newWg
 	oldWg := disk["wg0.conf"]
 
+	// Refuse a wg0.conf carrying any hook the control node must not be able to
+	// run as root, BEFORE it is written or brought up. A rejected config leaves
+	// the existing tunnel untouched.
+	if wgChanged {
+		if err := validateWgHooks(newWg, r.cfg.ConfDir); err != nil {
+			r.lastErr = err.Error()
+			log.Print(r.lastErr)
+			return false
+		}
+	}
+
 	// Port pre-flight: refuse a port move onto a busy port outright, before
 	// touching anything. The tunnel keeps running on the old config.
 	if wgChanged {

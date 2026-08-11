@@ -148,12 +148,18 @@ export function advance(
     return events;
   }
 
+  // The soak is carried by the first node that actually updates. That is the
+  // canary — unless the canary is pinned/skipped, in which case pinning it
+  // must NOT silently void the bake time for the whole fleet; the next
+  // eligible node inherits the soak instead.
+  const soakCarrier = state.plan.find((n) => !opts.pinned(n));
+
   if (report && report.version === state.version && report.lastError === "") {
     if (!ns.doneAt) {
       ns.doneAt = now;
       events.push({ type: "node-done", node, detail: `healthy on ${state.version}` });
     }
-    const soakNeeded = node === state.canary ? state.soakSec : 0;
+    const soakNeeded = node === soakCarrier ? state.soakSec : 0;
     if (now - ns.doneAt >= soakNeeded * 1000) {
       if (soakNeeded > 0) {
         events.push({ type: "soak-complete", node, detail: `${state.soakSec}s soak complete` });
@@ -167,6 +173,16 @@ export function advance(
       }
     }
     return events;
+  }
+
+  // Reached here means the current node is NOT healthy on the target version.
+  // If it had previously gone healthy (soak clock running), the health has
+  // regressed — restart the clock so the soak measures CONTINUOUS health. A
+  // canary that flaps healthy → broken → healthy must not pass the gate it
+  // exists to enforce on the strength of its first good report.
+  if (ns.doneAt !== undefined) {
+    delete ns.doneAt;
+    events.push({ type: "node-started", node, detail: `health regressed on ${state.version}; soak restarted` });
   }
 
   if (ns.startedAt && now - ns.startedAt > state.failTimeoutSec * 1000) {

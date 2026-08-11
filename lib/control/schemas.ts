@@ -20,7 +20,15 @@ export const enrolRequestSchema = z.object({
 
 export const agentReportSchema = z.object({
   nodeId: z.string().max(64).optional(),
-  version: z.string().max(64).default(""),
+  // Constrained charset: version is reflected into a Prometheus /metrics label.
+  // The exposition format is escaped at the sink as well, but a version string
+  // has no reason to contain quotes, newlines or control characters, so the
+  // schema refuses them outright as the first line of defence.
+  version: z
+    .string()
+    .max(64)
+    .regex(/^[A-Za-z0-9._+-]*$/, "version may contain only letters, digits, and . _ + -")
+    .default(""),
   appliedHash: z.string().max(128).default(""),
   diskHash: z.string().max(128).default(""),
   lastError: z.string().max(2000).default(""),

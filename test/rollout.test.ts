@@ -5,6 +5,7 @@ import { loadFixture } from "./helpers.js";
 const NOW = 1_700_000_000_000;
 const noPin = { pinned: () => false };
 const healthy = (version: string) => ({ version, lastError: "", lastUpdateError: "", lastSeen: NOW });
+const unhealthy = (version: string) => ({ version, lastError: "tunnel down", lastUpdateError: "", lastSeen: NOW });
 
 describe("rollout planning", () => {
   it("canary first, hubs last", () => {
@@ -52,6 +53,38 @@ describe("rollout advancement", () => {
     );
     expect(state.status).toBe("done");
     expect(done.map((e) => e.type)).toContain("rollout-done");
+  });
+
+  it("a canary that flaps unhealthy mid-soak restarts the soak clock", () => {
+    const state = planRollout(cfg, "2.0.0", "site-a", 30, 600, NOW);
+    markStarted(state, "site-a", NOW);
+    // Healthy at t+1s → soak clock starts.
+    advance(state, { "site-a": healthy("2.0.0") }, NOW + 1_000, noPin);
+    // Breaks at t+10s (inside the 30s soak).
+    advance(state, { "site-a": unhealthy("2.0.0") }, NOW + 10_000, noPin);
+    // Healthy again at t+31s: naive code would treat the original t+1s as
+    // satisfying the 30s soak. It must NOT — the clock restarted at t+31s.
+    const ev = advance(state, { "site-a": healthy("2.0.0") }, NOW + 31_000, noPin);
+    expect(ev.map((e) => e.type)).not.toContain("soak-complete");
+    expect(state.idx).toBe(0);
+    // And it completes only after a further continuous 30s.
+    const done = advance(state, { "site-a": healthy("2.0.0") }, NOW + 62_000, noPin);
+    expect(done.map((e) => e.type)).toContain("soak-complete");
+  });
+
+  it("a pinned canary hands the soak to the next node instead of voiding it", () => {
+    const state = planRollout(cfg, "2.0.0", "site-a", 30, 600, NOW);
+    const pinA = { pinned: (n: string) => n === "site-a" };
+    // site-a is pinned → skipped; site-b becomes current and must now carry
+    // the soak rather than updating with zero bake time.
+    advance(state, {}, NOW, pinA);
+    expect(state.plan[state.idx]).toBe("site-b");
+    markStarted(state, "site-b", NOW);
+    const early = advance(state, { "site-b": healthy("2.0.0") }, NOW + 5_000, pinA);
+    expect(early.map((e) => e.type)).not.toContain("soak-complete");
+    expect(state.idx).toBe(1); // still on site-b, soaking
+    const soaked = advance(state, { "site-b": healthy("2.0.0") }, NOW + 35_000, pinA);
+    expect(soaked.map((e) => e.type)).toContain("soak-complete");
   });
 
   it("a reported update failure aborts the whole rollout", () => {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -26,6 +27,48 @@ func isManagedFile(name string) bool {
 		}
 	}
 	return false
+}
+
+// allowedPostUp is the ONE hook directive the control node may place in
+// wg0.conf: loading this node's own private key. The path is a single
+// shell-metacharacter-free token, and nothing may follow it, so there is no
+// room to chain a second command.
+var allowedPostUp = regexp.MustCompile(`^PostUp\s*=\s*wg set %i private-key ([A-Za-z0-9._/-]+)$`)
+
+// validateWgHooks refuses any wg-quick hook the control node has no business
+// supplying. wg-quick runs PreUp/PostUp/PreDown/PostDown as root via the
+// shell, and the entire wg0.conf body comes from the control node — so without
+// this gate a rogue, compromised, or MITM'd control node achieves arbitrary
+// root command execution on every gateway (the config is the back door around
+// the file-allowlist and capture-filter hardening). The only sanctioned hook
+// is `PostUp = wg set %i private-key <path>`, and the path must live under the
+// agent's own config directory.
+func validateWgHooks(conf, confDir string) error {
+	confDir = filepath.Clean(confDir)
+	for _, raw := range strings.Split(conf, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq < 0 {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(line[:eq])) {
+		case "preup", "predown", "postdown":
+			return fmt.Errorf("refusing wg0.conf: control node supplied a %s hook, which wg-quick runs as root", strings.TrimSpace(line[:eq]))
+		case "postup":
+			m := allowedPostUp.FindStringSubmatch(line)
+			if m == nil {
+				return fmt.Errorf("refusing wg0.conf: PostUp is restricted to loading the node private key, got %q", line)
+			}
+			p := filepath.Clean(m[1])
+			if p != confDir && !strings.HasPrefix(p, confDir+"/") {
+				return fmt.Errorf("refusing wg0.conf: private-key path %q is outside %s", m[1], confDir)
+			}
+		}
+	}
+	return nil
 }
 
 // safeVersion constrains a server-supplied release version before it is used

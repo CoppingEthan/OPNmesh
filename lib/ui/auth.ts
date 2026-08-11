@@ -56,6 +56,15 @@ const GLOBAL_FAILURES_BEFORE_THROTTLE = 50;
 const TRUST_PROXY_HEADERS = process.env["OPNMESH_TRUST_PROXY"] === "1";
 
 /**
+ * Ceiling on concurrent argon2 verifications. Each costs ~19 MiB + CPU, so an
+ * unbounded login flood is a resource-exhaustion DoS. Excess attempts are shed
+ * instantly and recover within milliseconds — unlike the failure ledger, this
+ * never persistently blocks a correct password.
+ */
+const MAX_INFLIGHT_VERIFY = 6;
+let inflightVerify = 0;
+
+/**
  * Cookies must be Secure in production. The one exception is an explicitly
  * flagged insecure lab run, which also downgrades the cookie name because
  * browsers reject __Host- cookies without Secure.
@@ -133,6 +142,14 @@ export function passwordProblem(password: string): string | null {
   }
   if (/^(.)\1*$/.test(password)) return "Password must not be a single repeated character.";
   return null;
+}
+
+/** Verify a plaintext password against the stored admin hash. */
+export async function verifyAdminPassword(password: string): Promise<boolean> {
+  const row = getDb().prepare("SELECT password_hash FROM admin WHERE id = 1").get() as
+    | { password_hash: string }
+    | undefined;
+  return row !== undefined && (await argon2.verify(row.password_hash, password));
 }
 
 /** Creates or replaces the admin password and invalidates every session. */
@@ -218,21 +235,39 @@ export interface LoginResult {
 export async function login(password: string): Promise<LoginResult> {
   const d = getDb();
   const source = await sourceAddress();
-  if (throttled(source)) return { ok: false, throttled: true };
+  const isThrottled = throttled(source);
 
+  // Load-shed under a genuine flood so an attacker cannot make the panel burn
+  // unbounded argon2 work (≈19 MiB + CPU each). This sheds instantly and
+  // self-heals in milliseconds as in-flight verifications drain — it is NOT
+  // the persistent, ledger-based block that used to lock the operator out.
+  if (inflightVerify >= MAX_INFLIGHT_VERIFY) return { ok: false, throttled: true };
+
+  // Verify the password BEFORE the throttle can veto the outcome. A correct
+  // credential must always be admitted: the failure ledger is a single shared
+  // bucket without a trusted proxy, so letting it block the *success* path
+  // means an attacker who fills it locks the sole admin out of their own panel
+  // — exactly when they most need in. The throttle governs WRONG guesses only.
   const row = d.prepare("SELECT password_hash FROM admin WHERE id = 1").get() as
     | { password_hash: string }
     | undefined;
-  const valid = row !== undefined && (await argon2.verify(row.password_hash, password));
+  let valid = false;
+  inflightVerify++;
+  try {
+    valid = row !== undefined && (await argon2.verify(row.password_hash, password));
+  } finally {
+    inflightVerify--;
+  }
   if (!valid) {
     d.prepare("INSERT INTO login_failures (source, ts) VALUES (?, ?)").run(source, Date.now());
-    return { ok: false, throttled: false };
+    // `isThrottled` is now only a message to the caller — the wrong password
+    // was rejected on its own merits, not because the bucket was full.
+    return { ok: false, throttled: isThrottled };
   }
 
   // A correct password proves the operator is present, so the whole failure
   // ledger is cleared — not just this source's. Otherwise an attacker could
-  // park failures just under the global ceiling and leave the admin one typo
-  // away from being locked out of their own panel.
+  // park failures and leave the admin one typo from a lockout.
   d.prepare("DELETE FROM login_failures").run();
 
   const token = randomBytes(32).toString("hex");
