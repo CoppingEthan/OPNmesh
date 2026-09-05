@@ -1,0 +1,50 @@
+{
+  "siteId": "site-dc",
+  "siteSlug": "dc",
+  "layout": "transit",
+  "nextHop": "10.0.250.2",
+  "routes": [
+    {
+      "cidr": "192.168.20.0/24",
+      "label": "Office — Staff",
+      "objectName": "OPNmesh: office Staff",
+      "required": true
+    },
+    {
+      "cidr": "10.30.0.0/24",
+      "label": "Warehouse — Warehouse",
+      "objectName": "OPNmesh: warehouse Warehouse",
+      "required": true
+    },
+    {
+      "cidr": "10.99.0.0/24",
+      "label": "Mesh tunnel addresses (gateways)",
+      "objectName": "OPNmesh: tunnel addresses",
+      "required": true
+    },
+    {
+      "cidr": "10.99.1.0/24",
+      "label": "Roaming clients (aggregate only — never per-client routes)",
+      "objectName": "OPNmesh: roaming clients",
+      "required": true
+    }
+  ],
+  "portForward": {
+    "protocol": "udp",
+    "port": 51820,
+    "toIp": "10.0.250.2"
+  },
+  "allStatesPolicy": null,
+  "clientBlockPolicy": {
+    "name": "OPNmesh: block LAN to roaming clients",
+    "destination": "10.99.1.0/24"
+  },
+  "localLans": [
+    {
+      "cidr": "10.0.1.0/24",
+      "name": "Servers",
+      "vlan": null,
+      "shared": true
+    }
+  ]
+}

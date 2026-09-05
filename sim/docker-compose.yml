@@ -1,0 +1,225 @@
+# OPNmesh simulation: four sites with real routers, gateways and hosts, a
+# roaming client on the "internet", and the real controller image.
+#
+#   Site A  datacentre  transit layout, reachable, hosts the controller
+#   Site B  office      same-LAN layout, reachable, UniFi-like firewall
+#   Site C  warehouse   masquerade layout, outbound-only (CGNAT-style NAT, no port forward)
+#   Site D  shop        transit layout, outbound-only  → C↔D transit through A
+#
+# All Ubuntu 24.04 images with kernel WireGuard and nftables. Docker's own
+# gateway on every subnet is .254 so routers can hold the conventional .1.
+# /proc/sys is read-only inside containers, so every sysctl is set here.
+name: opnmesh-sim
+
+networks:
+  wan:
+    ipam: { config: [{ subnet: 198.51.100.0/24, gateway: 198.51.100.254 }] }
+    driver_opts: { com.docker.network.bridge.enable_ip_masquerade: "false" }
+  lan-a:
+    ipam: { config: [{ subnet: 10.0.1.0/24, gateway: 10.0.1.254 }] }
+    driver_opts: { com.docker.network.bridge.enable_ip_masquerade: "false" }
+  transit-a:
+    ipam: { config: [{ subnet: 10.0.250.0/29, gateway: 10.0.250.6 }] }
+    driver_opts: { com.docker.network.bridge.enable_ip_masquerade: "false" }
+  lan-b:
+    ipam: { config: [{ subnet: 192.168.20.0/24, gateway: 192.168.20.254 }] }
+    driver_opts: { com.docker.network.bridge.enable_ip_masquerade: "false" }
+  lan-c:
+    ipam: { config: [{ subnet: 10.30.0.0/24, gateway: 10.30.0.254 }] }
+    driver_opts: { com.docker.network.bridge.enable_ip_masquerade: "false" }
+  lan-d:
+    ipam: { config: [{ subnet: 10.40.0.0/24, gateway: 10.40.0.254 }] }
+    driver_opts: { com.docker.network.bridge.enable_ip_masquerade: "false" }
+  transit-d:
+    ipam: { config: [{ subnet: 10.40.250.0/29, gateway: 10.40.250.6 }] }
+    driver_opts: { com.docker.network.bridge.enable_ip_masquerade: "false" }
+
+x-node: &node
+  image: opnmesh-sim-node
+  cap_add: [NET_ADMIN]
+  restart: "no"
+
+# A router forwards, never sends ICMP redirects (the pessimistic UniFi case).
+x-router: &router
+  <<: *node
+  sysctls:
+    net.ipv4.ip_forward: 1
+    net.ipv4.conf.all.rp_filter: 2
+    net.ipv4.conf.all.send_redirects: 0
+    net.ipv4.conf.default.send_redirects: 0
+
+# A gateway VM as Ubuntu ships it (rp_filter loose) plus forwarding.
+x-gateway: &gateway
+  <<: *node
+  sysctls:
+    net.ipv4.ip_forward: 1
+    net.ipv4.conf.all.rp_filter: 2
+
+# A hardened LAN host: no forwarding, ignores ICMP redirects.
+x-host: &host
+  <<: *node
+  sysctls:
+    net.ipv4.ip_forward: 0
+    net.ipv4.conf.all.accept_redirects: 0
+    net.ipv4.conf.default.accept_redirects: 0
+
+services:
+  # Builds the shared node image exactly once (profile "build" keeps it from running).
+  node-image:
+    build:
+      context: ..
+      dockerfile: sim/Dockerfile.node
+    image: opnmesh-sim-node
+    profiles: [build]
+    command: ["true"]
+
+  # --- Site A: datacentre (transit layout, controller lives here) ------------
+  router-a:
+    <<: *router
+    container_name: sim-router-a
+    networks:
+      wan: { ipv4_address: 198.51.100.10 }
+      lan-a: { ipv4_address: 10.0.1.1 }
+      transit-a: { ipv4_address: 10.0.250.1 }
+    environment:
+      LAN_PREFIX: "10.0.1."
+      DNAT: "udp:51820:10.0.250.2,tcp:3000:10.0.1.10"
+    command: /opt/sim/router.sh
+  gw-a:
+    <<: *gateway
+    container_name: sim-gw-a
+    networks:
+      transit-a: { ipv4_address: 10.0.250.2 }
+    environment:
+      ROUTER_IP: 10.0.250.1
+      CONTROLLER_URL: http://198.51.100.10:3000
+    volumes: ["./state/gw-a:/etc/opnmesh"]
+    depends_on: [router-a]
+    command: /opt/sim/gateway.sh
+  host-a:
+    <<: *host
+    container_name: sim-host-a
+    networks:
+      lan-a: { ipv4_address: 10.0.1.20 }
+    environment: { ROUTER_IP: 10.0.1.1, TRAFFIC_TARGETS: "192.168.20.20:5202:240:0:60,10.40.0.20:5202:300:90:8" }
+    depends_on: [router-a]
+    command: /opt/sim/host.sh
+  controller:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: opnmesh-controller
+    container_name: sim-controller
+    user: root
+    cap_add: [NET_ADMIN]
+    networks:
+      lan-a: { ipv4_address: 10.0.1.10 }
+    environment:
+      OPNMESH_INSECURE_HTTP: "1"
+      OPNMESH_PUBLIC_URL: http://198.51.100.10:3000
+      OPNMESH_DATA_DIR: /data
+    volumes: ["./state/controller:/data"]
+    ports: ["127.0.0.1:18080:3000"]
+    depends_on: [router-a]
+    command: ["sh", "-c", "ip route replace default via 10.0.1.1 && exec node server.js"]
+
+  # --- Site B: office (same-LAN layout, reachable) ---------------------------
+  router-b:
+    <<: *router
+    container_name: sim-router-b
+    networks:
+      wan: { ipv4_address: 198.51.100.20 }
+      lan-b: { ipv4_address: 192.168.20.1 }
+    environment:
+      LAN_PREFIX: "192.168.20."
+      DNAT: "udp:51820:192.168.20.2"
+    command: /opt/sim/router.sh
+  gw-b:
+    <<: *gateway
+    container_name: sim-gw-b
+    networks:
+      lan-b: { ipv4_address: 192.168.20.2 }
+    environment:
+      ROUTER_IP: 192.168.20.1
+      CONTROLLER_URL: http://198.51.100.10:3000
+    volumes: ["./state/gw-b:/etc/opnmesh"]
+    depends_on: [router-b]
+    command: /opt/sim/gateway.sh
+  host-b:
+    <<: *host
+    container_name: sim-host-b
+    networks:
+      lan-b: { ipv4_address: 192.168.20.20 }
+    environment: { ROUTER_IP: 192.168.20.1, TRAFFIC_TARGETS: "10.0.1.20:5202:200:30:45,10.30.0.20:5202:260:120:6" }
+    depends_on: [router-b]
+    command: /opt/sim/host.sh
+
+  # --- Site C: warehouse (masquerade layout, outbound-only) ------------------
+  router-c:
+    <<: *router
+    container_name: sim-router-c
+    networks:
+      wan: { ipv4_address: 198.51.100.30 }
+      lan-c: { ipv4_address: 10.30.0.1 }
+    environment:
+      LAN_PREFIX: "10.30.0."
+    command: /opt/sim/router.sh
+  gw-c:
+    <<: *gateway
+    container_name: sim-gw-c
+    networks:
+      lan-c: { ipv4_address: 10.30.0.2 }
+    environment:
+      ROUTER_IP: 10.30.0.1
+      CONTROLLER_URL: http://198.51.100.10:3000
+    volumes: ["./state/gw-c:/etc/opnmesh"]
+    depends_on: [router-c]
+    command: /opt/sim/gateway.sh
+  host-c:
+    <<: *host
+    container_name: sim-host-c
+    networks:
+      lan-c: { ipv4_address: 10.30.0.20 }
+    environment: { ROUTER_IP: 10.30.0.1 }
+    depends_on: [router-c]
+    command: /opt/sim/host.sh
+
+  # --- Site D: shop (transit layout, outbound-only) --------------------------
+  router-d:
+    <<: *router
+    container_name: sim-router-d
+    networks:
+      wan: { ipv4_address: 198.51.100.40 }
+      lan-d: { ipv4_address: 10.40.0.1 }
+      transit-d: { ipv4_address: 10.40.250.1 }
+    environment:
+      LAN_PREFIX: "10.40.0."
+    command: /opt/sim/router.sh
+  gw-d:
+    <<: *gateway
+    container_name: sim-gw-d
+    networks:
+      transit-d: { ipv4_address: 10.40.250.2 }
+    environment:
+      ROUTER_IP: 10.40.250.1
+      CONTROLLER_URL: http://198.51.100.10:3000
+    volumes: ["./state/gw-d:/etc/opnmesh"]
+    depends_on: [router-d]
+    command: /opt/sim/gateway.sh
+  host-d:
+    <<: *host
+    container_name: sim-host-d
+    networks:
+      lan-d: { ipv4_address: 10.40.0.20 }
+    environment: { ROUTER_IP: 10.40.0.1, TRAFFIC_TARGETS: "10.30.0.20:5203:220:45:12,192.168.20.20:5203:340:150:5" }
+    depends_on: [router-d]
+    command: /opt/sim/host.sh
+
+  # --- Roaming client on the internet ----------------------------------------
+  client:
+    <<: *host
+    container_name: sim-client
+    networks:
+      wan: { ipv4_address: 198.51.100.100 }
+    volumes: ["./state/client:/etc/opnmesh"]
+    command: /opt/sim/client.sh

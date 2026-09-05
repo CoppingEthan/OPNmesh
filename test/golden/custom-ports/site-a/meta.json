@@ -1,7 +1,0 @@
-{
-  "nodeId": "site-a",
-  "role": "gateway",
-  "listenPort": 443,
-  "needsReresolve": true,
-  "privateKeyPath": "/etc/opnmesh/keys/wg0.key"
-}

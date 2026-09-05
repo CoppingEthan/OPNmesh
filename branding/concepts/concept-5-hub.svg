@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 130" width="560" height="130" role="img" aria-label="OPNmesh">
+  <!-- Concept 5 — Hub: three sites on the ring, joined through the centre. -->
+  <g transform="translate(64 66)">
+    <circle r="34" fill="none" stroke="#8fe0c3" stroke-width="8"/>
+    <g stroke="#3fb28c" stroke-width="3" stroke-linecap="round">
+      <line x1="0" y1="0" x2="0" y2="-34"/>
+      <line x1="0" y1="0" x2="29.44" y2="17"/>
+      <line x1="0" y1="0" x2="-29.44" y2="17"/>
+    </g>
+    <circle r="6.5" fill="#2e9f7b"/>
+    <g fill="#ffffff" stroke="#2e9f7b" stroke-width="3.5">
+      <circle cx="0" cy="-34" r="5.5"/>
+      <circle cx="29.44" cy="17" r="5.5"/>
+      <circle cx="-29.44" cy="17" r="5.5"/>
+    </g>
+  </g>
+  <text x="112" y="95" font-family="'Segoe UI Variable Display', 'Segoe UI', Inter, system-ui, sans-serif" font-size="86" font-weight="700" letter-spacing="-3">
+    <tspan fill="#3fb28c">PN</tspan><tspan fill="#16211d">mesh</tspan>
+  </text>
+</svg>

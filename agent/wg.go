@@ -1,8 +1,8 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -12,16 +12,11 @@ import (
 	"strings"
 )
 
-// ManagedFiles are the files the agent reconciles, relative to ConfDir.
-// This list is an allowlist, not documentation: anything the control node
-// names that is not here is refused (see isManagedFile).
-var ManagedFiles = []string{"wg0.conf", "nftables.conf", "sysctl.conf", "agent-settings.json"}
+// ManagedFiles are the logical names the controller sends. Anything else is
+// refused: the controller is authenticated, not trusted with paths.
+var ManagedFiles = []string{"wireguard.conf", "nftables.conf", "sysctl.conf"}
 
-// isManagedFile reports whether a server-supplied name may be written.
 func isManagedFile(name string) bool {
-	if name == "" || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
-		return false
-	}
 	for _, m := range ManagedFiles {
 		if name == m {
 			return true
@@ -30,21 +25,14 @@ func isManagedFile(name string) bool {
 	return false
 }
 
-// allowedPostUp is the ONE hook directive the control node may place in
-// wg0.conf: loading this node's own private key. The path is a single
-// shell-metacharacter-free token, and nothing may follow it, so there is no
-// room to chain a second command.
+// allowedPostUp is the only hook the controller may place in the WireGuard
+// config: loading this gateway's own private key from a path under ConfDir.
 var allowedPostUp = regexp.MustCompile(`^PostUp\s*=\s*wg set %i private-key ([A-Za-z0-9._/-]+)$`)
 
-// validateWgHooks refuses any wg-quick hook the control node has no business
-// supplying. wg-quick runs PreUp/PostUp/PreDown/PostDown as root via the
-// shell, and the entire wg0.conf body comes from the control node — so without
-// this gate a rogue, compromised, or MITM'd control node achieves arbitrary
-// root command execution on every gateway (the config is the back door around
-// the file-allowlist and capture-filter hardening). The only sanctioned hook
-// is `PostUp = wg set %i private-key <path>`, and the path must live under the
-// agent's own config directory.
-func validateWgHooks(conf, confDir string) error {
+// validateHooks refuses any wg-quick hook other than the sanctioned PostUp.
+// wg-quick runs hooks as root through a shell, so without this a compromised
+// controller would have root on every gateway.
+func validateHooks(conf, confDir string) error {
 	confDir = filepath.Clean(confDir)
 	for _, raw := range strings.Split(conf, "\n") {
 		line := strings.TrimSpace(raw)
@@ -55,39 +43,24 @@ func validateWgHooks(conf, confDir string) error {
 		if eq < 0 {
 			continue
 		}
-		switch strings.ToLower(strings.TrimSpace(line[:eq])) {
+		key := strings.ToLower(strings.TrimSpace(line[:eq]))
+		switch key {
 		case "preup", "predown", "postdown":
-			return fmt.Errorf("refusing wg0.conf: control node supplied a %s hook, which wg-quick runs as root", strings.TrimSpace(line[:eq]))
+			return fmt.Errorf("refusing config: %s hook present", strings.TrimSpace(line[:eq]))
 		case "postup":
 			m := allowedPostUp.FindStringSubmatch(line)
 			if m == nil {
-				return fmt.Errorf("refusing wg0.conf: PostUp is restricted to loading the node private key, got %q", line)
+				return fmt.Errorf("refusing config: PostUp may only load the private key, got %q", line)
 			}
 			p := filepath.Clean(m[1])
-			if p != confDir && !strings.HasPrefix(p, confDir+"/") {
-				return fmt.Errorf("refusing wg0.conf: private-key path %q is outside %s", m[1], confDir)
+			if p != confDir && !strings.HasPrefix(p, confDir+string(os.PathSeparator)) {
+				return fmt.Errorf("refusing config: private-key path %q is outside %s", m[1], confDir)
 			}
+		case "privatekey":
+			return fmt.Errorf("refusing config: it contains a PrivateKey line")
 		}
 	}
 	return nil
-}
-
-// safeVersion constrains a server-supplied release version before it is used
-// in any filesystem path.
-func safeVersion(v string) bool {
-	if v == "" || len(v) > 64 || strings.Contains(v, "..") {
-		return false
-	}
-	for i, r := range v {
-		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
-		if i > 0 {
-			ok = ok || r == '.' || r == '_' || r == '-'
-		}
-		if !ok {
-			return false
-		}
-	}
-	return true
 }
 
 func runCmd(name string, args ...string) (string, error) {
@@ -98,10 +71,8 @@ func runCmd(name string, args ...string) (string, error) {
 	return string(out), nil
 }
 
-// interfaceSection returns the [Interface] block of a wg-quick config with
-// comments and blank lines stripped, for change classification: an unchanged
-// interface section means peers-only changes, applied via syncconf with no
-// tunnel flap.
+// interfaceSection returns the [Interface] block with comments stripped, so
+// a peers-only change can be told apart from one that needs a restart.
 func interfaceSection(conf string) string {
 	var lines []string
 	in := false
@@ -111,7 +82,7 @@ func interfaceSection(conf string) string {
 			in = true
 			continue
 		}
-		if strings.HasPrefix(line, "[") && line != "[Interface]" {
+		if strings.HasPrefix(line, "[") {
 			in = false
 			continue
 		}
@@ -122,65 +93,26 @@ func interfaceSection(conf string) string {
 	return strings.Join(lines, "\n")
 }
 
-// listenPortOf extracts ListenPort from a wg-quick config (0 if absent).
-func listenPortOf(conf string) int {
+func confValue(conf, key string) string {
 	for _, raw := range strings.Split(conf, "\n") {
 		line := strings.TrimSpace(raw)
-		if strings.HasPrefix(line, "ListenPort") {
+		if strings.HasPrefix(line, key) {
 			parts := strings.SplitN(line, "=", 2)
-			if len(parts) == 2 {
-				if p, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil {
-					return p
-				}
+			if len(parts) == 2 && strings.TrimSpace(parts[0]) == key {
+				return strings.TrimSpace(parts[1])
 			}
-		}
-	}
-	return 0
-}
-
-// privateKeyPathOf extracts the key path from the generated
-// "PostUp = wg set %i private-key <path>" line.
-func privateKeyPathOf(conf string) string {
-	for _, raw := range strings.Split(conf, "\n") {
-		line := strings.TrimSpace(raw)
-		if strings.HasPrefix(line, "PostUp") && strings.Contains(line, "private-key") {
-			fields := strings.Fields(line)
-			return fields[len(fields)-1]
 		}
 	}
 	return ""
 }
 
-// udpPortFree reports whether the agent can bind the given UDP port right
-// now. Pre-flight for port changes: never apply a config that cannot bind
-// and leave the node dark.
-func udpPortFree(port int) bool {
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
+func listenPortOf(conf string) int {
+	p, _ := strconv.Atoi(confValue(conf, "ListenPort"))
+	return p
 }
 
-// wgUp brings the interface up from the given config path.
-func wgUp(confPath string) error {
-	_, err := runCmd("wg-quick", "up", confPath)
-	return err
-}
-
-func wgDown(confPath string) error {
-	_, err := runCmd("wg-quick", "down", confPath)
-	return err
-}
-
-func wgInterfaceExists(iface string) bool {
-	err := exec.Command("wg", "show", iface).Run()
-	return err == nil
-}
-
-// allowedPrefixes collects every AllowedIPs prefix in a config, normalized
-// the way `ip route show` prints them (/32 becomes a bare address).
+// allowedPrefixes collects every AllowedIPs prefix, normalised the way
+// `ip route` prints them (a /32 becomes the bare address).
 func allowedPrefixes(conf string) map[string]bool {
 	out := map[string]bool{}
 	for _, raw := range strings.Split(conf, "\n") {
@@ -193,8 +125,7 @@ func allowedPrefixes(conf string) map[string]bool {
 			continue
 		}
 		for _, p := range strings.Split(parts[1], ",") {
-			prefix := strings.TrimSpace(p)
-			prefix = strings.TrimSuffix(prefix, "/32")
+			prefix := strings.TrimSuffix(strings.TrimSpace(p), "/32")
 			if prefix != "" {
 				out[prefix] = true
 			}
@@ -203,60 +134,108 @@ func allowedPrefixes(conf string) map[string]bool {
 	return out
 }
 
-// syncRoutes reconciles the kernel routes on the wg interface with the
-// config's AllowedIPs. wg-quick installs routes only at `up`; peer changes
-// applied via syncconf update crypto but NOT routing — without this, a newly
-// added peer is crypto-reachable yet unrouted, which is a silent black hole.
-// Connected/kernel-managed routes (the interface's own subnet) are left alone.
-func syncRoutes(iface, conf string) error {
-	desired := allowedPrefixes(conf)
-	out, err := runCmd("ip", "-4", "route", "show", "dev", iface)
-	if err != nil {
-		return err
-	}
-	current := map[string]bool{}
-	for _, raw := range strings.Split(strings.TrimSpace(out), "\n") {
-		if raw == "" || strings.Contains(raw, "proto kernel") {
-			continue
-		}
-		fields := strings.Fields(raw)
-		if len(fields) > 0 {
-			current[fields[0]] = true
-		}
-	}
-	for p := range desired {
-		if !current[p] {
-			if _, err := runCmd("ip", "-4", "route", "replace", p, "dev", iface); err != nil {
-				return err
+// peerTunnelIPs maps each peer public key to the first AllowedIPs entry —
+// by generation the peer's own tunnel address — for latency probes.
+func peerTunnelIPs(conf string) map[string]string {
+	out := map[string]string{}
+	var key string
+	for _, raw := range strings.Split(conf, "\n") {
+		line := strings.TrimSpace(raw)
+		switch {
+		case line == "[Peer]":
+			key = ""
+		case strings.HasPrefix(line, "PublicKey"):
+			key = confValue(line, "PublicKey")
+		case strings.HasPrefix(line, "AllowedIPs") && key != "":
+			first := strings.TrimSpace(strings.SplitN(strings.SplitN(line, "=", 2)[1], ",", 2)[0])
+			ip := strings.TrimSuffix(first, "/32")
+			if !strings.Contains(ip, "/") {
+				out[key] = ip
 			}
+			key = ""
 		}
 	}
-	for c := range current {
-		if !desired[c] {
-			if _, err := runCmd("ip", "-4", "route", "del", c, "dev", iface); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return out
 }
 
-// wgSyncPeers applies peer-level changes without recreating the interface:
-// existing peers with unchanged parameters keep their sessions. The private
-// key is re-asserted afterwards because the generated config never carries it
-// inline, and kernel routes are reconciled because syncconf does not touch
-// routing.
+func udpPortFree(port int) bool {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+func wgInterfaceExists(iface string) bool {
+	return exec.Command("wg", "show", iface).Run() == nil
+}
+
+func wgQuickUp(confPath string) error {
+	_, err := runCmd("wg-quick", "up", confPath)
+	return err
+}
+
+func wgQuickDown(confPath string) error {
+	_, err := runCmd("wg-quick", "down", confPath)
+	return err
+}
+
+// privateKeyPathOf extracts the key path from the sanctioned PostUp line.
+func privateKeyPathOf(conf string) string {
+	for _, raw := range strings.Split(conf, "\n") {
+		if m := allowedPostUp.FindStringSubmatch(strings.TrimSpace(raw)); m != nil {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+// injectPrivateKey adds a PrivateKey line to a stripped config. `wg syncconf`
+// replaces the whole [Interface] section from the file, so a file without the
+// key would clear the interface's key and silently kill every tunnel.
+func injectPrivateKey(stripped, key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return stripped
+	}
+	var out []string
+	done := false
+	for _, line := range strings.Split(stripped, "\n") {
+		out = append(out, line)
+		if !done && strings.TrimSpace(line) == "[Interface]" {
+			out = append(out, "PrivateKey = "+key)
+			done = true
+		}
+	}
+	if !done {
+		out = append([]string{"[Interface]", "PrivateKey = " + key}, out...)
+	}
+	return strings.Join(out, "\n")
+}
+
+// wgSyncPeers applies peer changes without recreating the interface. The
+// private key is read from the gateway's own key file and included in the
+// temporary config (root-only, deleted immediately) so syncconf keeps it.
 func wgSyncPeers(iface, confPath, keyPath string) error {
 	stripped, err := runCmd("wg-quick", "strip", confPath)
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp("", "wgsync-*.conf")
+	key := ""
+	if keyPath != "" {
+		data, err := os.ReadFile(keyPath)
+		if err != nil {
+			return fmt.Errorf("read private key: %w", err)
+		}
+		key = string(data)
+	}
+	tmp, err := os.CreateTemp("", "opnmesh-strip-*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	if _, err := tmp.WriteString(stripped); err != nil {
+	if _, err := tmp.WriteString(injectPrivateKey(stripped, key)); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -264,136 +243,175 @@ func wgSyncPeers(iface, confPath, keyPath string) error {
 	if _, err := runCmd("wg", "syncconf", iface, tmp.Name()); err != nil {
 		return err
 	}
-	if keyPath != "" {
-		if _, err := runCmd("wg", "set", iface, "private-key", keyPath); err != nil {
-			return err
-		}
+	return ensurePrivateKey(iface, keyPath)
+}
+
+// ensurePrivateKey restores the key if the interface has lost it for any
+// reason. Cheap, and the difference between a tunnel and a dead interface.
+func ensurePrivateKey(iface, keyPath string) error {
+	if keyPath == "" || !wgInterfaceExists(iface) {
+		return nil
 	}
-	conf, err := os.ReadFile(confPath)
+	out, err := runCmd("wg", "show", iface, "public-key")
 	if err != nil {
 		return err
 	}
-	return syncRoutes(iface, string(conf))
-}
-
-// wgPeerStats parses `wg show <if> dump`.
-func wgPeerStats(iface string) []PeerStat {
-	out, err := runCmd("wg", "show", iface, "dump")
-	if err != nil {
+	if strings.TrimSpace(out) != "(none)" {
 		return nil
 	}
-	var stats []PeerStat
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	// First line is the interface itself; peers follow.
-	for _, line := range lines[1:] {
+	_, err = runCmd("wg", "set", iface, "private-key", keyPath)
+	return err
+}
+
+// --- routes ------------------------------------------------------------------
+
+type ipRoute struct {
+	Dst      string `json:"dst"`
+	Protocol string `json:"protocol"`
+}
+
+func listRoutes(iface string) ([]ipRoute, error) {
+	out, err := runCmd("ip", "-j", "-4", "route", "show", "dev", iface)
+	if err != nil {
+		return nil, err
+	}
+	return parseRoutes(out)
+}
+
+func parseRoutes(jsonText string) ([]ipRoute, error) {
+	var routes []ipRoute
+	if strings.TrimSpace(jsonText) == "" {
+		return routes, nil
+	}
+	if err := json.Unmarshal([]byte(jsonText), &routes); err != nil {
+		return nil, fmt.Errorf("parse routes: %w", err)
+	}
+	return routes, nil
+}
+
+// routePlan decides which routes to add and delete so the interface carries
+// exactly the AllowedIPs prefixes, leaving the kernel's connected route
+// alone and not duplicating prefixes it already covers (as wg-quick does).
+func routePlan(desired map[string]bool, current []ipRoute) (add, del []string) {
+	var connected []*net.IPNet
+	managed := map[string]bool{}
+	for _, r := range current {
+		if r.Protocol == "kernel" {
+			if _, n, err := net.ParseCIDR(withPrefix(r.Dst)); err == nil {
+				connected = append(connected, n)
+			}
+			continue
+		}
+		if r.Dst == "default" {
+			continue
+		}
+		managed[r.Dst] = true
+	}
+	for p := range desired {
+		if managed[p] {
+			continue
+		}
+		covered := false
+		if ip, ipn, err := net.ParseCIDR(withPrefix(p)); err == nil {
+			for _, c := range connected {
+				if c.Contains(ip) && maskLen(c) <= maskLen(ipn) {
+					covered = true
+					break
+				}
+			}
+		}
+		if !covered {
+			add = append(add, p)
+		}
+	}
+	for m := range managed {
+		if !desired[m] {
+			del = append(del, m)
+		}
+	}
+	sortStrings(add)
+	sortStrings(del)
+	return add, del
+}
+
+func withPrefix(p string) string {
+	if strings.Contains(p, "/") {
+		return p
+	}
+	return p + "/32"
+}
+
+func maskLen(n *net.IPNet) int {
+	ones, _ := n.Mask.Size()
+	return ones
+}
+
+func reconcileRoutes(iface, conf string) error {
+	current, err := listRoutes(iface)
+	if err != nil {
+		return err
+	}
+	add, del := routePlan(allowedPrefixes(conf), current)
+	for _, p := range add {
+		if _, err := runCmd("ip", "-4", "route", "add", withPrefix(p), "dev", iface); err != nil {
+			return err
+		}
+	}
+	for _, p := range del {
+		if _, err := runCmd("ip", "-4", "route", "del", withPrefix(p), "dev", iface); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- wg show dump ------------------------------------------------------------
+
+type PeerStats struct {
+	PublicKey       string
+	Endpoint        string
+	LatestHandshake int64
+	RxBytes         int64
+	TxBytes         int64
+}
+
+func wgDump(iface string) ([]PeerStats, error) {
+	out, err := runCmd("wg", "show", iface, "dump")
+	if err != nil {
+		return nil, err
+	}
+	return parseWgDump(out), nil
+}
+
+// parseWgDump reads `wg show <if> dump`: the first line is the interface,
+// each following line a peer (tab-separated: public key, preshared key,
+// endpoint, allowed ips, latest handshake, rx, tx, keepalive).
+func parseWgDump(text string) []PeerStats {
+	var peers []PeerStats
+	for i, line := range strings.Split(strings.TrimSpace(text), "\n") {
+		if i == 0 || line == "" {
+			continue
+		}
 		f := strings.Split(line, "\t")
-		if len(f) < 8 {
+		if len(f) < 7 {
 			continue
 		}
 		hs, _ := strconv.ParseInt(f[4], 10, 64)
 		rx, _ := strconv.ParseInt(f[5], 10, 64)
 		tx, _ := strconv.ParseInt(f[6], 10, 64)
-		stats = append(stats, PeerStat{
-			PublicKey:       f[0],
-			Endpoint:        f[2],
-			LatestHandshake: hs,
-			RxBytes:         rx,
-			TxBytes:         tx,
-		})
+		ep := f[2]
+		if ep == "(none)" {
+			ep = ""
+		}
+		peers = append(peers, PeerStats{PublicKey: f[0], Endpoint: ep, LatestHandshake: hs, RxBytes: rx, TxBytes: tx})
 	}
-	return stats
+	return peers
 }
 
-// pingPeerTunnels sends one short ping to each peer's tunnel address (the
-// first /32 in its AllowedIPs) to trigger immediate handshakes after a
-// WireGuard apply. Best-effort; failures are expected while peers converge.
-func pingPeerTunnels(conf string) {
-	for _, raw := range strings.Split(conf, "\n") {
-		line := strings.TrimSpace(raw)
-		if !strings.HasPrefix(line, "AllowedIPs") {
-			continue
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j] < s[j-1]; j-- {
+			s[j], s[j-1] = s[j-1], s[j]
 		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		first := strings.TrimSpace(strings.Split(parts[1], ",")[0])
-		ip := strings.TrimSuffix(first, "/32")
-		if ip == first {
-			continue // not a /32 — not a tunnel address
-		}
-		_ = exec.Command("ping", "-c", "1", "-W", "2", ip).Run()
 	}
-}
-
-func applyNftables(path string) error {
-	_, err := runCmd("nft", "-f", path)
-	return err
-}
-
-// safeSysctlKey reports whether the control node may set this sysctl key.
-//
-// sysctl.conf is a server-controlled managed file, so — exactly like
-// wg0.conf's hooks — it must not be a root RCE. Several kernel.* keys ARE
-// command execution: kernel.core_pattern with a "|program" value is run by the
-// kernel as root on the next coredump; kernel.modprobe/hotplug/uevent_helper
-// name programs the kernel execs as root. The generated fragment only ever
-// tunes forwarding and conntrack accounting, all under net.*, and no net.* key
-// runs a program — so the allowlist is simply the net.* namespace. Requiring
-// the net. prefix also rules out a leading "-" being read as a sysctl option.
-func safeSysctlKey(key string) bool {
-	return strings.HasPrefix(key, "net.")
-}
-
-func applySysctl(path string) {
-	// Apply key-by-key with -w (portable across busybox/procps sysctl).
-	// Best-effort: containers may not allow every key; a real node will.
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-	for _, raw := range strings.Split(string(data), "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		kv := strings.Replace(line, " = ", "=", 1)
-		eq := strings.IndexByte(kv, '=')
-		if eq < 0 {
-			continue
-		}
-		key := strings.TrimSpace(kv[:eq])
-		if !safeSysctlKey(key) {
-			log.Printf("sysctl: refusing control-node key %q (only net.* is permitted; kernel.* keys can run commands as root)", key)
-			continue
-		}
-		if strings.Contains(kv[eq+1:], "|") {
-			log.Printf("sysctl: refusing value with a pipe for %q", key)
-			continue
-		}
-		_ = exec.Command("sysctl", "-w", kv).Run()
-	}
-}
-
-func writeFileAtomic(path, content string, mode os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".opnmesh-*")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	if _, err := tmp.WriteString(content); err != nil {
-		tmp.Close()
-		os.Remove(name)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(name)
-		return err
-	}
-	if err := os.Chmod(name, mode); err != nil {
-		os.Remove(name)
-		return err
-	}
-	return os.Rename(name, path)
 }

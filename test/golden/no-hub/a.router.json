@@ -1,0 +1,34 @@
+{
+  "siteId": "site-a",
+  "siteSlug": "a",
+  "layout": "transit",
+  "nextHop": "10.1.0.2",
+  "routes": [
+    {
+      "cidr": "10.99.0.0/24",
+      "label": "Mesh tunnel addresses (gateways)",
+      "objectName": "OPNmesh: tunnel addresses",
+      "required": true
+    },
+    {
+      "cidr": "10.99.1.0/24",
+      "label": "Roaming clients (aggregate only — never per-client routes)",
+      "objectName": "OPNmesh: roaming clients",
+      "required": true
+    }
+  ],
+  "portForward": null,
+  "allStatesPolicy": null,
+  "clientBlockPolicy": {
+    "name": "OPNmesh: block LAN to roaming clients",
+    "destination": "10.99.1.0/24"
+  },
+  "localLans": [
+    {
+      "cidr": "10.1.0.0/24",
+      "name": "A",
+      "vlan": null,
+      "shared": true
+    }
+  ]
+}

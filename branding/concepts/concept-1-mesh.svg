@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 130" width="560" height="130" role="img" aria-label="OPNmesh">
+  <!-- Concept 1 — Mesh: the O is a ring of four sites, every one linked to every other. -->
+  <defs>
+    <linearGradient id="ring" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#a5ead1"/>
+      <stop offset="1" stop-color="#4cc39d"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(64 66)">
+    <circle r="34" fill="none" stroke="url(#ring)" stroke-width="8"/>
+    <g stroke="#3fb28c" stroke-width="2.5" stroke-linecap="round" opacity="0.6">
+      <line x1="24.04" y1="-24.04" x2="-24.04" y2="-24.04"/>
+      <line x1="-24.04" y1="-24.04" x2="-24.04" y2="24.04"/>
+      <line x1="-24.04" y1="24.04" x2="24.04" y2="24.04"/>
+      <line x1="24.04" y1="24.04" x2="24.04" y2="-24.04"/>
+      <line x1="24.04" y1="-24.04" x2="-24.04" y2="24.04"/>
+      <line x1="-24.04" y1="-24.04" x2="24.04" y2="24.04"/>
+    </g>
+    <g fill="#ffffff" stroke="#2e9f7b" stroke-width="3.5">
+      <circle cx="24.04" cy="-24.04" r="5.5"/>
+      <circle cx="-24.04" cy="-24.04" r="5.5"/>
+      <circle cx="-24.04" cy="24.04" r="5.5"/>
+      <circle cx="24.04" cy="24.04" r="5.5"/>
+    </g>
+  </g>
+  <text x="112" y="95" font-family="'Segoe UI Variable Display', 'Segoe UI', Inter, system-ui, sans-serif" font-size="86" font-weight="700" letter-spacing="-3">
+    <tspan fill="#3fb28c">PN</tspan><tspan fill="#16211d">mesh</tspan>
+  </text>
+</svg>

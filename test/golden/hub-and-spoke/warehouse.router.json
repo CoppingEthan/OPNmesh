@@ -1,0 +1,46 @@
+{
+  "siteId": "site-warehouse",
+  "siteSlug": "warehouse",
+  "layout": "masquerade",
+  "nextHop": "10.30.0.2",
+  "routes": [
+    {
+      "cidr": "10.0.1.0/24",
+      "label": "Dc — Servers",
+      "objectName": "OPNmesh: dc Servers",
+      "required": false
+    },
+    {
+      "cidr": "192.168.20.0/24",
+      "label": "Office — Staff",
+      "objectName": "OPNmesh: office Staff",
+      "required": false
+    },
+    {
+      "cidr": "10.99.0.0/24",
+      "label": "Mesh tunnel addresses (gateways)",
+      "objectName": "OPNmesh: tunnel addresses",
+      "required": false
+    },
+    {
+      "cidr": "10.99.1.0/24",
+      "label": "Roaming clients (aggregate only — never per-client routes)",
+      "objectName": "OPNmesh: roaming clients",
+      "required": false
+    }
+  ],
+  "portForward": null,
+  "allStatesPolicy": null,
+  "clientBlockPolicy": {
+    "name": "OPNmesh: block LAN to roaming clients",
+    "destination": "10.99.1.0/24"
+  },
+  "localLans": [
+    {
+      "cidr": "10.30.0.0/24",
+      "name": "Warehouse",
+      "vlan": null,
+      "shared": true
+    }
+  ]
+}

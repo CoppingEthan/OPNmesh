@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 130" width="560" height="130" role="img" aria-label="OPNmesh">
+  <!-- Concept 3 — Orbit: sites circling one network, wherever they are. -->
+  <g transform="translate(64 66)">
+    <circle r="31" fill="#b9efd9" stroke="#4cc39d" stroke-width="4"/>
+    <ellipse rx="46" ry="14" fill="none" stroke="#2e9f7b" stroke-width="3" transform="rotate(-25)"/>
+    <g fill="#ffffff" stroke="#2e9f7b" stroke-width="3">
+      <circle cx="39.5" cy="-13.2" r="4.8"/>
+      <circle cx="-31.6" cy="22.5" r="4.8"/>
+      <circle cx="14.8" cy="-20.3" r="4.8"/>
+    </g>
+  </g>
+  <text x="112" y="95" font-family="'Segoe UI Variable Display', 'Segoe UI', Inter, system-ui, sans-serif" font-size="86" font-weight="700" letter-spacing="-3">
+    <tspan fill="#3fb28c">PN</tspan><tspan fill="#16211d">mesh</tspan>
+  </text>
+</svg>

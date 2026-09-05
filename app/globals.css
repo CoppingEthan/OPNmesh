@@ -1,71 +1,239 @@
 @import "tailwindcss";
 
-/* Dense, functional, dark-mode-first admin UI. Monospace for addresses,
-   keys and config. Status legible at a glance from across the room. */
+/*
+ * OPNmesh design tokens — dark glass edition.
+ *
+ * The page is a wallpaper (public/wallpaper.webp, softened by 4 px, drawn at
+ * low opacity over black) and every surface is frosted glass over it:
+ * translucent, blurred backdrop, a hairline light edge and a soft, distant
+ * shadow. Ink stays high-contrast; colour is reserved for status and series.
+ * Tokens are CSS variables; Tailwind utilities are generated from them via
+ * @theme inline (bg-surface, text-ink, border-line, text-good …) and the
+ * glass surfaces via @utility below.
+ */
+/* Dark only: the product is a dark glass dashboard. Form controls and
+ * scrollbars follow via color-scheme. */
 :root {
   color-scheme: dark;
+
+  /* Solid black under the wallpaper; the wallpaper is drawn at this opacity. */
+  --page: #000000;
+  /* Opaque near-black for shapes that must hide what is behind them. */
+  --solid: #0e1219;
+  --wallpaper-opacity: 0.25;
+  --wallpaper-filter: blur(4px) saturate(1.15) brightness(0.9);
+
+  /* Glass panes are mostly see-through; the blurred wallpaper behind them is
+   * what makes them read as glass. Ink stays near-white for contrast. */
+  --glass: rgba(14, 17, 24, 0.36);
+  --glass-strong: rgba(14, 17, 24, 0.86);
+  --glass-panel: rgba(10, 12, 18, 0.4);
+  --glass-border: rgba(255, 255, 255, 0.14);
+  --glass-highlight: rgba(255, 255, 255, 0.12);
+  --glass-highlight-2: rgba(255, 255, 255, 0.05);
+  --glass-drop: rgba(0, 0, 0, 0.7);
+  --glass-shadow: inset 0 1px 0 var(--glass-highlight), inset 1px 0 0 var(--glass-highlight-2), 0 14px 44px -14px var(--glass-drop);
+
+  --surface: rgba(34, 38, 48, 0.5);
+  --surface-2: rgba(255, 255, 255, 0.06);
+  --surface-3: rgba(255, 255, 255, 0.11);
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.17);
+  --ink: #f3f4f6;
+  --ink-2: #bfc3cc;
+  --ink-3: #9aa1ae;
+  --brand: #22b58c;
+  --brand-strong: #3ccaa1;
+  --brand-soft: color-mix(in oklab, #22b58c 20%, transparent);
+  --brand-ink: #7fdcc0;
+  --good: #0ca30c;
+  --good-soft: color-mix(in oklab, #3ddc3d 16%, transparent);
+  --good-ink: #7fdb7f;
+  --warn: #fab219;
+  --warn-soft: color-mix(in oklab, #fab219 16%, transparent);
+  --warn-ink: #f7cd6e;
+  --bad: #e66767;
+  --bad-soft: color-mix(in oklab, #e66767 16%, transparent);
+  --bad-ink: #f29a9a;
+  --idle: #8a8880;
+  --idle-soft: rgba(255, 255, 255, 0.07);
+  /* Muted categorical series: the validated hues at 85% chroma, light enough to
+   * read clearly on the dark glass but muted rather than neon.
+   * Every series is named in the legend, which covers the colour-vision case. */
+  --series-1: #518cd7;
+  --series-2: #cf6a45;
+  --series-3: #469e79;
+  --series-4: #b47f30;
+  --series-5: #cc6386;
+  --series-6: #50a04b;
+  --series-7: #867fcd;
+  --series-8: #cc6867;
+  --grid: rgba(255, 255, 255, 0.08);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px -14px rgba(0, 0, 0, 0.5);
+}
+
+@theme inline {
+  --color-page: var(--page);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-brand: var(--brand);
+  --color-brand-strong: var(--brand-strong);
+  --color-brand-soft: var(--brand-soft);
+  --color-brand-ink: var(--brand-ink);
+  --color-good: var(--good);
+  --color-good-soft: var(--good-soft);
+  --color-good-ink: var(--good-ink);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-warn-ink: var(--warn-ink);
+  --color-bad: var(--bad);
+  --color-bad-soft: var(--bad-soft);
+  --color-bad-ink: var(--bad-ink);
+  --color-idle: var(--idle);
+  --color-idle-soft: var(--idle-soft);
+  --color-series-1: var(--series-1);
+  --color-series-2: var(--series-2);
+  --color-series-3: var(--series-3);
+  --color-series-4: var(--series-4);
+  --color-series-5: var(--series-5);
+  --color-series-6: var(--series-6);
+  --color-series-7: var(--series-7);
+  --color-series-8: var(--series-8);
+  --color-grid: var(--grid);
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --font-mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --shadow-card: var(--shadow);
+  --radius-card: 18px;
+}
+
+/* Frosted surfaces. `glass` for cards and tiles, `glass-strong` for things
+ * that float over content (dialogs, tooltips), `glass-panel` for the shell. */
+@utility glass {
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+  -webkit-backdrop-filter: blur(18px) saturate(1.9);
+  backdrop-filter: blur(18px) saturate(1.9);
+}
+@utility glass-strong {
+  background: var(--glass-strong);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+  -webkit-backdrop-filter: blur(28px) saturate(1.8);
+  backdrop-filter: blur(28px) saturate(1.8);
+}
+@utility glass-panel {
+  background: var(--glass-panel);
+  box-shadow: inset -1px 0 0 var(--glass-border);
+  -webkit-backdrop-filter: blur(24px) saturate(1.8);
+  backdrop-filter: blur(24px) saturate(1.8);
+}
+
+html {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  background: var(--page);
 }
 
 body {
-  @apply bg-zinc-950 text-zinc-200 antialiased;
+  background: transparent;
+  color: var(--ink);
+  margin: 0;
+  min-height: 100vh;
+}
+
+/* The wallpaper the glass sits on (public/wallpaper.webp, a compressed
+ * Unsplash gradient) at low opacity over black, so it glows rather than
+ * shouts. Fixed so it never scrolls and the blur behind every pane stays
+ * cheap; softened by 4 px so compression never shows through the glass;
+ * slightly oversized so the blur has no edge. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: -12px;
+  z-index: -1;
+  pointer-events: none;
+  background: url("/wallpaper.webp") center / cover no-repeat;
+  opacity: var(--wallpaper-opacity);
+  filter: var(--wallpaper-filter);
+}
+
+/* A whisper of grain over the wash so the frosting has texture. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  opacity: 0.045;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  background-size: 160px 160px;
+}
+
+::selection {
+  background: var(--brand-soft);
+  color: var(--brand-ink);
 }
 
 .mono {
-  font-family: ui-monospace, "Cascadia Mono", "JetBrains Mono", Menlo, monospace;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
 }
 
-.card {
-  @apply rounded border border-zinc-800 bg-zinc-900/60 p-4;
+.tnum {
+  font-variant-numeric: tabular-nums;
 }
 
-.h1 {
-  @apply text-lg font-semibold text-zinc-100;
+/* Focus ring for keyboard users only. */
+:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
 }
 
-.label {
-  @apply text-xs uppercase tracking-wide text-zinc-500;
+/* Native dialog polish. */
+dialog::backdrop {
+  background: rgba(10, 12, 18, 0.35);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
 }
 
-.btn {
-  @apply inline-block cursor-pointer rounded border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-100 hover:bg-zinc-700 disabled:opacity-40;
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.fade-in {
+  animation: fade-in 180ms ease-out both;
 }
 
-.btn-danger {
-  @apply border-red-900 bg-red-950 text-red-200 hover:bg-red-900;
+@keyframes pulse-dot {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in oklab, var(--good) 45%, transparent);
+  }
+  60% {
+    box-shadow: 0 0 0 6px transparent;
+  }
+}
+.pulse-good {
+  animation: pulse-dot 2.4s ease-out infinite;
 }
 
-.btn-primary {
-  @apply border-emerald-800 bg-emerald-950 text-emerald-200 hover:bg-emerald-900;
-}
-
-.input {
-  @apply w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-sm text-zinc-100 outline-none focus:border-zinc-500;
-}
-
-table.data {
-  @apply w-full border-collapse text-sm;
-}
-table.data th {
-  @apply border-b border-zinc-800 px-2 py-1.5 text-left text-xs font-medium uppercase tracking-wide text-zinc-500;
-}
-table.data td {
-  @apply border-b border-zinc-800/60 px-2 py-1.5 align-top;
-}
-
-.status-ok {
-  @apply text-emerald-400;
-}
-.status-warn {
-  @apply text-amber-400;
-}
-.status-bad {
-  @apply text-red-400;
-}
-.status-dim {
-  @apply text-zinc-500;
-}
-
-pre.conf {
-  font-family: ui-monospace, "Cascadia Mono", "JetBrains Mono", Menlo, monospace;
-  @apply overflow-x-auto rounded border border-zinc-800 bg-black/60 p-3 text-xs leading-5 text-zinc-300;
+@media (prefers-reduced-motion: reduce) {
+  .fade-in,
+  .pulse-good {
+    animation: none;
+  }
 }

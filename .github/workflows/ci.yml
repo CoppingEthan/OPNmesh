@@ -6,21 +6,67 @@ on:
   pull_request:
 
 jobs:
-  key-material-check:
-    name: No key material in repo
-    runs-on: ubuntu-latest
+  no-secrets:
+    name: No key material in the repository
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Grep for private key material
-        run: bash scripts/check-no-keys.sh
+      - name: Grep for private keys and tokens
+        run: |
+          set -e
+          if git grep -nE -- '-----BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY-----' -- ':!*.md' ; then echo "private key material found"; exit 1; fi
+          if git grep -nE 'PrivateKey = [A-Za-z0-9+/]{43}=' -- ':!test/golden' ':!*.md' ; then echo "WireGuard private key found"; exit 1; fi
+          echo "clean"
 
-  test:
-    runs-on: ubuntu-latest
+  unit:
+    name: Unit and API tests (Ubuntu)
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - run: npx cross-env OPNMESH_STANDALONE=1 NEXT_TELEMETRY_DISABLED=1 npx next build
+
+  agent:
+    name: Gateway agent (Go)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: agent/go.sum
+      - run: cd agent && go mod tidy && test -z "$(gofmt -l .)" && go vet ./... && go test ./...
+      - run: cd agent && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/opnmesh-gw .
+
+  simulation:
+    name: Four-site simulation (Ubuntu 24.04 containers, kernel WireGuard)
+    runs-on: ubuntu-24.04
+    needs: [unit, agent]
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Kernel WireGuard available on the runner
+        run: sudo modprobe wireguard && lsmod | grep -q wireguard
+      - name: Build the agent
+        run: node scripts/agent-build.mjs
+      - name: Start the simulation
+        run: node scripts/sim.mjs up
+      - name: Run the integration suite
+        run: npm run sim:test
+      - name: Logs on failure
+        if: failure()
+        run: docker compose -f sim/docker-compose.yml logs --no-color --tail 200
+      - name: Tear down
+        if: always()
+        run: node scripts/sim.mjs down

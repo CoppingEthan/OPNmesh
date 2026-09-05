@@ -1,9 +1,0 @@
-#!/bin/sh
-# Prefer the A/B flipped-in version if present; fall back to the packaged
-# binary. Rollback (opnmesh-agent rollback-update) just moves the symlink, so
-# the next restart picks up the previous version with no network access.
-set -eu
-if [ -x /var/lib/opnmesh/current/opnmesh-agent ]; then
-  exec /var/lib/opnmesh/current/opnmesh-agent -config /etc/opnmesh/agent.json
-fi
-exec /usr/local/bin/opnmesh-agent -config /etc/opnmesh/agent.json

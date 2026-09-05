@@ -1,0 +1,46 @@
+{
+  "siteId": "site-depot",
+  "siteSlug": "depot",
+  "layout": "transit",
+  "nextHop": "10.40.0.2",
+  "routes": [
+    {
+      "cidr": "10.0.1.0/24",
+      "label": "Dc — Servers",
+      "objectName": "OPNmesh: dc Servers",
+      "required": true
+    },
+    {
+      "cidr": "192.168.20.0/24",
+      "label": "Office — Staff",
+      "objectName": "OPNmesh: office Staff",
+      "required": true
+    },
+    {
+      "cidr": "10.99.0.0/24",
+      "label": "Mesh tunnel addresses (gateways)",
+      "objectName": "OPNmesh: tunnel addresses",
+      "required": true
+    },
+    {
+      "cidr": "10.99.1.0/24",
+      "label": "Roaming clients (aggregate only — never per-client routes)",
+      "objectName": "OPNmesh: roaming clients",
+      "required": true
+    }
+  ],
+  "portForward": null,
+  "allStatesPolicy": null,
+  "clientBlockPolicy": {
+    "name": "OPNmesh: block LAN to roaming clients",
+    "destination": "10.99.1.0/24"
+  },
+  "localLans": [
+    {
+      "cidr": "10.40.0.0/24",
+      "name": "Depot",
+      "vlan": null,
+      "shared": true
+    }
+  ]
+}

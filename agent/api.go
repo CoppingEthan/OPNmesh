@@ -2,12 +2,10 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,223 +14,191 @@ import (
 	"time"
 )
 
-// DesiredConfig is what the control node says this node's files should be.
-type DesiredConfig struct {
-	NodeID string            `json:"nodeId"`
-	Files  map[string]string `json:"files"`
-	Hash   string            `json:"hash"`
+// Client talks to the controller. Every request carries the gateway token
+// except enrolment, which carries the one-time enrolment token in its body.
+type Client struct {
+	base  string
+	token string
+	http  *http.Client
 }
 
-// Report is what the agent tells the control node every cycle. It never
-// contains key material.
-type Report struct {
-	NodeID          string     `json:"nodeId"`
-	Version         string     `json:"version"`
-	AppliedHash     string     `json:"appliedHash"`
-	DiskHash        string     `json:"diskHash"`
-	LastError       string     `json:"lastError,omitempty"`
-	LastUpdateError string     `json:"lastUpdateError,omitempty"`
-	Peers           []PeerStat `json:"peers"`
-	AgentUptime     int64      `json:"agentUptimeSec"`
-}
+const maxResponse = 4 << 20
 
-// PeerStat is one row of `wg show <if> dump`.
-type PeerStat struct {
-	PublicKey       string `json:"publicKey"`
-	Endpoint        string `json:"endpoint"`
-	LatestHandshake int64  `json:"latestHandshake"`
-	RxBytes         int64  `json:"rxBytes"`
-	TxBytes         int64  `json:"txBytes"`
-}
-
-type APIClient struct {
-	baseURL string
-	token   string
-	http    *http.Client
-	// etag of the last successfully fetched config; server returns 304 when unchanged.
-	etag string
-}
-
-// NewAPIClient builds a client whose TLS behaviour is decided by the agent
-// config: with a pin, the control node's certificate public key must match
-// exactly (no CA trust needed for a private mesh); without TLS at all, only
-// when the install is explicitly marked insecure.
-func NewAPIClient(cfg AgentConfig, token string) *APIClient {
+func newClient(cfg Config, token string) (*Client, error) {
 	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
-		Proxy:           nil, // never route agent traffic through an env proxy
+		Proxy:                 http.ProxyFromEnvironment,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 20 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
 	}
-	if cfg.ServerPinSha256 != "" {
-		pin := strings.ToLower(strings.TrimSpace(cfg.ServerPinSha256))
-		// Pinning replaces chain validation: we verify the presented key, not
-		// who signed it, so a private/self-signed certificate is fine and a
-		// swapped one is refused even if it chains to a public CA.
-		transport.TLSClientConfig.InsecureSkipVerify = true
-		transport.TLSClientConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			// ONLY the leaf may satisfy the pin.
-			//
-			// Chain validation is off, so every certificate after rawCerts[0] is
-			// an unauthenticated attachment — the handshake proves possession of
-			// the leaf's private key and nothing else. Scanning the whole chain
-			// therefore accepted any attacker who appended the control node's
-			// (public) certificate behind their own leaf: the pin matched a cert
-			// they did not hold the key for, and the agent handed its bearer
-			// token to them.
-			if len(rawCerts) == 0 {
-				return fmt.Errorf("control node presented no certificate")
-			}
-			cert, err := x509.ParseCertificate(rawCerts[0])
-			if err != nil {
-				return fmt.Errorf("control node certificate is unparseable: %w", err)
-			}
-			sum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
-			if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(pin)) != 1 {
-				return fmt.Errorf("control node certificate does not match the pin recorded at enrolment")
-			}
-			return nil
-		}
-	}
-	return &APIClient{
-		baseURL: strings.TrimSuffix(cfg.ServerURL, "/"),
-		token:   token,
-		http:    &http.Client{Timeout: 15 * time.Second, Transport: transport},
-	}
-}
-
-// FetchConfig returns (config, changed, error). changed=false means the
-// server said 304 Not Modified.
-func (c *APIClient) FetchConfig() (*DesiredConfig, bool, error) {
-	req, err := http.NewRequest(http.MethodGet, c.baseURL+"/api/v1/agent/config", nil)
-	if err != nil {
-		return nil, false, err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	if c.etag != "" {
-		req.Header.Set("If-None-Match", c.etag)
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, false, err
-	}
-	defer resp.Body.Close()
-
-	switch resp.StatusCode {
-	case http.StatusNotModified:
-		return nil, false, nil
-	case http.StatusOK:
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if cfg.CAFile != "" {
+		pem, err := os.ReadFile(cfg.CAFile)
 		if err != nil {
-			return nil, false, err
+			return nil, fmt.Errorf("read CA file: %w", err)
 		}
-		var cfg DesiredConfig
-		if err := json.Unmarshal(body, &cfg); err != nil {
-			return nil, false, fmt.Errorf("parse config response: %w", err)
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, errors.New("CA file contains no certificates")
 		}
-		c.etag = resp.Header.Get("ETag")
-		return &cfg, true, nil
-	default:
-		return nil, false, fmt.Errorf("config fetch: HTTP %d", resp.StatusCode)
+		transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	} else {
+		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	}
+	if strings.HasPrefix(cfg.ControllerURL, "http://") && !cfg.InsecureHTTP {
+		return nil, errors.New("refusing plain http controller without insecure_http")
+	}
+	return &Client{
+		base:  strings.TrimRight(cfg.ControllerURL, "/"),
+		token: token,
+		http:  &http.Client{Transport: transport, Timeout: 30 * time.Second},
+	}, nil
 }
 
-// FetchUpdate asks whether this node should update right now. nil means no.
-func (c *APIClient) FetchUpdate() (*UpdateInstruction, error) {
-	req, err := http.NewRequest(http.MethodGet, c.baseURL+"/api/v1/agent/update", nil)
+type apiError struct {
+	Status int
+	Body   string
+}
+
+func (e *apiError) Error() string {
+	msg := e.Body
+	var parsed struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal([]byte(e.Body), &parsed) == nil && parsed.Error != "" {
+		msg = parsed.Error
+	}
+	return fmt.Sprintf("controller returned %d: %s", e.Status, strings.TrimSpace(msg))
+}
+
+func (c *Client) do(method, path string, body any, headers map[string]string, out any) (*http.Response, error) {
+	var reader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		reader = bytes.NewReader(data)
+	}
+	req, err := http.NewRequest(method, c.base+path, reader)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "opnmesh-gw/"+version)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNoContent {
-		return nil, nil
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("update check: HTTP %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponse))
 	if err != nil {
-		return nil, err
+		return resp, err
 	}
-	var instr UpdateInstruction
-	if err := json.Unmarshal(body, &instr); err != nil {
-		return nil, err
+	if resp.StatusCode == http.StatusNotModified {
+		return resp, nil
 	}
-	if instr.TargetVersion == "" {
-		return nil, nil
+	if resp.StatusCode >= 400 {
+		return resp, &apiError{Status: resp.StatusCode, Body: string(data)}
 	}
-	return &instr, nil
+	if out != nil && len(data) > 0 {
+		if err := json.Unmarshal(data, out); err != nil {
+			return resp, fmt.Errorf("decode response: %w", err)
+		}
+	}
+	return resp, nil
 }
 
-// DownloadFile streams an authenticated API path to a local file.
-func (c *APIClient) DownloadFile(apiPath, dst string) error {
-	req, err := http.NewRequest(http.MethodGet, c.baseURL+apiPath, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download: HTTP %d", resp.StatusCode)
-	}
-	f, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
-		f.Close()
-		return err
-	}
-	return f.Close()
+// --- enrolment -------------------------------------------------------------
+
+type EnrolRequest struct {
+	Token        string   `json:"token"`
+	PublicKey    string   `json:"publicKey"`
+	Hostname     string   `json:"hostname"`
+	OS           string   `json:"os"`
+	Arch         string   `json:"arch"`
+	Addresses    []string `json:"addresses"`
+	AgentVersion string   `json:"agentVersion"`
 }
 
-func (c *APIClient) SendFlows(flows []FlowRecord) error {
-	payload, err := json.Marshal(map[string]any{"flows": flows})
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/api/v1/agent/flows", bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("flows: HTTP %d", resp.StatusCode)
-	}
-	return nil
+type EnrolResponse struct {
+	GatewayID    string `json:"gatewayId"`
+	GatewayToken string `json:"gatewayToken"`
+	Status       string `json:"status"`
+	SiteName     string `json:"siteName"`
 }
 
-func (c *APIClient) SendReport(r Report) error {
-	payload, err := json.Marshal(r)
+func (c *Client) Enrol(req EnrolRequest) (EnrolResponse, error) {
+	var out EnrolResponse
+	_, err := c.do("POST", "/api/agent/enrol", req, nil, &out)
+	return out, err
+}
+
+// --- configuration ---------------------------------------------------------
+
+type ConfigMeta struct {
+	InterfaceName            string `json:"interfaceName"`
+	ListenPort               int    `json:"listenPort"`
+	NeedsReresolve           bool   `json:"needsReresolve"`
+	PrivateKeyPath           string `json:"privateKeyPath"`
+	TelemetryIntervalSeconds int    `json:"telemetryIntervalSeconds"`
+	SiteSlug                 string `json:"siteSlug"`
+}
+
+type ConfigResponse struct {
+	Status        string            `json:"status"`
+	Message       string            `json:"message"`
+	Hash          string            `json:"hash"`
+	ConfigVersion int               `json:"configVersion"`
+	Files         map[string]string `json:"files"`
+	Meta          ConfigMeta        `json:"meta"`
+}
+
+// FetchConfig returns (config, notModified, error). A pending gateway gets
+// Status "pending" and no files.
+func (c *Client) FetchConfig(etag string) (*ConfigResponse, bool, error) {
+	headers := map[string]string{}
+	if etag != "" {
+		headers["If-None-Match"] = `"` + etag + `"`
+	}
+	var out ConfigResponse
+	resp, err := c.do("GET", "/api/agent/config", nil, headers, &out)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/api/v1/agent/report", bytes.NewReader(payload))
-	if err != nil {
-		return err
+	if resp.StatusCode == http.StatusNotModified {
+		return nil, true, nil
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("report: HTTP %d", resp.StatusCode)
-	}
-	return nil
+	return &out, false, nil
+}
+
+// --- telemetry -------------------------------------------------------------
+
+type TelemetryResponse struct {
+	Status          string `json:"status"`
+	ConfigHash      string `json:"configHash"`
+	IntervalSeconds int    `json:"intervalSeconds"`
+	// Things the admin asked for, e.g. {type: "diagnose"}.
+	Actions []DiagAction `json:"actions"`
+}
+
+func (c *Client) SendTelemetry(r Report) (TelemetryResponse, error) {
+	var out TelemetryResponse
+	_, err := c.do("POST", "/api/agent/telemetry", r, nil, &out)
+	return out, err
+}
+
+// --- health checks -------------------------------------------------------------
+
+func (c *Client) SendDiagnostics(r DiagReport) error {
+	_, err := c.do("POST", "/api/agent/diagnostics", r, nil, nil)
+	return err
 }

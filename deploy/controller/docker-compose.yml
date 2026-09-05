@@ -1,0 +1,53 @@
+# OPNmesh controller — production deployment.
+#
+#   Caddy terminates TLS on 80/443 and proxies to the controller. With
+#   OPNMESH_DOMAIN set it obtains Let's Encrypt certificates automatically;
+#   without one it issues certificates from a private CA that gateways pin
+#   at install time (the UI prints the fingerprint next to the command).
+#
+#   cp .env.example .env    # then edit
+#   docker compose up -d
+#
+# Data lives in ./data (SQLite + secret.key) and ./caddy (certificates).
+# Back up ./data as a whole; the secret encrypts client private keys.
+name: opnmesh
+
+services:
+  controller:
+    image: ${OPNMESH_IMAGE:-ghcr.io/coppingethan/opnmesh:latest}
+    restart: unless-stopped
+    environment:
+      OPNMESH_DATA_DIR: /data
+      OPNMESH_PUBLIC_URL: ${OPNMESH_PUBLIC_URL:?set OPNMESH_PUBLIC_URL in .env}
+      OPNMESH_TRUST_PROXY: "1"
+      OPNMESH_CA_FILE: /caddy/pki/authorities/local/root.crt
+    volumes:
+      - ./data:/data
+      - ./caddy:/caddy:ro
+    expose: ["3000"]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/admin/setup').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "${OPNMESH_HTTP_PORT:-80}:80"
+      - "${OPNMESH_HTTPS_PORT:-443}:443"
+      - "${OPNMESH_HTTPS_PORT:-443}:443/udp"
+    environment:
+      # A DNS name → Let's Encrypt; an IP address → Caddy's private CA.
+      OPNMESH_SITE: ${OPNMESH_SITE:?set OPNMESH_SITE in .env (the hostname or IP of this controller)}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy:/data
+      - caddy-config:/config
+    depends_on:
+      - controller
+
+volumes:
+  caddy-config:

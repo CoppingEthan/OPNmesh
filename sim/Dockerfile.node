@@ -1,0 +1,15 @@
+# Simulation node: Ubuntu 24.04 with exactly the tooling a real gateway,
+# router or host would have. Used for routers, gateways, LAN hosts and the
+# roaming client; the entrypoint decides the role.
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq \
+    && apt-get install -qq -y --no-install-recommends \
+       wireguard-tools nftables iproute2 iputils-ping curl ca-certificates \
+       iperf3 tcpdump conntrack python3 procps \
+    && rm -rf /var/lib/apt/lists/*
+# The agent binary, built by scripts/agent-build.mjs; install.sh installs it.
+COPY agent/bin/opnmesh-gw-linux-amd64 /opt/opnmesh/opnmesh-gw
+COPY deploy/gateway/install.sh /opt/opnmesh/install.sh
+COPY sim/entrypoints/ /opt/sim/
+RUN chmod +x /opt/opnmesh/opnmesh-gw /opt/opnmesh/install.sh /opt/sim/*.sh

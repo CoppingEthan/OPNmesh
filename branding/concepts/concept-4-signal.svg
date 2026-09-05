@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 130" width="560" height="130" role="img" aria-label="OPNmesh">
+  <!-- Concept 4 — Signal: concentric rings around a live centre; the tunnel seen end-on. -->
+  <g transform="translate(64 66)" fill="none">
+    <circle r="34" stroke="#7fd9b8" stroke-width="8"/>
+    <circle r="21" stroke="#7fd9b8" stroke-width="6" opacity="0.55"/>
+    <circle r="8.5" fill="#2e9f7b"/>
+  </g>
+  <text x="112" y="95" font-family="'Segoe UI Variable Display', 'Segoe UI', Inter, system-ui, sans-serif" font-size="86" font-weight="700" letter-spacing="-3">
+    <tspan fill="#3fb28c">PN</tspan><tspan fill="#16211d">mesh</tspan>
+  </text>
+</svg>

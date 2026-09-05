@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 130" width="560" height="130" role="img" aria-label="OPNmesh">
+  <!-- Concept 2 — Links: two halves, two sites, meeting end to end to make one ring. -->
+  <g transform="translate(64 66)" fill="none" stroke-width="9" stroke-linecap="round">
+    <!-- upper arc, 190° → 350° through the top -->
+    <path d="M -33.48 -5.9 A 34 34 0 0 1 33.48 -5.9" stroke="#8fe0c3"/>
+    <!-- lower arc, 10° → 170° through the bottom -->
+    <path d="M 33.48 5.9 A 34 34 0 0 1 -33.48 5.9" stroke="#3fb28c"/>
+  </g>
+  <text x="112" y="95" font-family="'Segoe UI Variable Display', 'Segoe UI', Inter, system-ui, sans-serif" font-size="86" font-weight="700" letter-spacing="-3">
+    <tspan fill="#3fb28c">PN</tspan><tspan fill="#16211d">mesh</tspan>
+  </text>
+</svg>

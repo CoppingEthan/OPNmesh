@@ -1,5 +1,7 @@
-# Auto detect text files and perform LF normalization
+# Normalise line endings in the repository; files that Linux hosts execute
+# or compare byte-for-byte must check out as LF on every platform.
 * text=auto
 *.sh text eol=lf
-docker/** text eol=lf
+deploy/** text eol=lf
+sim/entrypoints/** text eol=lf
 test/golden/** text eol=lf
