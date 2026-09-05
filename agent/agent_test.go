@@ -36,7 +36,7 @@ func TestValidateHooks(t *testing.T) {
 		"[Interface]\nPostDown = rm -rf /\n",
 		"[Interface]\nPostUp = wg set %i private-key /root/.ssh/id_rsa\n",
 		"[Interface]\nPostUp = wg set %i private-key /etc/opnmesh/../shadow\n",
-		"[Interface]\nPrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+		"[Interface]\nPrivateKey = placeholder-the-line-is-refused-whatever-its-value\n",
 	}
 	for _, c := range bad {
 		if err := validateHooks(c, "/etc/opnmesh"); err == nil {

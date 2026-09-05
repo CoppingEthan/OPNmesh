@@ -1,7 +1,5 @@
-# Normalise line endings in the repository; files that Linux hosts execute
-# or compare byte-for-byte must check out as LF on every platform.
-* text=auto
-*.sh text eol=lf
-deploy/** text eol=lf
-sim/entrypoints/** text eol=lf
-test/golden/** text eol=lf
+# Every text file is stored and checked out with LF on every platform: the
+# tree is executed on Linux (installers, sim entrypoints, nftables files),
+# built into Docker images straight from the working copy, and compared
+# byte-for-byte by the golden tests. Binary files are detected automatically.
+* text=auto eol=lf
