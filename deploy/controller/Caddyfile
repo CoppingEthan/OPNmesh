@@ -1,13 +1,24 @@
 # OPNmesh controller — TLS termination.
 #
-# OPNMESH_SITE is either a public DNS name (Caddy obtains Let's Encrypt
-# certificates automatically; ports 80/443 must be reachable from the
-# internet) or an IP address / private name (Caddy issues certificates from
-# its own private CA, whose root the controller serves at /ca.crt so
-# gateways can pin it at install time).
+# OPNMESH_SITE is the public DNS name or the IP address / private name the
+# controller is reached at. OPNMESH_TLS is empty for a public name (Caddy
+# obtains Let's Encrypt certificates; ports 80/443 must be reachable from the
+# internet) or "tls internal" otherwise (Caddy issues certificates from its
+# own private CA, whose root the controller serves at /ca.crt so gateways
+# can pin it at install time). The installer sets both.
+
+{
+	# A client that connects to an IP address sends no server name, and Caddy
+	# would then look for a certificate matching the connection's local
+	# address, which behind Docker's port forwarding is the container's
+	# internal IP. Treat such connections as being for the site itself.
+	default_sni {$OPNMESH_SITE}
+}
 
 {$OPNMESH_SITE} {
+	{$OPNMESH_TLS}
 	encode zstd gzip
+	header Strict-Transport-Security "max-age=31536000"
 	reverse_proxy controller:3000 {
 		# Server-Sent Events must stream, not buffer.
 		flush_interval -1

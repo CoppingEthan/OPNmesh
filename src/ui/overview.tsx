@@ -3,7 +3,7 @@
 import { AlertTriangle, ArrowRight, XCircle } from "lucide-react";
 import Link from "next/link";
 import type { StatePayload } from "@/server/state";
-import { Badge, Card, EmptyState, LinkButton, StatusDot, cx, healthLabel, healthTone } from "./components";
+import { Badge, Card, EmptyState, LinkButton, StatusDot, healthLabel, healthTone } from "./components";
 import { Ago } from "./components-client";
 import { EasedBits } from "./eased";
 import { LAYOUT_LABEL } from "./format";

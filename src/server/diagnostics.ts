@@ -19,7 +19,7 @@ import { endpointOf, isReachable, listenPortOf, meshSites, mtuOf, pairStatus, ty
 import { now } from "./env";
 import { logEvent } from "./events";
 import { liveState } from "./live";
-import { getSettings } from "./settings";
+import { getSettings, publicUrl } from "./settings";
 import { getSite } from "./sites";
 import { getGenerated } from "./snapshot";
 import { gatewayHealth } from "./status";
@@ -187,7 +187,7 @@ export async function controllerChecks(siteId: string, at = now()): Promise<Chec
   const lg = live.get(gw.id);
   const health = gatewayHealth(gw, lg, at, settings.telemetryIntervalS);
   const checks: CheckResult[] = [];
-  const controllerUrl = settings.publicUrl ?? "the controller";
+  const controllerUrl = publicUrl();
 
   // 1. Is the gateway talking to us?
   const seen = lg?.at ?? gw.lastSeenAt;

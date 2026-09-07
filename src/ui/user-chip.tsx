@@ -10,7 +10,7 @@ import { LogOut } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { apiFetch } from "./api";
 
-/** "ethan.copping@x.com" → "Ethan Copping"; "admin@x.com" → "Admin". */
+/** "jane.doe@x.com" → "Jane Doe"; "admin@x.com" → "Admin". */
 export function displayName(email: string): string {
   const local = email.split("@")[0] ?? email;
   const words = local.split(/[._-]+/).filter(Boolean);

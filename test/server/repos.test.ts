@@ -1,7 +1,14 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { freshDb } from "./helpers";
-import { getSettings, updateSettings, SettingsError } from "@/server/settings";
-import { addLan, createEnrolToken, createSite, deleteSite, enrolGateway, getSite, listSites, removeLan, updateGateway, updateLan, updateSite, SiteError, gatewayByToken } from "@/server/sites";
+import { isNotNull } from "drizzle-orm";
+import Database from "better-sqlite3";
+import { getDb } from "@/db";
+import { enrolTokens } from "@/db/schema";
+import { setEnvForTests } from "@/server/env";
+import { getSettings, publicUrl, updateSettings, SettingsError } from "@/server/settings";
+import { addLan, createEnrolToken, createSite, deleteSite, enrolGateway, getSite, listSites, pruneEnrolTokens, removeLan, updateGateway, updateLan, updateSite, SiteError, gatewayByToken } from "@/server/sites";
+import { liveState, telemetrySchema } from "@/server/live";
+import { ingestTelemetry } from "@/server/telemetry";
 import { clientPrivateKey, consumeInvite, createClient, createInvite, deleteClient, expireClients, getClient, peekInvite, rotateClientKeys, updateClient, ClientError } from "@/server/clients";
 import { getGenerated, renderClientConf } from "@/server/snapshot";
 import { listEvents } from "@/server/events";
@@ -171,5 +178,51 @@ describe("audit log", () => {
     createClient({ name: "Laptop" });
     const kinds = listEvents().map((e) => e.kind);
     expect(kinds).toEqual(["client", "lan", "site"]);
+  });
+});
+
+describe("housekeeping", () => {
+  it("prunes expired unused enrolment tokens at once and used ones after a week", () => {
+    const site = createSite({ name: "DC" });
+    createEnrolToken(site.id, { ttlMs: -1 }); // already expired, never used
+    createEnrolToken(site.id); // live
+    const used = createEnrolToken(site.id);
+    const r = enrolGateway({ token: used.token, publicKey: KEY(), hostname: "gw", os: "", arch: "", addresses: ["10.0.250.2"], agentVersion: "" });
+    expect(r.ok).toBe(true);
+    expect(pruneEnrolTokens()).toBe(1);
+    expect(getDb().select().from(enrolTokens).all()).toHaveLength(2);
+    getDb().update(enrolTokens).set({ usedAt: Date.now() - 8 * 24 * 3600 * 1000 }).where(isNotNull(enrolTokens.usedAt)).run();
+    expect(pruneEnrolTokens()).toBe(1);
+    expect(getDb().select().from(enrolTokens).all()).toHaveLength(1);
+  });
+
+  it("forgets a removed gateway's live state", () => {
+    const site = createSite({ name: "DC" });
+    const r = enrolAt(site.id);
+    const gw = getSite(site.id)!.gateway!;
+    ingestTelemetry(gw, telemetrySchema.parse({ peers: [] }));
+    expect(liveState().get(r.gatewayId)).toBeDefined();
+    deleteSite(site.id);
+    expect(liveState().get(r.gatewayId)).toBeUndefined();
+  });
+
+  it("normalises and validates the public URL override", () => {
+    expect(publicUrl()).toBe("http://controller.test"); // the environment; tests run in insecure (lab) mode
+    expect(updateSettings({ publicUrl: " https://mesh.example.com/ " }).publicUrl).toBe("https://mesh.example.com");
+    expect(publicUrl()).toBe("https://mesh.example.com");
+    expect(updateSettings({ publicUrl: "https://mesh.example.com:8443" }).publicUrl).toBe("https://mesh.example.com:8443");
+    expect(updateSettings({ publicUrl: "" }).publicUrl).toBeNull();
+    expect(publicUrl()).toBe("http://controller.test");
+    for (const bad of ["mesh.example.com", "https://mesh.example.com/admin", "https://mesh.example.com/?x=1", "ftp://mesh.example.com", "https://user:pw@mesh.example.com"]) {
+      expect(() => updateSettings({ publicUrl: bad }), bad).toThrow(SettingsError);
+    }
+    setEnvForTests({ insecureHttp: false });
+    expect(() => updateSettings({ publicUrl: "http://mesh.example.com" })).toThrow(SettingsError);
+  });
+
+  it("uses better-sqlite3 buffers the way the backup route expects", () => {
+    const copy = new Database(getDb().$client.serialize());
+    expect((copy.prepare("SELECT COUNT(*) AS n FROM settings").get() as { n: number }).n).toBe(1);
+    copy.close();
   });
 });

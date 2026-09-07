@@ -146,13 +146,18 @@ func cmdRun(args []string, once bool) error {
 	interval := time.Duration(meta.TelemetryEverySec) * time.Second
 	log.Printf("opnmesh-gw %s: controller %s, interface %s, reporting every %s", version, cfg.ControllerURL, meta.Interface, interval)
 
-	// Make sure the tunnel is up from disk even if opnmesh-wg.service did not run.
-	if err := applyFromDisk(cfg); err != nil {
-		log.Printf("bring-up from disk: %v", err)
-	}
+	// A configuration that failed to apply here, and when: it is not fetched
+	// again until applyRetryAfter has passed or the controller changes it.
+	failedHash := ""
+	var failedAt time.Time
+	rr := newReresolver()
+	var lastBringUp time.Time
 
 	for {
-		healKey(cfg)
+		// Keep the tunnel up from the files on disk whether or not the
+		// controller can be reached (opnmesh-wg.service may not have run,
+		// DNS may have been down at boot, a public address may have moved).
+		maintainTunnel(cfg, rr, &lastBringUp)
 		token, err := cfg.token()
 		if err != nil {
 			log.Printf("%v", err)
@@ -168,16 +173,24 @@ func cmdRun(args []string, once bool) error {
 			case resp.Status == "disabled":
 				log.Printf("this gateway is disabled in the OPNmesh UI")
 			case resp.ConfigHash != "" && resp.ConfigHash != appliedHash:
-				desired, notModified, err := client.FetchConfig("")
-				if err != nil {
+				if resp.IntervalSeconds > 0 {
+					interval = time.Duration(resp.IntervalSeconds) * time.Second
+				}
+				if resp.ConfigHash == failedHash && time.Since(failedAt) < applyRetryAfter {
+					// This exact configuration already failed here (and was rolled
+					// back). Leave the running tunnel alone until the retry is due
+					// or the controller changes something.
+				} else if desired, notModified, err := client.FetchConfig(""); err != nil {
 					log.Printf("fetch config: %v", err)
 				} else if notModified || desired == nil || desired.Status != "active" {
 					log.Printf("config not available yet")
 				} else if err := applyConfig(cfg, desired); err != nil {
 					lastError = err.Error()
-					log.Printf("apply failed: %v", err)
+					failedHash, failedAt = desired.Hash, time.Now()
+					log.Printf("apply failed: %v (next attempt in %s unless the configuration changes)", err, applyRetryAfter)
 				} else {
 					lastError = ""
+					failedHash = ""
 					appliedHash = desired.Hash
 					if desired.Meta.TelemetryIntervalSeconds > 0 {
 						interval = time.Duration(desired.Meta.TelemetryIntervalSeconds) * time.Second

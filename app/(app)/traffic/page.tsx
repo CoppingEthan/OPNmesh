@@ -1,3 +1,4 @@
+import { now } from "@/server/env";
 import { requireAdmin } from "@/server/session";
 import { buildState } from "@/server/state";
 import { pairSeries, rangeMs, RANGES, type Range } from "@/server/telemetry";
@@ -15,7 +16,7 @@ export default async function TrafficPage({ searchParams }: { searchParams: Prom
   const state = buildState();
   const snap = getGenerated().snapshot;
   const sites = meshSites(snap);
-  const now = Date.now();
+  const at = now();
   const history: PairHistory[] = [];
   for (let i = 0; i < sites.length; i++) {
     for (let j = i + 1; j < sites.length; j++) {
@@ -24,10 +25,10 @@ export default async function TrafficPage({ searchParams }: { searchParams: Prom
       history.push({
         aId: a.id,
         bId: b.id,
-        aToB: pairSeries(a.slug, b.slug, range, now).map((p) => ({ ts: p.ts, v: p.bps })),
-        bToA: pairSeries(b.slug, a.slug, range, now).map((p) => ({ ts: p.ts, v: p.bps })),
+        aToB: pairSeries(a.slug, b.slug, range, at).map((p) => ({ ts: p.ts, v: p.bps })),
+        bToA: pairSeries(b.slug, a.slug, range, at).map((p) => ({ ts: p.ts, v: p.bps })),
       });
     }
   }
-  return <TrafficView initial={state} range={range} ranges={RANGES} history={history} from={now - rangeMs(range)} to={now} />;
+  return <TrafficView initial={state} range={range} ranges={RANGES} history={history} from={at - rangeMs(range)} to={at} />;
 }

@@ -26,8 +26,17 @@ export function UnifiPanel({ site }: { site: SiteState }) {
 
   const load = async () => setLink(await apiFetch<LinkView | null>("GET", `/api/admin/sites/${site.id}/unifi`));
   useEffect(() => {
-    load().catch(() => setLink(null));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    let cancelled = false;
+    apiFetch<LinkView | null>("GET", `/api/admin/sites/${site.id}/unifi`)
+      .then((l) => {
+        if (!cancelled) setLink(l);
+      })
+      .catch(() => {
+        if (!cancelled) setLink(null);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [site.id]);
 
   if (link === undefined) return <Card title="UniFi">Loading…</Card>;

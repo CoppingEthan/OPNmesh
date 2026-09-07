@@ -12,3 +12,9 @@ test
 coverage
 *.md
 !README.md
+# development-only material
+branding
+screenshots
+.test-data
+*.tsbuildinfo
+gradient-wallpapers-*.jpg

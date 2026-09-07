@@ -39,7 +39,7 @@ export function ClientsList({ initial, rows, openNew }: { initial: StatePayload;
         }
       />
       {noEntry && state.sites.length > 0 && (
-        <p className="mb-4 rounded-lg bg-warn-soft px-4 py-3 text-sm text-warn-ink">No site accepts incoming connections yet, so clients have nowhere to connect. On a site's gateway, tick “accepts incoming connections” and set its public address.</p>
+        <p className="mb-4 rounded-lg bg-warn-soft px-4 py-3 text-sm text-warn-ink">No site accepts incoming connections yet, so clients have nowhere to connect. On a site&apos;s gateway, tick “accepts incoming connections” and set its public address.</p>
       )}
       {state.clients.length === 0 ? (
         <EmptyState title="No clients yet" description="Add a device, then hand it a QR code, a config file or a one-time link." action={<Button variant="primary" onClick={() => setCreating(true)}>Add client</Button>} />
@@ -48,7 +48,7 @@ export function ClientsList({ initial, rows, openNew }: { initial: StatePayload;
           <ul className="divide-y divide-line">
             {state.clients.map((c) => {
               const r = byId.get(c.id);
-              const expired = !!r?.expiresAt && r.expiresAt < Date.now();
+              const expired = !!r?.expiresAt && r.expiresAt < state.at;
               return (
                 <li key={c.id}>
                   <Link href={`/clients/${c.id}`} className="flex items-center gap-4 px-5 py-3.5 hover:bg-surface-2">

@@ -29,8 +29,11 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
+      - run: npm run lint
       - run: npm test
       - run: npx cross-env OPNMESH_STANDALONE=1 NEXT_TELEMETRY_DISABLED=1 npx next build
+      - name: UI smoke test against the standalone server (what the image runs)
+        run: node scripts/ui-smoke.mjs --standalone
 
   agent:
     name: Gateway agent (Go)
@@ -43,6 +46,33 @@ jobs:
           cache-dependency-path: agent/go.sum
       - run: cd agent && go mod tidy && test -z "$(gofmt -l .)" && go vet ./... && go test ./...
       - run: cd agent && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/opnmesh-gw .
+
+  deploy:
+    name: Controller deployment (installer, Caddy private CA, unprivileged container)
+    runs-on: ubuntu-24.04
+    needs: [unit, agent]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build the controller image
+        run: docker build -t opnmesh:ci .
+      - name: Run the controller installer against the local image
+        env:
+          OPNMESH_RAW_BASE: file://${{ github.workspace }}/deploy/controller
+          OPNMESH_HTTP_PORT: "18080"
+          OPNMESH_HTTPS_PORT: "18443"
+        run: sudo -E bash deploy/controller/install.sh --dir /tmp/opnmesh-ci --url https://127.0.0.1:18443 --image opnmesh:ci
+      - name: Smoke-test the deployment as a first install would see it
+        run: sudo -E "$(command -v node)" scripts/deploy-smoke.mjs --dir /tmp/opnmesh-ci --url https://127.0.0.1:18443
+      - name: Logs on failure
+        if: failure()
+        run: cd /tmp/opnmesh-ci && sudo docker compose logs --no-color --tail 100
+      - name: Tear down
+        if: always()
+        run: cd /tmp/opnmesh-ci && sudo docker compose down -v || true
 
   simulation:
     name: Four-site simulation (Ubuntu 24.04 containers, kernel WireGuard)

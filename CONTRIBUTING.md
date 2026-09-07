@@ -25,6 +25,7 @@ than UniFi, and pull requests are all welcome.
 npm install
 npm run dev            # controller on http://localhost:3000
 npm test               # unit + API tests
+npm run lint           # ESLint (the Next.js rule set)
 npm run agent:test     # Go agent (in Docker)
 npm run sim:up && npm run sim:test   # four-site simulation
 ```

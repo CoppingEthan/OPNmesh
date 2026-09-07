@@ -15,7 +15,7 @@ import { open, seal } from "@/core/crypto";
 import { env, now } from "./env";
 import { logEvent } from "./events";
 import { liveState } from "./live";
-import { getSettings } from "./settings";
+import { getSettings, publicUrl } from "./settings";
 import { listSites } from "./sites";
 import { gatewayHealth } from "./status";
 
@@ -124,7 +124,7 @@ export async function sendMail(subject: string, text: string): Promise<void> {
 export async function sendTestEmail(actor = "admin"): Promise<string[]> {
   const to = recipients(getSettings().alertTo);
   const name = getSettings().networkName;
-  await sendMail(`[${name}] OPNmesh test email`, `This is a test email from OPNmesh (${env().publicUrl}).\n\nIf you are reading it, alerts for gateways going down will reach this address.\n`);
+  await sendMail(`[${name}] OPNmesh test email`, `This is a test email from OPNmesh (${publicUrl()}).\n\nIf you are reading it, alerts for gateways going down will reach this address.\n`);
   logEvent("alert", `Test email sent to ${to.join(", ")}`, { actor });
   return to;
 }
@@ -163,7 +163,7 @@ export async function checkGatewayAlerts(at = now()): Promise<AlertOutcome> {
         `Site address: ${gw.lanIp}`,
         ``,
         `Other sites keep talking to each other; only traffic to and from ${site.name} is affected.`,
-        `Dashboard: ${env().publicUrl}/sites/${site.id}`,
+        `Dashboard: ${publicUrl()}/sites/${site.id}`,
       ].join("\n"));
       getDb().update(gateways).set({ alertState: "down" }).where(eq(gateways.id, gw.id)).run();
       out.sent.push({ siteId: site.id, kind: "down" });
@@ -171,7 +171,7 @@ export async function checkGatewayAlerts(at = now()): Promise<AlertOutcome> {
       await notify(site.id, "up", `[${s.networkName}] ${site.name} gateway is back`, [
         `The OPNmesh gateway at ${site.name} (${gw.hostname || gw.name}) is reporting again.`,
         ``,
-        `Dashboard: ${env().publicUrl}/sites/${site.id}`,
+        `Dashboard: ${publicUrl()}/sites/${site.id}`,
       ].join("\n"));
       getDb().update(gateways).set({ alertState: "up" }).where(eq(gateways.id, gw.id)).run();
       out.sent.push({ siteId: site.id, kind: "up" });

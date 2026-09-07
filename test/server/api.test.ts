@@ -27,6 +27,9 @@ import { POST as enrolPost } from "../../app/api/agent/enrol/route";
 import { GET as configGet } from "../../app/api/agent/config/route";
 import { POST as telemetryPost } from "../../app/api/agent/telemetry/route";
 import { GET as installGet } from "../../app/install.sh/route";
+import { GET as backupGet } from "../../app/api/admin/backup/route";
+import Database from "better-sqlite3";
+import { listEvents } from "@/server/events";
 
 const BASE = "http://controller.test";
 
@@ -228,4 +231,44 @@ describe("clients through the API", () => {
 
     expect((await settingsGet(req("GET", "/api/admin/settings", undefined, asAdmin()))).status).toBe(200);
   }, 60_000);
+});
+
+describe("public endpoints and operations", () => {
+  it("refuse cross-origin mutations, log failed sign-ins, and honour the public URL override", async () => {
+    const evil = await loginPost(req("POST", "/api/admin/login", { email: "admin@example.com", password: "x".repeat(12) }, { origin: "https://evil.example" }));
+    expect(evil.status).toBe(403);
+    await setupAndLogin();
+    const bad = await loginPost(req("POST", "/api/admin/login", { email: "admin@example.com", password: "nope nope nope" }));
+    expect(bad.status).toBe(401);
+    expect(listEvents().some((e) => e.kind === "login" && e.message.startsWith("Failed sign-in for admin@example.com"))).toBe(true);
+
+    expect((await settingsPut(req("PUT", "/api/admin/settings", { publicUrl: "not a url" }, asAdmin()))).status).toBe(400);
+    expect((await settingsPut(req("PUT", "/api/admin/settings", { publicUrl: "https://mesh.example.com" }, asAdmin()))).status).toBe(200);
+    const site = await (await sitesPost(req("POST", "/api/admin/sites", { name: "DC" }, asAdmin()))).json();
+    const tok = await (await tokenPost(req("POST", `/api/admin/sites/${site.id}/enrol-token`, {}, asAdmin()), params({ id: site.id }))).json();
+    expect(tok.command).toContain("curl -fsSL https://mesh.example.com/install.sh");
+    expect(tok.command).not.toContain("--insecure-http");
+    expect(await (await installGet()).text()).toContain('CONTROLLER="https://mesh.example.com"');
+    const client = await (await clientsPost(req("POST", "/api/admin/clients", { name: "Laptop" }, asAdmin()))).json();
+    const inv = await (await invitePost(req("POST", `/api/admin/clients/${client.id}/invite`, {}, asAdmin()), params({ id: client.id }))).json();
+    expect(inv.url).toMatch(/^https:\/\/mesh\.example\.com\/invite\//);
+    const state = await (await stateGet(req("GET", "/api/admin/state", undefined, asAdmin()))).json();
+    expect(state.settings.publicUrl).toBe("https://mesh.example.com");
+  }, 30_000);
+
+  it("serves a consistent database backup to the admin only", async () => {
+    expect((await backupGet(req("GET", "/api/admin/backup"))).status).toBe(401);
+    await setupAndLogin();
+    await sitesPost(req("POST", "/api/admin/sites", { name: "DC" }, asAdmin()));
+    const r = await backupGet(req("GET", "/api/admin/backup", undefined, asAdmin()));
+    expect(r.status).toBe(200);
+    expect(r.headers.get("content-disposition")).toMatch(/opnmesh-backup-\d{8}-\d{4}\.db/);
+    const bytes = Buffer.from(await r.arrayBuffer());
+    expect(bytes.subarray(0, 15).toString("latin1")).toBe("SQLite format 3");
+    const copy = new Database(bytes);
+    expect((copy.prepare("SELECT COUNT(*) AS n FROM users").get() as { n: number }).n).toBe(1);
+    expect((copy.prepare("SELECT COUNT(*) AS n FROM sites").get() as { n: number }).n).toBe(1);
+    copy.close();
+    expect(listEvents().some((e) => e.message === "Database backup downloaded")).toBe(true);
+  }, 30_000);
 });

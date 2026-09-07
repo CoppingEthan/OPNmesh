@@ -3,7 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { apiFetch } from "./api";
-import { Button, Callout, Card, Field, Input, Mono, PageHeader } from "./components";
+import { Button, buttonClass, Callout, Card, cx, Field, Input, Mono, PageHeader } from "./components";
 import { Notice } from "./components-client";
 
 interface SettingsView {
@@ -78,7 +78,7 @@ export function SettingsForms({ admin, settings, env, smtp }: { admin: { email: 
               <Field label="Network name">
                 <Input value={v.networkName} onChange={(e) => set("networkName", e.target.value)} />
               </Field>
-              <Field label="Public URL" hint={`Shown in install commands and invite links. Currently served as ${env.publicUrl}.`}>
+              <Field label="Public URL" hint={`Used in install commands, invite links and alert emails. Leave empty to use the address from the environment, ${env.publicUrl}.`}>
                 <Input className="mono" value={v.publicUrl ?? ""} onChange={(e) => set("publicUrl", e.target.value)} placeholder={env.publicUrl} />
               </Field>
               <Field label="Gateway tunnel range" hint="Addresses for gateways inside the mesh. Change only before the first gateway enrols.">
@@ -134,6 +134,10 @@ export function SettingsForms({ admin, settings, env, smtp }: { admin: { email: 
             <p className="text-sm text-ink-2">
               Everything lives in the data directory: <Mono>opnmesh.db</Mono> (sites, clients, telemetry) and <Mono>secret.key</Mono>, which encrypts client private keys. Back up both together; the database alone cannot decrypt client keys, and the key alone is useless without the database.
             </p>
+            <p className="mt-2 text-sm text-ink-2">The download below is a consistent copy of the database taken while the controller runs, which copying the file by hand is not. Keep it with a copy of <Mono>secret.key</Mono>.</p>
+            <a href="/api/admin/backup" className={cx(buttonClass("secondary", "sm"), "mt-3")}>
+              Download database backup
+            </a>
           </Card>
         </div>
       </div>

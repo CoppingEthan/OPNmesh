@@ -1,7 +1,7 @@
 #!/bin/sh
 # OPNmesh controller installer for Ubuntu 22.04 / 24.04 (Debian 12 works too).
 #
-#   curl -fsSL https://raw.githubusercontent.com/CoppingEthan/OPNmesh/main/deploy/controller/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/CoppingEthan/OPNmesh/main/deploy/controller/install.sh | sudo bash -s -- --domain mesh.example.com
 #
 # Installs Docker if missing, creates /opt/opnmesh with a compose file, a
 # Caddyfile and a .env, starts everything, and prints the URL and the
@@ -9,9 +9,15 @@
 #
 # Flags / env:
 #   --dir <path>        install directory (default /opt/opnmesh)
-#   --domain <name>     public DNS name for automatic Let's Encrypt certificates
-#   --url <url>         public URL if not derived from the domain (e.g. https://203.0.113.5)
+#   --domain <name>     public DNS name; Caddy obtains Let's Encrypt certificates
+#                       (ports 80 and 443 must be reachable from the internet)
+#   --url <url>         public URL when there is no public domain, e.g.
+#                       https://203.0.113.5 or https://mesh.lan (default: this
+#                       host's address); Caddy then issues certificates from a
+#                       private CA that gateways pin at install time
 #   --image <ref>       controller image (default ghcr.io/coppingethan/opnmesh:latest)
+#   --http-port <n>     host port for Caddy's HTTP listener (default 80)
+#   --https-port <n>    host port for Caddy's HTTPS listener (default 443)
 #   --no-start          write files but do not start
 set -eu
 
@@ -19,8 +25,12 @@ DIR=/opt/opnmesh
 DOMAIN="${OPNMESH_DOMAIN:-}"
 URL="${OPNMESH_PUBLIC_URL:-}"
 IMAGE="${OPNMESH_IMAGE:-ghcr.io/coppingethan/opnmesh:latest}"
+HTTP_PORT="${OPNMESH_HTTP_PORT:-80}"
+HTTPS_PORT="${OPNMESH_HTTPS_PORT:-443}"
 RAW="${OPNMESH_RAW_BASE:-https://raw.githubusercontent.com/CoppingEthan/OPNmesh/main/deploy/controller}"
 START=1
+# The image runs as this unprivileged user; the data directory must be its.
+DATA_UID=1000
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -28,6 +38,8 @@ while [ $# -gt 0 ]; do
     --domain) DOMAIN="$2"; shift 2 ;;
     --url) URL="$2"; shift 2 ;;
     --image) IMAGE="$2"; shift 2 ;;
+    --http-port) HTTP_PORT="$2"; shift 2 ;;
+    --https-port) HTTPS_PORT="$2"; shift 2 ;;
     --no-start) START=0; shift ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
@@ -45,6 +57,11 @@ docker compose version >/dev/null 2>&1 || { echo "docker compose plugin missing;
 
 # Files ----------------------------------------------------------------------
 mkdir -p "$DIR/data" "$DIR/caddy"
+# The controller runs unprivileged inside its container and must own its data
+# (SQLite, secret.key, the setup code). A root-owned directory would leave it
+# unable to start.
+chown "$DATA_UID:$DATA_UID" "$DIR/data"
+chmod 0700 "$DIR/data"
 cd "$DIR"
 for f in docker-compose.yml Caddyfile; do
   if [ ! -f "$f" ]; then
@@ -64,11 +81,16 @@ if [ ! -f .env ]; then
     fi
   fi
   SITE="${DOMAIN:-$(printf '%s' "$URL" | sed -E 's#^https?://##; s#[:/].*$##')}"
+  # Caddy chooses its own CA for IP addresses by itself, but not for private
+  # names such as mesh.lan; say so explicitly whenever there is no public domain.
+  TLS=""
+  [ -n "$DOMAIN" ] || TLS="tls internal"
   {
     echo "OPNMESH_SITE=$SITE"
     echo "OPNMESH_PUBLIC_URL=$URL"
-    echo "OPNMESH_HTTP_PORT=80"
-    echo "OPNMESH_HTTPS_PORT=443"
+    echo "OPNMESH_TLS=$TLS"
+    echo "OPNMESH_HTTP_PORT=$HTTP_PORT"
+    echo "OPNMESH_HTTPS_PORT=$HTTPS_PORT"
     echo "OPNMESH_IMAGE=$IMAGE"
   } > .env
   chmod 0600 .env
@@ -78,18 +100,29 @@ fi
 # Start ----------------------------------------------------------------------
 if [ "$START" = "1" ]; then
   log "starting OPNmesh"
-  docker compose pull -q
+  docker compose pull -q --ignore-pull-failures
   docker compose up -d
-  sleep 4
   . ./.env
+  # The controller writes its setup code, and Caddy its CA root, within seconds.
+  CA=caddy/caddy/pki/authorities/local/root.crt
+  ready() {
+    [ -f data/setup-code ] || return 1
+    if [ -n "${OPNMESH_TLS:-}" ]; then [ -f "$CA" ] || return 1; fi
+    return 0
+  }
+  n=0
+  while [ $n -lt 30 ] && ! ready; do sleep 1; n=$((n + 1)); done
   echo
   log "OPNmesh is starting at ${OPNMESH_PUBLIC_URL}"
   log "first-run setup code (also in: docker compose logs controller):"
-  docker compose logs controller 2>/dev/null | grep -o 'setup code:  [A-Z0-9]*' | tail -1 || true
-  [ -f data/setup-code ] && log "  $(cat data/setup-code)" || true
-  if [ -f caddy/pki/authorities/local/root.crt ]; then
-    log "private CA fingerprint (shown in the UI next to install commands):"
-    sha256sum caddy/pki/authorities/local/root.crt | cut -d' ' -f1
+  if [ -f data/setup-code ]; then
+    log "  $(cat data/setup-code)"
+  else
+    docker compose logs controller 2>/dev/null | grep -o 'setup code:  [A-Z0-9]*' | tail -1 || true
+  fi
+  if [ -f "$CA" ]; then
+    log "private CA fingerprint (the UI puts it in every gateway install command):"
+    log "  $(sha256sum "$CA" | cut -d' ' -f1)"
   fi
   echo
   log "next: open the URL above, enter the setup code, add your first site."

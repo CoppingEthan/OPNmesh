@@ -3,6 +3,7 @@ import { eq, sql } from "drizzle-orm";
 import { getDb } from "@/db";
 import { settings, type SettingsRow } from "@/db/schema";
 import { isValidCidr, cidrHasHostBits, cidrOverlaps, parseCidr } from "@/core/ip";
+import { env } from "./env";
 import { logEvent } from "./events";
 
 export function getSettings(): SettingsRow {
@@ -35,9 +36,36 @@ export interface SettingsPatch {
 
 export class SettingsError extends Error {}
 
+/**
+ * The address gateways and people are given for this controller: the
+ * Settings override when one is set, otherwise OPNMESH_PUBLIC_URL. Used for
+ * install commands, invite links and alert emails. The session cookie's
+ * Secure flag follows the environment only, since that is what is served.
+ */
+export function publicUrl(): string {
+  return getSettings().publicUrl || env().publicUrl;
+}
+
+/** Empty means "use the environment"; otherwise a bare https origin (http only in insecure/lab mode). */
+export function normalisePublicUrl(value: string | null): string | null {
+  const v = (value ?? "").trim();
+  if (v === "") return null;
+  let u: URL;
+  try {
+    u = new URL(v);
+  } catch {
+    throw new SettingsError("public URL must be a full address such as https://mesh.example.com");
+  }
+  if (u.protocol !== "https:" && !(u.protocol === "http:" && env().insecureHttp)) throw new SettingsError("public URL must start with https://");
+  if (u.pathname !== "/" || u.search !== "" || u.hash !== "" || u.username !== "" || u.password !== "") {
+    throw new SettingsError("public URL is just the scheme, host and optional port, with no path");
+  }
+  return u.origin;
+}
+
 export function updateSettings(patch: SettingsPatch, actor = "admin"): SettingsRow {
   const current = getSettings();
-  const next = { ...current, ...patch };
+  const next = { ...current, ...patch, publicUrl: patch.publicUrl === undefined ? current.publicUrl : normalisePublicUrl(patch.publicUrl) };
   for (const [label, cidr] of [
     ["gateway range", next.gatewayCidr],
     ["client range", next.clientCidr],

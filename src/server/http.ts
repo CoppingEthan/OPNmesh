@@ -110,10 +110,11 @@ export function withGateway(fn: GatewayHandler) {
   };
 }
 
-/** Wrap a public handler so thrown errors become JSON. */
+/** Wrap a public handler so thrown errors become JSON. Mutations must still come from the same origin. */
 export function withPublic<P = Record<string, never>>(fn: (req: Request, ctx: { params: P }) => Promise<Response> | Response) {
   return async (req: Request, ctx?: { params: Promise<P> }): Promise<Response> => {
     try {
+      if (req.method !== "GET" && req.method !== "HEAD" && !sameOrigin(req)) return json({ error: "cross-origin request refused" }, 403);
       const params = (ctx ? await ctx.params : {}) as P;
       return await fn(req, { params });
     } catch (e) {

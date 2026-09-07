@@ -14,7 +14,9 @@ import { formatBits } from "./format";
 export function useEased(target: number, format: (v: number) => string, tauMs = 1200): string {
   const [text, setText] = useState(() => format(target));
   const ref = useRef({ shown: target, target, text: format(target) });
-  ref.current.target = target;
+  useEffect(() => {
+    ref.current.target = target;
+  }, [target]);
   useEffect(() => {
     let raf = 0;
     let last = performance.now();

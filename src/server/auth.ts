@@ -110,6 +110,7 @@ export async function completeSetup(input: { code: string; email: string; passwo
   if (loginThrottled(source)) throw new AuthError("too many attempts — wait 15 minutes", 429);
   if (input.code.trim().toUpperCase() !== setupCode()) {
     recordFailure(source);
+    logEvent("login", `Failed first-run setup attempt for ${safeActor(input.email)} from ${source}`, { actor: safeActor(input.email) });
     throw new AuthError("setup code does not match the one printed in the controller log", 403);
   }
   validateCredentials(input.email, input.password);
@@ -117,6 +118,12 @@ export async function completeSetup(input: { code: string; email: string; passwo
   getDb().insert(users).values({ id: randomId(), email: input.email.trim(), passwordHash: hash, createdAt: now() }).run();
   markSetupComplete();
   logEvent("setup", `Admin account ${input.email.trim()} created`, { actor: input.email.trim() });
+}
+
+/** An attempted identity as it may be written to the log: printable, bounded. */
+function safeActor(email: string): string {
+  const s = email.trim().replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 120);
+  return s === "" ? "(empty)" : s;
 }
 
 function validateCredentials(email: string, password: string): void {
@@ -131,6 +138,7 @@ export async function login(email: string, password: string, source = "unknown")
   const ok = user ? await argon2.verify(user.passwordHash, password) : false;
   if (!user || !ok) {
     recordFailure(source);
+    logEvent("login", `Failed sign-in for ${safeActor(email)} from ${source}`, { actor: safeActor(email) });
     // Constant-ish time: hashing a dummy when the user is unknown.
     if (!user) await argon2.hash("x".repeat(16), { type: argon2.argon2id });
     throw new AuthError("email or password is incorrect");

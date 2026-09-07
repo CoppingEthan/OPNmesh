@@ -1,11 +1,13 @@
 # OPNmesh controller — production deployment.
 #
-#   Caddy terminates TLS on 80/443 and proxies to the controller. With
-#   OPNMESH_DOMAIN set it obtains Let's Encrypt certificates automatically;
-#   without one it issues certificates from a private CA that gateways pin
-#   at install time (the UI prints the fingerprint next to the command).
+#   Caddy terminates TLS on 80/443 and proxies to the controller. With a public
+#   domain it obtains Let's Encrypt certificates automatically; otherwise
+#   (OPNMESH_TLS="tls internal") it issues certificates from a private CA that
+#   gateways pin at install time (the UI prints the fingerprint in every
+#   install command).
 #
 #   cp .env.example .env    # then edit
+#   mkdir -p data && chown 1000:1000 data
 #   docker compose up -d
 #
 # Data lives in ./data (SQLite + secret.key) and ./caddy (certificates).
@@ -20,8 +22,12 @@ services:
       OPNMESH_DATA_DIR: /data
       OPNMESH_PUBLIC_URL: ${OPNMESH_PUBLIC_URL:?set OPNMESH_PUBLIC_URL in .env}
       OPNMESH_TRUST_PROXY: "1"
-      OPNMESH_CA_FILE: /caddy/pki/authorities/local/root.crt
+      # Caddy's private CA root, when Caddy issues the certificates. Served at
+      # /ca.crt for gateway installers; its fingerprint goes into install commands.
+      OPNMESH_CA_FILE: /caddy/caddy/pki/authorities/local/root.crt
     volumes:
+      # The image runs as uid 1000 (node); ./data must be owned by that user.
+      # The installer does this; by hand: chown 1000:1000 data
       - ./data:/data
       - ./caddy:/caddy:ro
     expose: ["3000"]
@@ -40,12 +46,31 @@ services:
       - "${OPNMESH_HTTPS_PORT:-443}:443"
       - "${OPNMESH_HTTPS_PORT:-443}:443/udp"
     environment:
-      # A DNS name → Let's Encrypt; an IP address → Caddy's private CA.
+      # The hostname or IP address this controller is reached at.
       OPNMESH_SITE: ${OPNMESH_SITE:?set OPNMESH_SITE in .env (the hostname or IP of this controller)}
+      # "tls internal" → Caddy's private CA (IP addresses, private names);
+      # empty → Let's Encrypt for a public domain.
+      OPNMESH_TLS: ${OPNMESH_TLS:-}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./caddy:/data
       - caddy-config:/config
+    # Caddy keeps its data directory and CA files root-only. The root
+    # *certificate* is public by nature (gateways download it), so once Caddy
+    # has created it, make that one file readable and let other users pass
+    # through the directories above it (traverse only, no listing). Private
+    # keys and issued certificates stay as Caddy left them.
+    command:
+      - sh
+      - -c
+      - |
+        (
+          f=/data/caddy/pki/authorities/local/root.crt
+          while [ ! -f "$$f" ]; do sleep 2; done
+          chmod o+x /data/caddy /data/caddy/pki /data/caddy/pki/authorities /data/caddy/pki/authorities/local
+          chmod 644 "$$f"
+        ) &
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
     depends_on:
       - controller
 

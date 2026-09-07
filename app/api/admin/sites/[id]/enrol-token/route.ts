@@ -14,7 +14,7 @@ function privateCaFingerprint(): string | null {
 }
 import { json, parseBody, withAdmin } from "@/server/http";
 import { createEnrolToken, getSite } from "@/server/sites";
-import { env } from "@/server/env";
+import { publicUrl } from "@/server/settings";
 import { installScript } from "@/server/install-script";
 
 export const dynamic = "force-dynamic";
@@ -27,7 +27,7 @@ export const POST = withAdmin<{ id: string }>(async (req, { params, admin }) => 
   if (!site) return json({ error: "site not found" }, 404);
   const body = await parseBody(req, schema);
   const { token, expiresAt } = createEnrolToken(params.id, { autoApprove: body.autoApprove ?? true }, admin.email);
-  const base = env().publicUrl;
+  const base = publicUrl();
   const script = installScript(base);
   const sha256 = createHash("sha256").update(script).digest("hex");
   const insecure = base.startsWith("http://") ? " --insecure-http" : "";

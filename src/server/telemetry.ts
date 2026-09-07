@@ -96,6 +96,13 @@ const HOUR = 3_600_000;
  * already present are left alone (INSERT OR IGNORE), so running it late or
  * twice is harmless.
  */
+const g = globalThis as unknown as { __opnmeshRollup?: { minute: number; hour: number } };
+
+/** Tests: forget where the previous pass stopped. */
+export function resetRollupWatermarkForTests(): void {
+  g.__opnmeshRollup = undefined;
+}
+
 export function runRollups(at = now()): { minutes: number; hours: number } {
   const db = getDb();
   const s = db.$client;
@@ -103,12 +110,21 @@ export function runRollups(at = now()): { minutes: number; hours: number } {
   const hourEnd = Math.floor(at / HOUR) * HOUR;
   let minutes = 0;
   let hours = 0;
+  // Where the previous pass stopped. Samples are stamped with the time they
+  // arrive, so a completed minute or hour never gains rows later and can be
+  // left alone; without this every pass would rescan a month of minute rows.
+  // The first pass after a start (or a clock that went backwards) starts
+  // from the oldest sample present instead.
+  const wm = g.__opnmeshRollup;
 
   s.transaction(() => {
-    // Everything older than the current minute that is not yet rolled up.
-    const oldestRaw = s.prepare("SELECT MIN(ts) AS t FROM telemetry_5s").get() as { t: number | null };
-    if (oldestRaw.t !== null) {
-      for (let m = Math.floor(oldestRaw.t / MIN) * MIN; m < minuteEnd; m += MIN) {
+    let fromMinute = wm && wm.minute <= minuteEnd ? wm.minute : null;
+    if (fromMinute === null) {
+      const oldestRaw = s.prepare("SELECT MIN(ts) AS t FROM telemetry_5s").get() as { t: number | null };
+      fromMinute = oldestRaw.t === null ? null : Math.floor(oldestRaw.t / MIN) * MIN;
+    }
+    if (fromMinute !== null) {
+      for (let m = fromMinute; m < minuteEnd; m += MIN) {
         const r = s
           .prepare(
             `INSERT OR IGNORE INTO telemetry_1m (ts, gateway_id, peer_key, rx_bps, tx_bps, rtt_ms)
@@ -124,9 +140,13 @@ export function runRollups(at = now()): { minutes: number; hours: number } {
         ).run(m, m, m + MIN);
       }
     }
-    const oldestMin = s.prepare("SELECT MIN(ts) AS t FROM telemetry_1m").get() as { t: number | null };
-    if (oldestMin.t !== null) {
-      for (let h = Math.floor(oldestMin.t / HOUR) * HOUR; h < hourEnd; h += HOUR) {
+    let fromHour = wm && wm.hour <= hourEnd ? wm.hour : null;
+    if (fromHour === null) {
+      const oldestMin = s.prepare("SELECT MIN(ts) AS t FROM telemetry_1m").get() as { t: number | null };
+      fromHour = oldestMin.t === null ? null : Math.floor(oldestMin.t / HOUR) * HOUR;
+    }
+    if (fromHour !== null) {
+      for (let h = fromHour; h < hourEnd; h += HOUR) {
         const r = s
           .prepare(
             `INSERT OR IGNORE INTO telemetry_1h (ts, gateway_id, peer_key, rx_bps, tx_bps, rtt_ms)
@@ -149,6 +169,7 @@ export function runRollups(at = now()): { minutes: number; hours: number } {
     s.prepare("DELETE FROM telemetry_1h WHERE ts < ?").run(at - RETENTION.hour1);
     s.prepare("DELETE FROM pair_1h WHERE ts < ?").run(at - RETENTION.hour1);
   })();
+  g.__opnmeshRollup = { minute: minuteEnd, hour: hourEnd };
 
   return { minutes, hours };
 }

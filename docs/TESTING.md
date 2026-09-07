@@ -9,15 +9,18 @@ containers exactly as on a real VM); in CI it means GitHub's Ubuntu runners.
 
 | Layer | Command | Runs where | Time |
 |---|---|---|---|
+| Typecheck and lint | `npm run typecheck && npm run lint` | host | seconds |
 | Unit (core, server logic) | `npm test` | Node 22 on Ubuntu (`npm run test:ubuntu` wraps it in a container) | seconds |
 | API route handlers | part of `npm test` | same | seconds |
 | Go agent | `npm run agent:test` | `golang` container | seconds |
-| Build (typecheck + next build + agent binaries) | `npm run build:all` | container | ~2 min |
+| Production build + UI smoke | `npm run ui:test` | host or container | ~2 min |
 | Simulation | `npm run sim:up && npm run sim:test` | Docker compose, Ubuntu 24.04 images | ~5–10 min |
-| UI smoke | `npm run ui:test` | container | ~1 min |
+| Deployment smoke | `deploy/controller/install.sh` + `scripts/deploy-smoke.mjs` | CI (a Linux host with Docker) | ~5 min |
 
-`npm run check` runs unit + Go + typecheck; `npm run check:full` adds build,
-UI smoke and the simulation. CI runs `check:full`.
+`npm run check` runs typecheck, lint, unit and Go; `npm run check:full` adds
+the production build, the UI smoke test and the simulation. CI runs all of
+that plus the deployment smoke test, which needs a Linux host where it can
+bind ports and run the real installer.
 
 ## The simulation
 
@@ -55,7 +58,11 @@ Docker's own per-network MASQUERADE rule (applied to bridged frames because
 `bridge-nf-call-iptables` is on) rewrites packets a router has just DNAT-ed,
 so IP masquerade is disabled on every simulation network.
 
-`sim/test/*.test.ts` drives the controller's admin API exactly as the UI does:
+One thing the simulation deliberately does not reproduce: the controller
+runs as root there so it can set its default route. The production image
+runs unprivileged; the deployment smoke test below covers that.
+
+`sim/test/mesh.test.ts` drives the controller's admin API exactly as the UI does:
 
 1. Setup admin, create sites/LANs with their layouts, create enrolment tokens.
 2. Start gateways with those tokens; wait for `active`.
@@ -79,10 +86,36 @@ so IP masquerade is disabled on every simulation network.
 10. Client lifecycle: create, fetch config via one-time invite, bring up in the
    client container, reach every site; disable → handshakes stop; site
    restriction → only allowed site reachable.
-11. UniFi integration against `sim/fake-unifi` (a small Node server
-    implementing the subset of classic + v2 endpoints): link a site, assert the
-    routes created, change topology, assert reconciliation, delete a LAN,
-    assert the managed route is removed and an unmanaged one untouched.
+11. Health checks still pass with the client connected (its /32 route must
+    not capture the router probe for the client range).
+
+The UniFi integration is covered by the unit suite against
+`test/server/fake-unifi.ts`, a small http server implementing the subset of
+classic and v2 endpoints OPNmesh uses: link a site, assert the routes created,
+change the topology, assert reconciliation, delete a LAN, assert the managed
+route is removed and an unmanaged one left alone. Certificate pinning against
+a real console has not been exercised automatically.
+
+## The deployment smoke test
+
+The simulation reaches the controller over plain HTTP as root. The production
+path is different in three ways that have each hidden a bug: Caddy terminates
+TLS with a private CA whose root the controller must be able to read; the
+controller runs as the image's unprivileged user against a bind-mounted data
+directory; and the gateway installer downloads the agent over that TLS. CI
+therefore builds the image, runs the real `deploy/controller/install.sh`
+against it on the runner (with `OPNMESH_RAW_BASE` pointed at the checkout so
+the compose file and Caddyfile come from the branch under test), and then
+`scripts/deploy-smoke.mjs` checks the first-install flow end to end: the CA
+root appears where the compose file expects it, `/api/admin/setup` answers
+over TLS signed by that CA, `/ca.crt` serves the same root, the controller
+process is uid 1000, first-run setup works with the persisted code, the
+install command carries the CA fingerprint, and the agent checksum downloads
+over TLS. It runs against any deployment made by the installer:
+
+```bash
+sudo -E node scripts/deploy-smoke.mjs --dir /opt/opnmesh --url https://<host>
+```
 
 ## Conventions
 
@@ -90,3 +123,5 @@ so IP masquerade is disabled on every simulation network.
 - Golden files in `test/golden/` change only via `npm run goldens:update`
   followed by a reviewed diff.
 - A generator or validator change without a test is rejected in review.
+- Never pipe a test runner through `tail` or `head` when its exit code
+  matters: the pipe returns the pager's status and buffers the output.

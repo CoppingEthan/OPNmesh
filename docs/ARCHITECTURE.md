@@ -108,7 +108,7 @@ Plus one thing OPNmesh does **not** run but must cooperate with:
    last known good configuration if the controller disappears.
 8. **Tested on Ubuntu, always.** Every layer has automated tests that run inside
    Ubuntu 24.04 containers with kernel WireGuard, including a full simulated
-   three-site network with routers, so behaviour on a real Ubuntu VM is what
+   four-site network with routers, so behaviour on a real Ubuntu VM is what
    was tested, not what was assumed.
 
 ## 3. Components
@@ -378,8 +378,11 @@ and the only place NAT exists in OPNmesh.
 
 A site that accepts tunnels needs one UDP port (default 51820) forwarded from
 the router's WAN to the VM. A site with a dynamic public IP uses a DDNS
-hostname as its endpoint; the agent re-resolves peer hostnames periodically
-because WireGuard resolves them only once.
+hostname as its endpoint. WireGuard resolves a name only once, when the peer
+is set, so the agent re-applies a peer's hostname endpoint whenever that
+peer's handshake is more than 135 seconds old (at most every 30 seconds per
+peer), the same remedy as wg-quick's reresolve-dns script. A site whose
+public address changes is back within a few minutes with nobody involved.
 
 ### 7.5 UniFi automation
 
@@ -408,16 +411,19 @@ names are for humans and may change freely.
 settings          singleton: network_name, gateway_cidr (10.99.0.0/24),
                   client_cidr (10.99.1.0/24), listen_port (51820), mtu (1420),
                   keepalive (25), interface_name (opnmesh0), telemetry_interval_s (5),
-                  public_url, config_version (monotonic), setup_complete
-users             id, email, password_hash (argon2id), created_at, totp_secret_enc?
+                  public_url, config_version (monotonic), setup_complete,
+                  smtp_host, smtp_port, smtp_secure, smtp_user, smtp_pass_enc,
+                  smtp_from, alert_to
+users             id, email, password_hash (argon2id), created_at
 sessions          id (hash), user_id, created_at, last_seen_at, expires_at
 sites             id, name, slug, notes, router_layout (transit|same_lan|masquerade),
-                  hub_priority, dns_server?, dns_domain?, created_at
+                  hub_priority, dns_server?, dns_domain?, alert_email, created_at
 lans              id, site_id, cidr, name, vlan?, shared (bool), sort
 gateways          id, site_id, name, hostname, public_key, tunnel_ip, lan_ip,
                   endpoint_host?, listen_port?, mtu?, token_hash, status
                   (pending|active|disabled), enrolled_at, approved_at, last_seen_at,
-                  agent_version, os, arch, last_error, applied_version, disk_hash
+                  agent_version, os, arch, addresses (json), last_error, applied_hash,
+                  disk_hash, alert_state, diag_requested_at?, diag_at?, diag_json?
 enrol_tokens      id, site_id, token_hash, auto_approve, expires_at, used_at,
                   created_by
 clients           id, name, owner?, tunnel_ip, public_key, private_key_enc,
@@ -432,7 +438,9 @@ telemetry_5s      ts, gateway_id, peer_key, rx_bytes, tx_bytes, handshake_age_s,
                   rtt_ms?   (raw samples, kept 2 hours)
 telemetry_1m      ts, gateway_id, peer_key, rx_bps, tx_bps, rtt_ms  (kept 30 days)
 telemetry_1h      ts, gateway_id, peer_key, rx_bps, tx_bps, rtt_ms  (kept 2 years)
-pair_counters     ts, gateway_id, from_site_id, to_site_id, bytes, packets
+pair_5s/1m/1h     ts, gateway_id, from_slug, to_slug, bps (+ bytes on pair_5s): routed
+                  site-to-site traffic from the nftables counters, same retention
+                  as the telemetry tables
 events            ts, actor, kind, subject, message, detail (json)
 ```
 
@@ -582,8 +590,15 @@ Apply rules (from v1, kept because they were right):
   new port can be bound.
 - Before overwriting, the previous files are kept as `*.prev`; `opnmesh-gw
   rollback` restores them offline.
-- A config that fails to apply is reported with the error; the agent keeps
-  polling and retries when the version changes again.
+- A change that needs a restart and fails is rolled back on the spot: the
+  previous files come back and the tunnel is brought up from them, the error
+  is reported to the controller, and that configuration is not tried again
+  for five minutes unless the controller changes it. A change applied with
+  `wg syncconf` that fails leaves the running interface as it was.
+- Every tick, before talking to the controller, the agent brings the
+  interface up from disk if it is missing (a boot before DNS was ready, a
+  manual `wg-quick down`), restores a lost private key, and re-resolves
+  stale hostname endpoints (§7.4).
 
 ## 11. Real-time traffic and the dashboard
 
@@ -776,7 +791,20 @@ Caddy terminates TLS. With `OPNMESH_DOMAIN` set it obtains Let's Encrypt
 certificates; agents verify with system roots. Without a domain Caddy runs a
 private CA; the install one-liner carries the CA fingerprint, the installer
 downloads the root, checks the fingerprint, and the agent trusts *only* that
-root from then on. A swapped certificate is refused. Plain HTTP is allowed only
+root from then on. A swapped certificate is refused. Caddy only picks its
+internal CA by itself for IP addresses and a few reserved suffixes, so the
+controller installer sets `tls internal` explicitly whenever no public
+domain is given; a private hostname works the same way as an address. Caddy
+keeps the CA root file root-only; the compose file makes just that one file
+readable so the controller (which runs unprivileged) can serve it at
+`/ca.crt` and print its fingerprint into install commands.
+One more Docker detail: a client that connects to an IP address sends no
+server name, and Caddy then looks for a certificate matching the
+connection's local address, which behind Docker's port forwarding is the
+container's internal IP rather than the site's. The Caddyfile sets
+`default_sni` to the site so such connections are served the site's
+certificate; without it every IP-address deployment failed the TLS
+handshake from outside the container. Plain HTTP is allowed only
 with `OPNMESH_INSECURE_HTTP=1`, which exists for the simulation.
 
 ### 12.3 Admin authentication
@@ -789,8 +817,8 @@ globally; `X-Forwarded-For` is trusted only from Caddy. TOTP is planned for
 
 ### 12.4 Secrets at rest
 
-`OPNMESH_SECRET` (generated by the controller installer, stored in the data
-volume) derives the key that encrypts client private keys, pre-shared keys
+The sealing secret (`OPNMESH_SECRET`, or `secret.key`, which the controller
+generates on first start and keeps in the data volume) derives the key that encrypts client private keys, pre-shared keys
 and UniFi credentials (AES-256-GCM, per-row nonce). Gateway private keys are
 never on the controller. A database backup is useless without the secret; the
 backup page says so.
@@ -817,10 +845,12 @@ curl -fsSL https://raw.githubusercontent.com/CoppingEthan/OPNmesh/main/deploy/co
 ```
 
 On any Ubuntu 22.04/24.04 with Docker, this creates `/opt/opnmesh/` with a
-`docker-compose.yml`, `.env` (generated secret, chosen ports, optional domain),
+`docker-compose.yml`, `.env` (site name, public URL, ports, TLS mode),
 starts Caddy + the controller, and prints the URL and one-time setup code.
-Upgrading is `docker compose pull && docker compose up -d`. Backup is the
-`/opt/opnmesh/data` directory plus `.env`.
+The data directory is owned by uid 1000, the unprivileged user the image runs
+as. Upgrading is `docker compose pull && docker compose up -d`. Backup is the
+`/opt/opnmesh/data` directory (or the database download in Settings, which
+is consistent while the controller runs) plus `.env`.
 
 Where to run it: the recommended place is a small VM at the primary site
 (the datacentre), with the router forwarding TCP 443 to it so gateways at
@@ -860,7 +890,8 @@ opnmesh/
   LICENSE                       MIT
   package.json                  Next.js app + tooling
   app/                          Next.js App Router: pages, layouts, route handlers
-    (ui)/…                      dashboard, sites, clients, traffic, events, settings, setup, login
+    (app)/…                     dashboard, sites, clients, traffic, events, settings
+    (public)/…                  setup, login, invite pickup
     api/admin/…                 admin route handlers (+ /api/admin/live SSE)
     api/agent/…                 enrol, config, telemetry
     install.sh/route.ts         installer served with the controller URL baked in
@@ -881,8 +912,9 @@ opnmesh/
   agent/                        Go: opnmesh-gw (go.mod, main.go, …, *_test.go)
   deploy/
     controller/                 install.sh, docker-compose.yml, Caddyfile, .env.example
-    gateway/                    systemd units, install.sh template
-  sim/                          docker compose simulation: 3 sites with routers, hosts, client
+    gateway/                    install.sh (the systemd units are embedded in it)
+  scripts/                      agent build/test in Docker, sim driver, UI and deployment smoke tests
+  sim/                          docker compose simulation: 4 sites with routers, hosts, client
   test/                         vitest unit + integration suites, golden files
   .github/workflows/            ci.yml (unit, go, sim), release.yml (image + binaries)
   Dockerfile                    multi-stage: builds agent binaries and the Next.js app
@@ -907,21 +939,28 @@ WireGuard built in. Full detail in [TESTING.md](TESTING.md).
    config ETag flow, telemetry ingest, invite pickup.
 4. **Agent (Go)** — parsers, hook validation, diff/apply decisions, telemetry
    collection against recorded `wg show dump` output.
-5. **Simulation** — `sim/docker-compose.yml`: three sites, each an Ubuntu
+5. **Simulation** — `sim/docker-compose.yml`: four sites, each an Ubuntu
    router container (ip_forward, conntrack firewall mimicking UniFi's
    defaults, port-forward/NAT) plus a gateway container running the real agent
    binary plus a LAN host; a roaming client on the WAN; the real controller
    image. Site A uses the transit layout, site B same-LAN, site C
-   outbound-only behind NAT with masquerade. The integration suite drives the
+   outbound-only behind NAT with masquerade, site D transit and outbound-only
+   (so C and D relay through A). The integration suite drives the
    real admin API to build the network and asserts: hosts ping each other by
    real address across every pair, TCP transfers succeed (iperf3), the client
    reaches every site, source addresses survive (except at C, by design), a
    gateway restart keeps the others up, killing the controller changes nothing,
    an approved config change lands within 15 s, the dashboard's live stream
    reports the traffic the test generated.
-6. **UI smoke** — build the app and load every page with a session.
-7. **CI** — every push runs 1–4 and 6 in minutes and 5 in about ten minutes;
-   a release tag builds the multi-arch image and the agent binaries.
+6. **UI smoke** — build the app and load every page with a session, against
+   the standalone server the image runs.
+7. **Deployment smoke** — build the image, run the real controller installer
+   against it on the CI runner (private CA, unprivileged container, bind-
+   mounted data directory), and check the first-install flow end to end:
+   TLS with the CA Caddy issued, `/ca.crt`, first-run setup, an install
+   command carrying the CA fingerprint, the agent download over TLS.
+8. **CI** — every push runs 1–4, 6 and 7 in minutes and 5 in about ten
+   minutes; a release tag builds the multi-arch image and the agent binaries.
 
 ## 16. What changed from v1 and why
 
@@ -935,7 +974,7 @@ hard to deploy. v2 keeps the ideas and removes the weight:
 | Config in `sites.yml`, edited via UI, committed to a local git repo | SQLite, edited via UI, audit log in a table | One less concept; no YAML/git failure modes; proper relational integrity. |
 | Two processes (dev control server + Next.js UI) sharing files | One Next.js process with route handlers | Half the code, one port, one log. |
 | Prometheus + Alertmanager + Grafana + mailpit for observability | Built-in telemetry, rollups and charts in SQLite; optional `/metrics` | The dashboard is the product; the stack was four extra services to run. |
-| Minisign-signed self-updates with A/B installs, commit-confirm, boot watchdog | Agent is updated by re-running the installer (or `opnmesh-gw upgrade`, which downloads from the controller and verifies SHA-256) | The failsafe machinery was more code than the rest of the agent and solved a problem small fleets do not have. |
+| Minisign-signed self-updates with A/B installs, commit-confirm, boot watchdog | Agent is updated by re-running the installer, which downloads the binary from the controller and verifies its SHA-256 | The failsafe machinery was more code than the rest of the agent and solved a problem small fleets do not have. |
 | Coordinated mesh-wide port-change transaction | Change port; agents apply on next tick; UI shows which have not | Simpler mental model; a failed change is visible and reversible in the same place. |
 | Full-mesh / multi-hub / single-hub as an explicit topology setting | Derived automatically from which sites are reachable, plus a hub priority list | Zero-config topology; the setting existed to describe a fact the data already knew. |
 | Client private keys never on the controller (placeholder in config) | Generated and stored encrypted; QR is complete and re-showable | Admins send QR codes; that requires the key. |

@@ -1,8 +1,8 @@
 /**
  * Drizzle schema — the typed view of the SQLite database. The SQL that creates
  * these tables lives in migrations.ts and is applied by the versioned migrator
- * at startup; keep the two in step (test/server/db.test.ts exercises every
- * table through this schema so drift fails loudly).
+ * at startup; keep the two in step (test/server/repos.test.ts and the API
+ * tests exercise every table through this schema, so drift fails loudly).
  *
  * Timestamps are integer milliseconds since the epoch. JSON columns are text.
  */

@@ -5,9 +5,13 @@
  * as a signed-in admin, checking each renders its key content.
  *
  *   npm run build && node scripts/ui-smoke.mjs
+ *
+ * With --standalone it runs .next/standalone/server.js instead of `next
+ * start` (after copying static assets, public/ and the gateway installer
+ * beside it, as the Dockerfile does), so CI exercises what the image runs.
  */
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,10 +19,17 @@ const PORT = 3123;
 const BASE = `http://127.0.0.1:${PORT}`;
 const dataDir = mkdtempSync(join(tmpdir(), "opnmesh-smoke-"));
 
-const server = spawn(process.execPath, ["node_modules/next/dist/bin/next", "start", "-p", String(PORT)], {
-  env: { ...process.env, OPNMESH_DATA_DIR: dataDir, OPNMESH_PUBLIC_URL: BASE, OPNMESH_INSECURE_HTTP: "1", NODE_ENV: "production" },
-  stdio: ["ignore", "pipe", "pipe"],
-});
+const standalone = process.argv.includes("--standalone");
+if (standalone) {
+  cpSync(".next/static", ".next/standalone/.next/static", { recursive: true });
+  cpSync("public", ".next/standalone/public", { recursive: true });
+  mkdirSync(".next/standalone/deploy/gateway", { recursive: true });
+  cpSync("deploy/gateway/install.sh", ".next/standalone/deploy/gateway/install.sh");
+}
+const env = { ...process.env, OPNMESH_DATA_DIR: dataDir, OPNMESH_PUBLIC_URL: BASE, OPNMESH_INSECURE_HTTP: "1", NODE_ENV: "production" };
+const server = standalone
+  ? spawn(process.execPath, [".next/standalone/server.js"], { env: { ...env, PORT: String(PORT), HOSTNAME: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"] })
+  : spawn(process.execPath, ["node_modules/next/dist/bin/next", "start", "-p", String(PORT)], { env, stdio: ["ignore", "pipe", "pipe"] });
 let log = "";
 server.stdout.on("data", (d) => (log += d));
 server.stderr.on("data", (d) => (log += d));

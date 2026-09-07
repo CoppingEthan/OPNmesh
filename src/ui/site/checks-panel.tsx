@@ -58,8 +58,21 @@ export function ChecksPanel({ site }: { site: SiteState }) {
   }, [site.id]);
 
   useEffect(() => {
-    if (hasGateway) void load();
-  }, [hasGateway, load]);
+    if (!hasGateway) return;
+    let cancelled = false;
+    apiFetch<SiteDiagnostics>("GET", `/api/admin/sites/${site.id}/diagnostics`)
+      .then((d) => {
+        if (cancelled) return;
+        setDiag(d);
+        setError(null);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [hasGateway, site.id]);
 
   // While the gateway is working on a request, poll for its answer.
   useEffect(() => {

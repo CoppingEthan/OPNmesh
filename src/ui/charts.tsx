@@ -158,14 +158,24 @@ export function LineChart({ series, height = 180, formatValue, from, to, classNa
   // because a scaled plot would contradict the numbers down the side.
   const smoothScale = !yAxis;
   const dataMax = useMemo(() => Math.max(0, ...series.flatMap((s) => s.points.map((p) => p.v))), [series]);
-  const targetMax = useRef(niceMax(dataMax));
   const nice = niceMax(dataMax);
-  if (!smoothScale || nice > targetMax.current || dataMax < targetMax.current * 0.5) targetMax.current = nice;
-  const [renderedMax, setRenderedMax] = useState(targetMax.current);
-  const animMax = useRef(targetMax.current);
-  const renderedMaxRef = useRef(renderedMax);
-  renderedMaxRef.current = smoothScale ? renderedMax : targetMax.current;
-  const maxV = renderedMaxRef.current;
+  // The scale's hysteresis is state derived from the data during render (the
+  // sanctioned way to adjust state when inputs change): it grows at once and
+  // shrinks only once the data has dropped well clear.
+  const [scaleMax, setScaleMax] = useState(nice);
+  const targetMaxValue = !smoothScale || nice > scaleMax || dataMax < scaleMax * 0.5 ? nice : scaleMax;
+  if (targetMaxValue !== scaleMax) setScaleMax(targetMaxValue);
+  const [renderedMax, setRenderedMax] = useState(nice);
+  const maxV = smoothScale ? renderedMax : targetMaxValue;
+  // Mirrors for the animation loop, which runs outside render. A layout
+  // effect keeps them current before the first frame is applied.
+  const targetMax = useRef(targetMaxValue);
+  const animMax = useRef(targetMaxValue);
+  const renderedMaxRef = useRef(maxV);
+  useLayoutEffect(() => {
+    targetMax.current = targetMaxValue;
+    renderedMaxRef.current = maxV;
+  }, [targetMaxValue, maxV]);
   const x = (ts: number) => PAD.l + ((ts - from) / span) * innerW;
   const y = (v: number) => PAD.t + innerH - (v / maxV) * innerH;
   const baseline = PAD.t + innerH;

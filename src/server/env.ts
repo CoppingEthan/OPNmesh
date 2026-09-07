@@ -48,5 +48,9 @@ export function setEnvForTests(partial: Partial<Env>): void {
 
 export const now = (): number => Date.now();
 
-/** Controller version, shown in the status bar and reported in events. */
-export const APP_VERSION = "2.0.0-dev";
+/**
+ * Controller version, shown in the status bar. The image build sets
+ * OPNMESH_VERSION from the release tag; a development checkout shows the
+ * placeholder.
+ */
+export const APP_VERSION = process.env["OPNMESH_VERSION"]?.trim() || "2.0.0-dev";

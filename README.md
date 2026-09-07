@@ -38,9 +38,13 @@ forwarded port; the datacentre is a good place):
 curl -fsSL https://raw.githubusercontent.com/CoppingEthan/OPNmesh/main/deploy/controller/install.sh | sudo bash -s -- --domain mesh.example.com
 ```
 
-Omit `--domain` to use a private certificate authority instead of Let's
-Encrypt. The script prints the URL and a one-time setup code; open the URL,
-enter the code, and create the admin account.
+With `--domain`, Caddy obtains Let's Encrypt certificates (ports 80 and 443
+must be reachable from the internet). Omit it to use a private certificate
+authority instead: the controller is then reached by its IP address (or pass
+`--url https://mesh.lan` for a private name), and every gateway install
+command carries the CA fingerprint so the installer verifies what it
+downloads before trusting it. The script prints the URL and a one-time setup
+code; open the URL, enter the code, and create the admin account.
 
 **Gateways**: in the UI, add a site, then click *Generate install command*
 and paste it into an Ubuntu VM at that site:
@@ -55,6 +59,37 @@ them).
 
 **Clients**: add a client, then scan the QR code, download the `.conf`, or
 send the person a one-time link.
+
+## Running it
+
+- **Where things live**: `/opt/opnmesh` holds `docker-compose.yml`, the
+  `Caddyfile`, `.env` (site name, public URL, ports, TLS mode) and two
+  directories: `data` (the SQLite database and `secret.key`, owned by uid
+  1000, the unprivileged user the image runs as) and `caddy` (certificates).
+- **Upgrades**: `cd /opt/opnmesh && docker compose pull && docker compose up -d`.
+  Gateways are upgraded by re-running their install command; the binary comes
+  from the controller and is checked against its SHA-256.
+- **Backups**: back up `data` as a whole. `secret.key` encrypts the client
+  private keys stored in the database, so neither file is useful without the
+  other. *Settings → Download database backup* gives a consistent copy while
+  the controller runs (copying the file by hand can miss recent writes); keep
+  it with a copy of `secret.key`.
+- **Public address**: install commands, invite links and alert emails use
+  `OPNMESH_PUBLIC_URL` from `.env`; *Settings → Public URL* overrides it
+  without a restart, for instance when the controller gains a proper name.
+- **Lost admin password**: there is one admin account and no reset email.
+  Remove it and run first-run setup again with the setup code the controller
+  keeps in its data directory:
+
+  ```bash
+  cd /opt/opnmesh
+  docker compose exec controller node -e "require('better-sqlite3')('/data/opnmesh.db').exec('DELETE FROM users')"
+  sudo cat data/setup-code      # then open https://<controller>/setup
+  ```
+
+- **Logs**: `docker compose logs -f controller` on the controller;
+  `journalctl -u opnmesh-gw -f` on a gateway. Every change and every gateway
+  event is also in the *Events* page.
 
 ## What you get
 
@@ -77,8 +112,10 @@ send the person a one-time link.
 - **Three router layouts** per site: transit VLAN (recommended), same LAN,
   or no router changes at all (masquerade).
 - **Safety**: gateways hold their last good configuration when the
-  controller is unreachable, refuse anything that would run commands, and
-  come up from disk at boot.
+  controller is unreachable, roll back on the spot if a change fails to come
+  up, refuse anything that would run commands, come up from disk at boot,
+  and re-resolve dynamic DNS endpoints so a site whose public address changes
+  rejoins on its own.
 
 ## Development
 
@@ -87,6 +124,7 @@ npm install
 npm run dev              # http://localhost:3000 (setup code is printed in the terminal)
 npm test                 # unit + API tests
 npm run typecheck
+npm run lint
 npm run agent:test       # Go agent tests (in Docker)
 npm run agent:build      # agent binaries into agent/bin
 npm run ui:test          # production build + page smoke test
@@ -97,7 +135,8 @@ npm run sim:down
 
 Requires Node 22 and Docker (Docker Desktop is fine: its kernel has
 WireGuard). Everything is tested on Ubuntu, in containers locally and on
-GitHub's runners in CI. See [docs/TESTING.md](docs/TESTING.md).
+GitHub's runners in CI, including a deployment smoke test that runs the real
+controller installer. See [docs/TESTING.md](docs/TESTING.md).
 
 ## Repository map
 
@@ -109,9 +148,12 @@ GitHub's runners in CI. See [docs/TESTING.md](docs/TESTING.md).
 | `src/ui/` | React components, the live map, charts |
 | `agent/` | The Go gateway agent (`opnmesh-gw`) |
 | `deploy/` | Controller installer + compose + Caddyfile; gateway installer |
+| `scripts/` | Agent build and tests in Docker, simulation driver, UI and deployment smoke tests |
 | `sim/` | The four-site Docker simulation and its integration suite |
 | `docs/` | Architecture, routers/UniFi, testing, prior art |
 
 ## License
 
-MIT.
+MIT. The dashboard wallpaper is a gradient photograph from
+[Unsplash](https://unsplash.com/photos/rcVkESi_JTQ), used under the Unsplash
+License.

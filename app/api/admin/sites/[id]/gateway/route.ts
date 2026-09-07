@@ -1,8 +1,6 @@
 import { z } from "zod";
 import { json, parseBody, withAdmin } from "@/server/http";
 import { removeGateway, updateGateway } from "@/server/sites";
-import { liveState } from "@/server/live";
-import { getSite } from "@/server/sites";
 
 export const dynamic = "force-dynamic";
 
@@ -23,8 +21,6 @@ export const PATCH = withAdmin<P>(async (req, { params, admin }) => {
 });
 
 export const DELETE = withAdmin<P>(async (_req, { params, admin }) => {
-  const site = getSite(params.id);
-  if (site?.gateway) liveState().forget(site.gateway.id);
   removeGateway(params.id, admin.email);
   return json({ ok: true });
 });

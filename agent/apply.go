@@ -128,16 +128,22 @@ func applyConfig(cfg Config, desired *ConfigResponse) error {
 	wgPath := realPath(cfg, iface, "wireguard.conf")
 	keyPath := privateKeyPathOf(wgConf)
 	if restart {
-		if ifaceChanged && wgInterfaceExists(oldIface) {
-			_, _ = runCmd("ip", "link", "del", oldIface)
-		} else if wgInterfaceExists(iface) {
-			_, _ = runCmd("ip", "link", "del", iface)
-		}
-		if err := wgQuickUp(wgPath); err != nil {
-			return err
-		}
-		if err := ensurePrivateKey(iface, keyPath); err != nil {
-			return err
+		if err := restartInterface(iface, oldIface, ifaceChanged, wgPath, keyPath); err != nil {
+			if ifaceChanged {
+				return err
+			}
+			// The old interface is gone and the new one did not come up. Put
+			// the previous files back and bring them up, so a bad change costs
+			// seconds rather than an outage until someone logs in. The run
+			// loop reports the error and waits before trying this hash again.
+			n, rbErr := restorePrevious(cfg, iface)
+			if rbErr != nil || n == 0 {
+				return err
+			}
+			if upErr := applyFromDisk(cfg); upErr != nil {
+				return fmt.Errorf("%v; restoring the previous configuration failed too: %v", err, upErr)
+			}
+			return fmt.Errorf("%v; rolled back to the previous configuration, which is running again", err)
 		}
 	} else {
 		if err := wgSyncPeers(iface, wgPath, keyPath); err != nil {
@@ -255,16 +261,54 @@ func applyFromDisk(cfg Config) error {
 	return nil
 }
 
-// healKey is called on every loop tick: if the interface is up but has no
-// private key (a manual `wg setconf`, a bug, anything), put it back.
-func healKey(cfg Config) {
+// restartInterface replaces the running interface with one built from the
+// new file: the only way to change the [Interface] section.
+func restartInterface(iface, oldIface string, ifaceChanged bool, wgPath, keyPath string) error {
+	if ifaceChanged && wgInterfaceExists(oldIface) {
+		_, _ = runCmd("ip", "link", "del", oldIface)
+	} else if wgInterfaceExists(iface) {
+		_, _ = runCmd("ip", "link", "del", iface)
+	}
+	if err := wgQuickUp(wgPath); err != nil {
+		return err
+	}
+	return ensurePrivateKey(iface, keyPath)
+}
+
+// How long the run loop leaves a configuration alone after it failed to
+// apply here, unless the controller changes it in the meantime.
+const applyRetryAfter = 5 * time.Minute
+
+// How often maintainTunnel retries bringing a missing interface up.
+const bringUpEvery = 30 * time.Second
+
+// maintainTunnel runs on every tick, controller or no controller: it brings
+// the interface up from disk when it is missing (a boot-time bring-up that
+// failed because DNS was not ready, a manual `wg-quick down`, anything),
+// restores a lost private key, and re-resolves stale hostname endpoints so a
+// site whose public address changed comes back on its own.
+func maintainTunnel(cfg Config, rr *reresolver, lastBringUp *time.Time) {
 	meta := cfg.loadMeta()
 	files := diskFiles(cfg, meta.Interface)
-	if wg, ok := files["wireguard.conf"]; ok {
-		if err := ensurePrivateKey(meta.Interface, privateKeyPathOf(wg)); err != nil {
-			log.Printf("restore private key: %v", err)
-		}
+	wg, ok := files["wireguard.conf"]
+	if !ok {
+		return
 	}
+	if !wgInterfaceExists(meta.Interface) {
+		if time.Since(*lastBringUp) < bringUpEvery {
+			return
+		}
+		*lastBringUp = time.Now()
+		if err := applyFromDisk(cfg); err != nil {
+			log.Printf("bring-up from disk: %v", err)
+			return
+		}
+		log.Printf("brought %s up from the files on disk", meta.Interface)
+	}
+	if err := ensurePrivateKey(meta.Interface, privateKeyPathOf(wg)); err != nil {
+		log.Printf("restore private key: %v", err)
+	}
+	rr.run(meta.Interface, wg)
 }
 
 func tearDown(cfg Config) error {
@@ -283,9 +327,9 @@ func tearDown(cfg Config) error {
 	return firstErr
 }
 
-func rollback(cfg Config) error {
-	meta := cfg.loadMeta()
-	iface := meta.Interface
+// restorePrevious swaps every managed file with its .prev copy and reports
+// how many were swapped. Nothing is applied; callers bring the result up.
+func restorePrevious(cfg Config, iface string) (int, error) {
 	restored := 0
 	for _, name := range ManagedFiles {
 		p := realPath(cfg, iface, name)
@@ -295,10 +339,20 @@ func rollback(cfg Config) error {
 		}
 		cur, _ := os.ReadFile(p)
 		if err := writeFileAtomic(p, prev, 0o600); err != nil {
-			return err
+			return restored, err
 		}
 		_ = writeFileAtomic(p+".prev", cur, 0o600)
 		restored++
+	}
+	return restored, nil
+}
+
+func rollback(cfg Config) error {
+	meta := cfg.loadMeta()
+	iface := meta.Interface
+	restored, err := restorePrevious(cfg, iface)
+	if err != nil {
+		return err
 	}
 	if restored == 0 {
 		return errors.New("nothing to roll back to (no .prev files)")

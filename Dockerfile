@@ -40,7 +40,8 @@ LABEL org.opencontainers.image.title="OPNmesh" \
       org.opencontainers.image.licenses="MIT"
 WORKDIR /app
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 \
-    OPNMESH_DATA_DIR=/data PORT=3000 HOSTNAME=0.0.0.0
+    OPNMESH_DATA_DIR=/data PORT=3000 HOSTNAME=0.0.0.0 \
+    OPNMESH_VERSION=${VERSION}
 # iproute2: lets an operator (or the simulation) inspect and adjust routes.
 RUN apt-get update -qq && apt-get install -qq -y --no-install-recommends iproute2 ca-certificates \
     && rm -rf /var/lib/apt/lists/*

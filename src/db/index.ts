@@ -1,7 +1,7 @@
 /**
  * Database handle. One connection per process (cached on globalThis so
  * Next.js dev-mode module reloads do not leak handles). Tests open their own
- * with openDatabase(":memory:") or a temp path.
+ * with openDatabase(":memory:") and install it with installDatabaseForTests.
  */
 import Database from "better-sqlite3";
 import { drizzle, type BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
@@ -49,7 +49,7 @@ export function getDb(): Db {
 }
 
 /** Tests: point the process-wide handle at a fresh database. */
-export function useDatabase(db: Db, path = ":test:"): void {
+export function installDatabaseForTests(db: Db, path = ":test:"): void {
   g.__opnmeshDb = db;
   g.__opnmeshDbPath = path;
   process.env["OPNMESH_DB_PATH"] = path;

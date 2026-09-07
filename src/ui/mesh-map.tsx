@@ -9,7 +9,7 @@
  * Colour is reserved for problems.
  */
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { StatePayload, SiteState } from "@/server/state";
 import type { TunnelView } from "@/server/status";
 import { formatBits, formatMs } from "./format";
@@ -74,16 +74,25 @@ function toneOf(site: SiteState): "good" | "warn" | "bad" | "idle" {
 
 const STROKE: Record<string, string> = { good: "var(--good)", warn: "var(--warn)", bad: "var(--bad)", idle: "var(--idle)" };
 
+/** A store that never changes: "mounted" is false on the server and true in the browser. */
+const subscribeNever = () => () => {};
+
 export function MeshMap({ state, height = 560 }: { state: StatePayload; height?: number }) {
   const sites = useMemo(() => [...state.sites].sort((a, b) => a.hubPriority - b.hubPriority || a.name.localeCompare(b.name)), [state.sites]);
   const pos = useMemo(() => layout(sites), [sites]);
   const byId = useMemo(() => new Map(sites.map((s) => [s.id, s])), [sites]);
   const [hoverLink, setHoverLink] = useState<TunnelView | null>(null);
   const [hoverSite, setHoverSite] = useState<SiteState | null>(null);
+  // The animation loop reads these each frame; they are mirrored by effects
+  // so render stays free of ref access.
   const tunnelsRef = useRef(state.tunnels);
-  tunnelsRef.current = state.tunnels;
   const hoverKey = useRef<string | null>(null);
-  hoverKey.current = hoverLink ? `${hoverLink.a}|${hoverLink.b}` : null;
+  useEffect(() => {
+    tunnelsRef.current = state.tunnels;
+  }, [state.tunnels]);
+  useEffect(() => {
+    hoverKey.current = hoverLink ? `${hoverLink.a}|${hoverLink.b}` : null;
+  }, [hoverLink]);
   /** Eased weight per link, written straight to the line elements. */
   const shown = useRef<Map<string, number>>(new Map());
   const lineRefs = useRef<Map<string, SVGLineElement>>(new Map());
@@ -119,8 +128,11 @@ export function MeshMap({ state, height = 560 }: { state: StatePayload; height?:
   // React 19 treats <title> as document metadata and hoists it, which makes an
   // SVG <title> disagree between the server's markup and the client's. Render
   // the native tooltip only after mount, so hydration has nothing to reconcile.
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => setMounted(true), []);
+  const mounted = useSyncExternalStore(
+    subscribeNever,
+    () => true,
+    () => false,
+  );
 
   return (
     <div className="relative">
