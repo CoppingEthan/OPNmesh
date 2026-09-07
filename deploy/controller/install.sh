@@ -48,6 +48,14 @@ done
 [ "$(id -u)" = "0" ] || { echo "run as root (sudo)" >&2; exit 2; }
 log() { printf '\033[1;32m[opnmesh]\033[0m %s\n' "$*"; }
 
+# Read one value out of .env without executing the file. Sourcing it would run
+# any value that contains a space (OPNMESH_TLS="tls internal") as a command,
+# and .env is read back here both after writing it and when this script is
+# re-run against an install that already has one.
+env_value() {
+  { sed -n "s/^$1=//p" .env 2>/dev/null || true; } | tail -1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+
 # Docker -------------------------------------------------------------------
 if ! command -v docker >/dev/null 2>&1; then
   log "installing Docker"
@@ -88,7 +96,9 @@ if [ ! -f .env ]; then
   {
     echo "OPNMESH_SITE=$SITE"
     echo "OPNMESH_PUBLIC_URL=$URL"
-    echo "OPNMESH_TLS=$TLS"
+    # Quoted because the value contains a space. Compose strips the quotes;
+    # without them any shell reading this file would try to run "internal".
+    echo "OPNMESH_TLS=\"$TLS\""
     echo "OPNMESH_HTTP_PORT=$HTTP_PORT"
     echo "OPNMESH_HTTPS_PORT=$HTTPS_PORT"
     echo "OPNMESH_IMAGE=$IMAGE"
@@ -102,18 +112,19 @@ if [ "$START" = "1" ]; then
   log "starting OPNmesh"
   docker compose pull -q --ignore-pull-failures
   docker compose up -d
-  . ./.env
+  PUBLIC_URL="$(env_value OPNMESH_PUBLIC_URL)"
+  TLS_MODE="$(env_value OPNMESH_TLS)"
   # The controller writes its setup code, and Caddy its CA root, within seconds.
   CA=caddy/caddy/pki/authorities/local/root.crt
   ready() {
     [ -f data/setup-code ] || return 1
-    if [ -n "${OPNMESH_TLS:-}" ]; then [ -f "$CA" ] || return 1; fi
+    if [ -n "$TLS_MODE" ]; then [ -f "$CA" ] || return 1; fi
     return 0
   }
   n=0
   while [ $n -lt 30 ] && ! ready; do sleep 1; n=$((n + 1)); done
   echo
-  log "OPNmesh is starting at ${OPNMESH_PUBLIC_URL}"
+  log "OPNmesh is starting at $PUBLIC_URL"
   log "first-run setup code (also in: docker compose logs controller):"
   if [ -f data/setup-code ]; then
     log "  $(cat data/setup-code)"
