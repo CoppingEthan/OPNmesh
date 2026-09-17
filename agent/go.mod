@@ -1,7 +1,7 @@
 module github.com/CoppingEthan/opnmesh/agent
 
-go 1.24
+go 1.27.0
 
-require golang.org/x/net v0.41.0
+require golang.org/x/net v0.59.0
 
-require golang.org/x/sys v0.33.0 // indirect
+require golang.org/x/sys v0.48.0 // indirect

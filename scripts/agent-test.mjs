@@ -17,7 +17,7 @@ const r = spawnSync(
     "/src",
     "-e",
     "GOFLAGS=-mod=mod",
-    "golang:1.24",
+    "golang:1.27",
     "sh",
     "-c",
     `go mod tidy && test -z "$(gofmt -l .)" || { echo 'gofmt: files need formatting:'; gofmt -l .; exit 1; }; go vet ./... && go test ./... ${extra}`,

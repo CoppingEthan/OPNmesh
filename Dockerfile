@@ -8,7 +8,7 @@
 ARG VERSION=2.0.0-dev
 
 # --- agent -------------------------------------------------------------------
-FROM golang:1.24 AS agent
+FROM golang:1.27 AS agent
 ARG VERSION
 WORKDIR /src
 COPY agent/go.mod agent/go.sum* ./
