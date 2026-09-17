@@ -33,3 +33,10 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+networks:
+  default:
+    driver_opts:
+      # opnmesh-backend-firewall filters by this name, which also catches
+      # hosts that route straight to the container's address.
+      com.docker.network.bridge.name: opnmesh-br
