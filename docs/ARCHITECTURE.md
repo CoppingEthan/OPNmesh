@@ -827,9 +827,12 @@ problems-first, with passed checks folded away.
 
 Caddy terminates TLS. With `OPNMESH_DOMAIN` set it obtains Let's Encrypt
 certificates; agents verify with system roots. Without a domain Caddy runs a
-private CA; the install one-liner carries the CA fingerprint, the installer
-downloads the root, checks the fingerprint, and the agent trusts *only* that
-root from then on. A swapped certificate is refused. Caddy only picks its
+private CA. The install one-liner carries the CA fingerprint: the SHA-256
+of the root certificate, the same value a browser shows for it. The
+installer downloads the root and checks the fingerprint, and from then on
+the agent trusts *only* that root. A swapped certificate is refused. The
+installer script itself is downloaded before any trust exists, so the
+one-liner also checks it against its SHA-256 before running it (§10.1). Caddy only picks its
 internal CA by itself for IP addresses and a few reserved suffixes, so the
 controller installer sets `tls internal` explicitly whenever no public
 domain is given; a private hostname works the same way as an address. Caddy
@@ -847,13 +850,51 @@ with `OPNMESH_INSECURE_HTTP=1`, which exists for the simulation.
 
 ### 12.3 Admin authentication
 
-One local admin account created on first run (a setup code is printed to the
-container log). Passwords are argon2id; sessions are server-side, hashed, with
-idle and absolute timeouts; login failures are throttled per source and
-globally. The client address comes from `X-Forwarded-For` only when
+One local admin account created on first run. The setup code is printed to
+the container log and kept in `data/setup-code` until setup succeeds. Setup
+checks it in constant time and creates the account in a transaction, so two
+requests holding the code cannot both create an admin.
+
+Passwords are argon2id. Sessions are server-side and hashed, with idle and
+absolute timeouts, and a password change ends them all.
+
+Sign-in throttling:
+- An attempt is charged before the password is checked and refunded if it
+  proves right. A burst of concurrent guesses therefore cannot overrun the
+  limit while argon2 is busy.
+- The limit is 10 failures per client per 15 minutes, where an IPv6 client
+  counts by its /64, plus a global cap of 100.
+- A successful sign-in sets a device cookie. It is HMAC-signed with the
+  server secret, sent only to the sign-in endpoint, and gives that browser
+  its own bucket outside the global cap. Junk from many addresses therefore
+  cannot lock the admin out of a browser they already use. A new browser can
+  still be refused while such an attack runs.
+- Setup has only the per-client limit: its 60-bit code needs no global cap,
+  and one would let anyone stop the owner finishing setup.
+- Checks of the current password (on password change) are throttled per
+  account, so a stolen session is no way to guess the password.
+- Failed attempts are logged with the attempted name in the event's detail,
+  never in its message.
+
+The client address comes from `X-Forwarded-For` only when
 `OPNMESH_TRUST_PROXY` says how many reverse proxies are in front, and is
 counted from the right of that header, so an address a client adds itself
-is never used. TOTP is planned for 2.1. Security headers and same-site cookies throughout.
+is never used.
+
+Every mutation must carry an `Origin` equal to the public URL, or to the host
+the request was addressed to with the public URL's scheme.
+`X-Forwarded-Host` counts only behind a configured proxy. A request without
+`Origin` is refused when `Sec-Fetch-Site` marks it cross-site. Cookies are
+HttpOnly and SameSite, and the usual security headers are set everywhere.
+
+Request bodies are capped at 1 MB while they stream in, so a chunked upload
+is never buffered first. The live event stream re-checks its session every
+5 seconds, ends after 15 minutes (the browser reconnects), skips a client
+that stops reading, and is limited to 8 streams per session and 64 in all.
+
+The public URL, whether from Settings or `OPNMESH_PUBLIC_URL`, must be a
+plain origin, because it is written into commands that gateways run as root.
+TOTP is planned.
 
 ### 12.4 Secrets at rest
 
@@ -861,7 +902,11 @@ The sealing secret (`OPNMESH_SECRET`, or `secret.key`, which the controller
 generates on first start and keeps in the data volume) derives the key that encrypts client private keys, pre-shared keys
 and UniFi credentials (AES-256-GCM, per-row nonce). Gateway private keys are
 never on the controller. A database backup is useless without the secret; the
-backup page says so.
+backup page says so. The controller refuses to start when `secret.key` is
+missing next to an existing database, or is empty or truncated, rather than
+generating a new one that could not open anything already stored.
+`OPNMESH_SECRET` must be at least 32 characters. The key file is written
+atomically, and the data directory is kept at mode 0700.
 
 ### 12.5 Gateway hardening
 
