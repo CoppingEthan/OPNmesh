@@ -90,12 +90,13 @@ send the person a one-time link.
   `OPNMESH_PUBLIC_URL` from `.env`; *Settings → Public URL* overrides it
   without a restart, for instance when the controller gains a proper name.
 - **Lost admin password**: there is one admin account and no reset email.
-  Remove it and run first-run setup again with the setup code the controller
-  keeps in its data directory:
+  Remove it, restart the controller so it makes a new setup code, and run
+  first-run setup again (the code is removed once setup succeeds):
 
   ```bash
   cd /opt/opnmesh
   docker compose exec controller node -e "require('better-sqlite3')('/data/opnmesh.db').exec('DELETE FROM users')"
+  docker compose restart controller
   sudo cat data/setup-code      # then open https://<controller>/setup
   ```
 

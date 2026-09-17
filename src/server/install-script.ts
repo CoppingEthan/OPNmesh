@@ -4,10 +4,11 @@
  * deploy/gateway/install.sh so it can be read, linted and tested as a file;
  * this module substitutes the URL and builds the commands.
  */
-import { createHash } from "node:crypto";
+import { X509Certificate, createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { publicUrl } from "./settings";
+import { env } from "./env";
+import { isSafeOrigin, publicUrl } from "./settings";
 
 let cached: string | null = null;
 
@@ -25,16 +26,33 @@ function template(): string {
   throw new Error("deploy/gateway/install.sh not found");
 }
 
-export function installScript(url: string): string {
-  return template().replace(/__OPNMESH_URL__/g, url);
+/**
+ * The URL goes into shell commands that gateways run as root, so it must be a
+ * plain origin; Settings refuses anything else, and so does this, for a bad
+ * OPNMESH_PUBLIC_URL. Plain http needs the explicit lab switch.
+ */
+function checkedBase(url: string): string {
+  if (!isSafeOrigin(url)) throw new Error(`public URL ${JSON.stringify(url)} is not a plain http(s) origin; fix OPNMESH_PUBLIC_URL or Settings → Public URL`);
+  if (url.startsWith("http://") && !env().insecureHttp) throw new Error("public URL uses http:// but OPNMESH_INSECURE_HTTP is not set");
+  return url;
 }
 
-/** SHA-256 of the private CA root file Caddy issued, when the controller uses one. */
+export function installScript(url: string): string {
+  const base = checkedBase(url);
+  return template().replace(/__OPNMESH_URL__/g, () => base);
+}
+
+/**
+ * SHA-256 fingerprint of the private CA root Caddy issued, when the
+ * controller uses one: lowercase hex over the certificate's DER encoding, the
+ * same value browsers and `openssl x509 -fingerprint -sha256` show (there
+ * with colons), so an admin can check it against the certificate itself.
+ */
 export function privateCaFingerprint(): string | null {
   const file = process.env["OPNMESH_CA_FILE"];
   if (!file) return null;
   try {
-    return createHash("sha256").update(readFileSync(file)).digest("hex");
+    return new X509Certificate(readFileSync(file)).fingerprint256.replace(/:/g, "").toLowerCase();
   } catch {
     return null;
   }
@@ -58,7 +76,7 @@ export interface GatewayCommand {
  * after that.
  */
 export function gatewayCommand(opts: { token: string } | { upgrade: true }): GatewayCommand {
-  const base = publicUrl();
+  const base = checkedBase(publicUrl());
   const installScriptSha256 = createHash("sha256").update(installScript(base)).digest("hex");
   const caFingerprint = base.startsWith("https://") ? privateCaFingerprint() : null;
   const flags = [

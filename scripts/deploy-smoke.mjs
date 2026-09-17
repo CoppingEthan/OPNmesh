@@ -20,7 +20,7 @@
  * gateway firewall leaves container bridges alone. Disposable machines only.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { X509Certificate } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import https from "node:https";
 import { join } from "node:path";
@@ -97,7 +97,8 @@ try {
   for (let waited = 0; !existsSync(caFile) && waited < 90; waited += 2) await sleep(2000);
   check(existsSync(caFile), `Caddy wrote its CA root at ${caFile}`);
   const ca = readFileSync(caFile);
-  const caFingerprint = createHash("sha256").update(ca).digest("hex");
+  // The standard certificate fingerprint: what a browser shows for the root, without colons.
+  const caFingerprint = new X509Certificate(ca).fingerprint256.replace(/:/g, "").toLowerCase();
 
   // 2. The controller answers through Caddy with a certificate from that CA.
   let setup = null;

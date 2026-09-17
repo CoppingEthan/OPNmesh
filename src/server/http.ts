@@ -5,7 +5,8 @@
 import { z, type ZodType } from "zod";
 import { AuthError, sessionFromToken, tokenFromRequest, type AdminSession } from "./auth";
 import { ClientError } from "./clients";
-import { SettingsError } from "./settings";
+import { env } from "./env";
+import { SettingsError, publicUrl } from "./settings";
 import { SiteError, gatewayByToken } from "./sites";
 import type { GatewayRow } from "@/db/schema";
 
@@ -42,15 +43,38 @@ export function errorResponse(e: unknown): Response {
   return json({ error: "internal error" }, 500);
 }
 
-const MAX_BODY = 1 << 20;
+export const MAX_BODY = 1 << 20;
 
-export async function parseBody<T>(req: Request, schema: ZodType<T>): Promise<T> {
+/**
+ * The request body as text, refused as soon as it passes MAX_BODY. A chunked
+ * upload has no Content-Length, so the limit is enforced while reading:
+ * `req.text()` would buffer any size first, and Next applies no limit of its
+ * own to route handlers.
+ */
+async function readBody(req: Request): Promise<string> {
   const len = Number(req.headers.get("content-length") ?? "0");
   if (len > MAX_BODY) throw new HttpError(413, "body too large");
+  if (!req.body) return "";
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_BODY) {
+      await reader.cancel().catch(() => undefined);
+      throw new HttpError(413, "body too large");
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+export async function parseBody<T>(req: Request, schema: ZodType<T>): Promise<T> {
   let raw: unknown;
   try {
-    const textBody = await req.text();
-    if (textBody.length > MAX_BODY) throw new HttpError(413, "body too large");
+    const textBody = await readBody(req);
     raw = textBody.length === 0 ? {} : JSON.parse(textBody);
   } catch (e) {
     if (e instanceof HttpError) throw e;
@@ -59,16 +83,34 @@ export async function parseBody<T>(req: Request, schema: ZodType<T>): Promise<T>
   return schema.parse(raw);
 }
 
-function sameOrigin(req: Request): boolean {
+/**
+ * CSRF protection for mutations. Browsers send Origin with every POST, PUT,
+ * PATCH and DELETE, so the request is accepted when Origin is this
+ * controller: its public URL, or the host the request was addressed to (so
+ * the dashboard also works by IP address) with the public URL's scheme.
+ * X-Forwarded-Host counts only behind a configured proxy, which sets it;
+ * otherwise a client could choose it. A request without Origin is refused
+ * when the browser marks it as coming from another site; with neither
+ * header it is not from a browser, and CSRF cannot forge those.
+ */
+export function sameOrigin(req: Request): boolean {
   const origin = req.headers.get("origin");
-  if (!origin) return true; // same-origin fetches and non-browser clients omit it
+  if (!origin) {
+    const site = req.headers.get("sec-fetch-site");
+    return site === null || site === "same-origin" || site === "none";
+  }
+  let o: URL;
+  let pub: URL;
   try {
-    const o = new URL(origin);
-    const host = req.headers.get("x-forwarded-host") ?? req.headers.get("host") ?? new URL(req.url).host;
-    return o.host === host;
+    o = new URL(origin);
+    pub = new URL(publicUrl());
   } catch {
     return false;
   }
+  if (o.origin === pub.origin) return true;
+  const forwarded = env().trustProxy > 0 ? req.headers.get("x-forwarded-host")?.split(",")[0]?.trim() : undefined;
+  const host = forwarded || req.headers.get("host") || new URL(req.url).host;
+  return o.protocol === pub.protocol && o.host === host.toLowerCase();
 }
 
 type AdminHandler<P> = (req: Request, ctx: { params: P; admin: AdminSession }) => Promise<Response> | Response;
@@ -126,18 +168,33 @@ export function withPublic<P = Record<string, never>>(fn: (req: Request, ctx: { 
 // ---------------------------------------------------------------------------
 // A small in-memory limiter for public endpoints (enrol, invite pickup).
 
-const buckets = new Map<string, { count: number; windowStart: number }>();
+const buckets = new Map<string, { count: number; windowStart: number; windowMs: number }>();
+const MAX_BUCKETS = 50_000;
 
 export function rateLimited(key: string, max: number, windowMs: number): boolean {
   const t = Date.now();
   let b = buckets.get(key);
   if (!b || t - b.windowStart > windowMs) {
-    b = { count: 0, windowStart: t };
+    buckets.delete(key);
+    b = { count: 0, windowStart: t, windowMs };
     buckets.set(key, b);
   }
   b.count++;
-  if (buckets.size > 10_000) buckets.clear();
+  if (buckets.size > MAX_BUCKETS) evictBuckets(t);
   return b.count > max;
+}
+
+/**
+ * Drops finished windows, then (if an attacker with many addresses still
+ * fills the table) the oldest windows first. Clearing everything would hand
+ * every address a fresh allowance.
+ */
+function evictBuckets(t: number): void {
+  for (const [k, v] of buckets) if (t - v.windowStart > v.windowMs) buckets.delete(k);
+  for (const k of buckets.keys()) {
+    if (buckets.size <= MAX_BUCKETS * 0.9) break;
+    buckets.delete(k);
+  }
 }
 
 export function resetRateLimitsForTests(): void {

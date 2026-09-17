@@ -46,3 +46,7 @@ screenshots/
 
 # design source material (the compressed derivative ships in public/)
 gradient-wallpapers-*.jpg
+
+# local tooling: agent worktrees and settings
+.claude/
+.kilo/

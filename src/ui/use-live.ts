@@ -1,5 +1,6 @@
 "use client";
 
+import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import type { StatePayload } from "@/server/state";
 
@@ -12,6 +13,7 @@ export function useLiveState(initial: StatePayload, opts: { fast?: boolean } = {
   const [connected, setConnected] = useState(false);
   const failures = useRef(0);
   const fast = opts.fast === true;
+  const router = useRouter();
 
   useEffect(() => {
     let es: EventSource | null = null;
@@ -23,7 +25,8 @@ export function useLiveState(initial: StatePayload, opts: { fast?: boolean } = {
       poll = setInterval(async () => {
         try {
           const res = await fetch("/api/admin/state", { credentials: "same-origin" });
-          if (res.ok) setState(await res.json());
+          if (res.status === 401) router.replace("/login"); // signed out elsewhere: stop showing stale data
+          else if (res.ok) setState(await res.json());
         } catch {
           /* keep last */
         }
@@ -57,7 +60,7 @@ export function useLiveState(initial: StatePayload, opts: { fast?: boolean } = {
       es?.close();
       if (poll) clearInterval(poll);
     };
-  }, [fast]);
+  }, [fast, router]);
 
   return { state, connected };
 }

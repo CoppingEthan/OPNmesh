@@ -242,7 +242,8 @@ describe("public endpoints and operations", () => {
     await setupAndLogin();
     const bad = await loginPost(req("POST", "/api/admin/login", { email: "admin@example.com", password: "nope nope nope" }));
     expect(bad.status).toBe(401);
-    expect(listEvents().some((e) => e.kind === "login" && e.message.startsWith("Failed sign-in for admin@example.com"))).toBe(true);
+    // The attempted name is the visitor's text: it is kept in the detail, not written into the message.
+    expect(listEvents().some((e) => e.kind === "login" && e.message.startsWith("Failed sign-in from") && JSON.stringify(e.detail).includes("admin@example.com"))).toBe(true);
 
     expect((await settingsPut(req("PUT", "/api/admin/settings", { publicUrl: "not a url" }, asAdmin()))).status).toBe(400);
     expect((await settingsPut(req("PUT", "/api/admin/settings", { publicUrl: "https://mesh.example.com" }, asAdmin()))).status).toBe(200);

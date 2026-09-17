@@ -4,12 +4,13 @@
  */
 import argon2 from "argon2";
 import { eq, lt } from "drizzle-orm";
-import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { isIPv6 } from "node:net";
 import { join } from "node:path";
 import { getDb } from "@/db";
 import { sessions, users } from "@/db/schema";
-import { randomId, randomToken, sha256Hex } from "@/core/crypto";
+import { macTag, randomId, randomToken, sha256Hex } from "@/core/crypto";
 import { env, now } from "./env";
 import { logEvent } from "./events";
 import { getSettings, markSetupComplete } from "./settings";
@@ -28,8 +29,13 @@ export class AuthError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// Throttling: only failures count, so nobody can lock the admin out by
-// hammering the login form with junk. Per-source buckets plus a global cap.
+// Throttling. Each attempt is charged before the password is checked and
+// given back when it proves right, so concurrent guesses cannot overrun the
+// limit while argon2 is busy. Attempts are counted per client (an IPv6 client
+// by its /64) with a global cap on top against a distributed guess. A browser
+// that has signed in before carries a signed device cookie and is counted on
+// its own, outside the global cap, so junk from elsewhere cannot lock the
+// admin out of a browser they already use.
 
 interface Bucket {
   failures: number;
@@ -40,31 +46,102 @@ let globalBucket: Bucket = { failures: 0, windowStart: 0 };
 const WINDOW_MS = 15 * 60 * 1000;
 const PER_SOURCE_MAX = 10;
 const GLOBAL_MAX = 100;
+const MAX_TRACKED = 50_000;
 
-function bucketFor(key: string): Bucket {
+/** Who an attempt is charged to, and whether it also counts towards the global cap. */
+export interface Attempt {
+  key: string;
+  global: boolean;
+}
+
+/** The throttling identity of a client address: an IPv6 address by its /64, since one host usually holds the whole prefix. */
+export function throttleKey(source: string): string {
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(source);
+  if (mapped) return mapped[1]!;
+  if (!isIPv6(source)) return source;
+  const lower = source.toLowerCase();
+  const [head = "", tail = ""] = lower.split("::");
+  const left = head ? head.split(":") : [];
+  const right = tail ? tail.split(":") : [];
+  const groups = lower.includes("::") ? [...left, ...Array<string>(Math.max(0, 8 - left.length - right.length)).fill("0"), ...right] : left;
+  return groups
+    .slice(0, 4)
+    .map((part) => part.replace(/^0+(?=.)/, ""))
+    .join(":") + "::/64";
+}
+
+export function attemptFor(source: string, device: string | null = null): Attempt {
+  return device ? { key: `device:${device}`, global: false } : { key: `source:${throttleKey(source)}`, global: true };
+}
+
+function bucket(key: string): Bucket {
   const t = now();
   let b = buckets.get(key);
   if (!b || t - b.windowStart > WINDOW_MS) {
+    buckets.delete(key);
     b = { failures: 0, windowStart: t };
     buckets.set(key, b);
+    if (buckets.size > MAX_TRACKED) pruneBuckets(t);
   }
   if (t - globalBucket.windowStart > WINDOW_MS) globalBucket = { failures: 0, windowStart: t };
   return b;
 }
 
-export function loginThrottled(source: string): boolean {
-  const b = bucketFor(source);
-  return b.failures >= PER_SOURCE_MAX || globalBucket.failures >= GLOBAL_MAX;
+/** Finished windows first; then, if many addresses still fill the table, the oldest. */
+function pruneBuckets(t: number): void {
+  for (const [k, v] of buckets) if (t - v.windowStart > WINDOW_MS) buckets.delete(k);
+  for (const k of buckets.keys()) {
+    if (buckets.size <= MAX_TRACKED * 0.9) break;
+    buckets.delete(k);
+  }
 }
 
-function recordFailure(source: string): void {
-  bucketFor(source).failures++;
-  globalBucket.failures++;
+function throttled(a: Attempt): boolean {
+  const b = bucket(a.key);
+  return b.failures >= PER_SOURCE_MAX || (a.global && globalBucket.failures >= GLOBAL_MAX);
+}
+
+function charge(a: Attempt): void {
+  bucket(a.key).failures++;
+  if (a.global) globalBucket.failures++;
+}
+
+function refund(a: Attempt): void {
+  const b = bucket(a.key);
+  b.failures = Math.max(0, b.failures - 1);
+  if (a.global) globalBucket.failures = Math.max(0, globalBucket.failures - 1);
+}
+
+export function loginThrottled(source: string, device: string | null = null): boolean {
+  return throttled(attemptFor(source, device));
 }
 
 export function resetThrottleForTests(): void {
   buckets.clear();
   globalBucket = { failures: 0, windowStart: 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Device cookie: set on every successful sign-in and sent only to the sign-in
+// endpoint. It holds a random id and a MAC made with the server secret, so it
+// cannot be forged, and it grants nothing but its own throttling bucket.
+
+export const DEVICE_COOKIE = "opnmesh_device";
+const DEVICE_MAX_AGE_S = 400 * 24 * 60 * 60; // the longest browsers keep a cookie
+
+export function deviceCookie(existing: string | null): string {
+  const id = existing ?? randomToken().slice(0, 22);
+  const secure = env().publicUrl.startsWith("https://") ? "; Secure" : "";
+  return `${DEVICE_COOKIE}=${id}.${macTag(id, env().secret, "device")}; Path=/api/admin/login; HttpOnly; SameSite=Strict; Max-Age=${DEVICE_MAX_AGE_S}${secure}`;
+}
+
+/** The device id from a valid device cookie, or null. */
+export function deviceFromRequest(req: Request): string | null {
+  const m = /^([A-Za-z0-9_-]{16,64})\.([A-Za-z0-9_-]{32})$/.exec(cookieValue(req, DEVICE_COOKIE) ?? "");
+  if (!m) return null;
+  const expected = Buffer.from(macTag(m[1]!, env().secret, "device"));
+  const given = Buffer.from(m[2]!);
+  return expected.length === given.length && timingSafeEqual(expected, given) ? m[1]! : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -105,18 +182,35 @@ export function needsSetup(): boolean {
   return !getSettings().setupComplete || getDb().select().from(users).all().length === 0;
 }
 
+function codesEqual(a: string, b: string): boolean {
+  return timingSafeEqual(createHash("sha256").update(a).digest(), createHash("sha256").update(b).digest());
+}
+
+/**
+ * Creates the one admin account. The setup code has 60 bits, so the
+ * per-client limit alone stops guessing; there is no global cap here, which
+ * would let anyone stop the owner finishing setup.
+ */
 export async function completeSetup(input: { code: string; email: string; password: string }, source = "unknown"): Promise<void> {
   if (!needsSetup()) throw new AuthError("setup already completed", 409);
-  if (loginThrottled(source)) throw new AuthError("too many attempts — wait 15 minutes", 429);
-  if (input.code.trim().toUpperCase() !== setupCode()) {
-    recordFailure(source);
-    logEvent("login", `Failed first-run setup attempt for ${safeActor(input.email)} from ${source}`, { actor: safeActor(input.email) });
+  const attempt: Attempt = { key: `setup:${throttleKey(source)}`, global: false };
+  if (throttled(attempt)) throw new AuthError("too many attempts — wait 15 minutes", 429);
+  if (!codesEqual(input.code.trim().toUpperCase(), setupCode())) {
+    charge(attempt);
+    logEvent("login", `Failed first-run setup attempt from ${source}`, { actor: "anonymous", detail: { attempted: safeActor(input.email) } });
     throw new AuthError("setup code does not match the one printed in the controller log", 403);
   }
   validateCredentials(input.email, input.password);
   const hash = await argon2.hash(input.password, { type: argon2.argon2id });
-  getDb().insert(users).values({ id: randomId(), email: input.email.trim(), passwordHash: hash, createdAt: now() }).run();
-  markSetupComplete();
+  // Checked again after the await, in one transaction: two requests holding the code must not both create an admin.
+  getDb().transaction((tx) => {
+    if (!needsSetup()) throw new AuthError("setup already completed", 409);
+    tx.insert(users).values({ id: randomId(), email: input.email.trim(), passwordHash: hash, createdAt: now() }).run();
+    markSetupComplete();
+  });
+  // The code has done its job; a later reset (see README) makes a new one.
+  g.__opnmeshSetupCode = undefined;
+  rmSync(join(env().dataDir, "setup-code"), { force: true });
   logEvent("setup", `Admin account ${input.email.trim()} created`, { actor: input.email.trim() });
 }
 
@@ -132,17 +226,19 @@ function validateCredentials(email: string, password: string): void {
   if (password.length > 200) throw new AuthError("password is too long", 400);
 }
 
-export async function login(email: string, password: string, source = "unknown"): Promise<string> {
-  if (loginThrottled(source)) throw new AuthError("too many failed attempts — wait 15 minutes", 429);
+export async function login(email: string, password: string, source = "unknown", device: string | null = null): Promise<string> {
+  const attempt = attemptFor(source, device);
+  if (throttled(attempt)) throw new AuthError("too many failed attempts — wait 15 minutes", 429);
+  charge(attempt);
   const user = getDb().select().from(users).where(eq(users.email, email.trim())).get();
-  const ok = user ? await argon2.verify(user.passwordHash, password) : false;
+  let ok = false;
+  if (user) ok = await argon2.verify(user.passwordHash, password);
+  else await argon2.hash("x".repeat(16), { type: argon2.argon2id }); // the same work as a real check
   if (!user || !ok) {
-    recordFailure(source);
-    logEvent("login", `Failed sign-in for ${safeActor(email)} from ${source}`, { actor: safeActor(email) });
-    // Constant-ish time: hashing a dummy when the user is unknown.
-    if (!user) await argon2.hash("x".repeat(16), { type: argon2.argon2id });
+    logEvent("login", `Failed sign-in from ${source}`, { actor: "anonymous", detail: { attempted: safeActor(email) } });
     throw new AuthError("email or password is incorrect");
   }
+  refund(attempt);
   const token = randomToken();
   const t = now();
   getDb()
@@ -156,7 +252,12 @@ export async function login(email: string, password: string, source = "unknown")
 export async function changePassword(userId: string, current: string, next: string): Promise<void> {
   const user = getDb().select().from(users).where(eq(users.id, userId)).get();
   if (!user) throw new AuthError("no such user", 404);
+  // A stolen session must not become a way to guess the password.
+  const attempt: Attempt = { key: `password:${userId}`, global: false };
+  if (throttled(attempt)) throw new AuthError("too many failed attempts — wait 15 minutes", 429);
+  charge(attempt);
   if (!(await argon2.verify(user.passwordHash, current))) throw new AuthError("current password is incorrect", 403);
+  refund(attempt);
   validateCredentials(user.email, next);
   getDb()
     .update(users)
@@ -199,14 +300,24 @@ export function pruneSessions(): number {
   return getDb().delete(sessions).where(lt(sessions.expiresAt, now())).run().changes;
 }
 
-/** Read the session cookie from a Request. */
-export function tokenFromRequest(req: Request): string | null {
+function cookieValue(req: Request, name: string): string | null {
   const cookie = req.headers.get("cookie") ?? "";
   for (const part of cookie.split(";")) {
     const [k, ...v] = part.trim().split("=");
-    if (k === SESSION_COOKIE) return decodeURIComponent(v.join("="));
+    if (k === name) {
+      try {
+        return decodeURIComponent(v.join("="));
+      } catch {
+        return null;
+      }
+    }
   }
   return null;
+}
+
+/** Read the session cookie from a Request. */
+export function tokenFromRequest(req: Request): string | null {
+  return cookieValue(req, SESSION_COOKIE);
 }
 
 export function sessionCookie(token: string | null): string {

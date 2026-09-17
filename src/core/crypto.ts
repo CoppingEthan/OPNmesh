@@ -12,6 +12,7 @@ import {
   createPrivateKey,
   createPublicKey,
   generateKeyPairSync,
+  createHmac,
   hkdfSync,
   randomBytes,
   timingSafeEqual,
@@ -84,6 +85,11 @@ export function keyFingerprint(publicKey: string): string {
 
 function sealingKey(secret: string, purpose: string): Buffer {
   return Buffer.from(hkdfSync("sha256", Buffer.from(secret, "utf8"), "opnmesh", purpose, 32));
+}
+
+/** A MAC over `data` with a key derived from the server secret for `purpose` (base64url, 32 chars). */
+export function macTag(data: string, secret: string, purpose: string): string {
+  return createHmac("sha256", sealingKey(secret, purpose)).update(data, "utf8").digest("base64url").slice(0, 32);
 }
 
 export function seal(plaintext: string, secret: string, purpose = "secret"): string {

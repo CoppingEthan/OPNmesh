@@ -46,6 +46,18 @@ export function publicUrl(): string {
   return getSettings().publicUrl || env().publicUrl;
 }
 
+/**
+ * An origin that is safe to paste into a shell command: http(s), then a DNS
+ * name or IPv4 address (letters, digits, dots, hyphens) or a bracketed IPv6
+ * literal, and an optional port. The URL parser alone accepts characters such
+ * as $ ( ) ; in a host, which would run as root in the gateway installer.
+ */
+const SAFE_ORIGIN = /^https?:\/\/(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?|\[[0-9a-f:.]+\])(?::\d{1,5})?$/;
+
+export function isSafeOrigin(origin: string): boolean {
+  return SAFE_ORIGIN.test(origin);
+}
+
 /** Empty means "use the environment"; otherwise a bare https origin (http only in insecure/lab mode). */
 export function normalisePublicUrl(value: string | null): string | null {
   const v = (value ?? "").trim();
@@ -60,6 +72,7 @@ export function normalisePublicUrl(value: string | null): string | null {
   if (u.pathname !== "/" || u.search !== "" || u.hash !== "" || u.username !== "" || u.password !== "") {
     throw new SettingsError("public URL is just the scheme, host and optional port, with no path");
   }
+  if (!isSafeOrigin(u.origin)) throw new SettingsError("public URL host may contain only letters, digits, dots and hyphens, or be an IP address");
   return u.origin;
 }
 
