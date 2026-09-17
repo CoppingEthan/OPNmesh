@@ -5,12 +5,14 @@
 #   curl -fsSL __OPNMESH_URL__/install.sh | sudo bash -s -- --upgrade
 #
 # What it does, in order:
-#   1. Installs wireguard-tools, nftables, iproute2 and curl (apt, dnf or apk).
+#   1. Installs wireguard-tools, nftables, iproute2, curl and openssl (apt,
+#      dnf or apk).
 #   2. Downloads the opnmesh-gw agent binary from the controller and verifies
 #      its SHA-256 against the controller's published digest.
 #   3. Generates a WireGuard keypair LOCALLY. The private key never leaves this
 #      machine; only the public key is sent to the controller.
-#   4. Enrols with the one-time token (the agent does this itself) and stores
+#   4. Enrols with the one-time token (the agent does this itself, reading
+#      the token from its environment rather than its arguments) and stores
 #      the returned gateway token root-only. The new binary only replaces the
 #      installed one once enrolment has succeeded.
 #   5. Installs and starts two systemd units: opnmesh-wg (brings the tunnel up
@@ -26,10 +28,14 @@
 #   --token-file <f>       read the token from a file instead (keeps it out of `ps`)
 #   --upgrade              update the agent of an already enrolled gateway
 #   --controller <url>     override the controller URL baked into this script
+#                          (scheme://host[:port], nothing more)
 #   --ca-fingerprint <hex> SHA-256 of the controller's private CA certificate;
-#                          the UI prints it. Downloads and pins the CA so a
-#                          private-CA controller is verified, not trusted blind.
-#                          A CA pinned by an earlier install is reused.
+#                          the UI prints it. Either the certificate's own
+#                          fingerprint (openssl x509 -fingerprint -sha256, with
+#                          or without colons) or the hash of the PEM file.
+#                          Downloads and pins the CA so a private-CA controller
+#                          is verified, not trusted blind. A CA pinned by an
+#                          earlier install is reused.
 #   --insecure-http        allow an http:// controller (simulation / lab only)
 #   --binary <path>        use a local agent binary instead of downloading
 #   --no-deps              skip package installation
@@ -40,6 +46,8 @@ set -eu
 
 CONTROLLER="__OPNMESH_URL__"
 TOKEN="${OPNMESH_TOKEN:-}"
+# Only the agent gets the token, and only when it enrols.
+unset OPNMESH_TOKEN
 CA_FP=""
 ALLOW_HTTP=0
 LOCAL_BIN=""
@@ -59,7 +67,7 @@ while [ $# -gt 0 ]; do
     --binary) LOCAL_BIN="$2"; shift 2 ;;
     --no-deps) INSTALL_DEPS=0; shift ;;
     --no-start) START=0; shift ;;
-    -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,44p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -80,6 +88,27 @@ case "$CONTROLLER" in
   *) echo "controller URL must start with https://" >&2; exit 2 ;;
 esac
 CONTROLLER="${CONTROLLER%/}"
+# The URL goes into curl commands, the agent's configuration and the log, so
+# it must be exactly scheme://host[:port]: a DNS name or IPv4 address, or an
+# IPv6 address in brackets.
+valid_controller() {
+  case "$1" in *"
+"*) return 1 ;; esac
+  printf '%s\n' "$1" | LC_ALL=C grep -Eqx 'https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+])(:[0-9]{1,5})?'
+}
+if ! valid_controller "$CONTROLLER"; then
+  echo "controller URL must be scheme://host[:port] and nothing else, got: $(printf '%s' "$CONTROLLER" | LC_ALL=C tr -cd '[:graph:]')" >&2
+  exit 2
+fi
+# The CA fingerprint is a SHA-256 in hex, in either case, colons allowed.
+if [ -n "$CA_FP" ]; then
+  CA_FP="$(printf '%s' "$CA_FP" | tr -d ':' | tr 'ABCDEF' 'abcdef')"
+  case "$CA_FP" in *[!0123456789abcdef]*) CA_FP="invalid" ;; esac
+  if [ "${#CA_FP}" -ne 64 ]; then
+    echo "--ca-fingerprint must be a SHA-256 in hex (64 digits, colons allowed)" >&2
+    exit 2
+  fi
+fi
 
 case "$(uname -m)" in
   x86_64|amd64) ARCH=amd64 ;;
@@ -92,16 +121,16 @@ log() { printf '\033[1;32m[opnmesh]\033[0m %s\n' "$*"; }
 # 1. Dependencies -----------------------------------------------------------
 if [ "$INSTALL_DEPS" = "1" ]; then
   if command -v apt-get >/dev/null 2>&1; then
-    log "installing wireguard-tools, nftables, iproute2, curl (apt)"
+    log "installing wireguard-tools, nftables, iproute2, curl, openssl (apt)"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -qq -y --no-install-recommends wireguard-tools nftables iproute2 curl ca-certificates >/dev/null
+    apt-get install -qq -y --no-install-recommends wireguard-tools nftables iproute2 curl openssl ca-certificates >/dev/null
   elif command -v dnf >/dev/null 2>&1; then
-    log "installing wireguard-tools, nftables, iproute, curl (dnf)"
-    dnf install -q -y wireguard-tools nftables iproute curl ca-certificates
+    log "installing wireguard-tools, nftables, iproute, curl, openssl (dnf)"
+    dnf install -q -y wireguard-tools nftables iproute curl openssl ca-certificates
   elif command -v apk >/dev/null 2>&1; then
-    log "installing wireguard-tools, nftables, iproute2, curl (apk)"
-    apk add --no-cache -q wireguard-tools nftables iproute2 curl ca-certificates
+    log "installing wireguard-tools, nftables, iproute2, curl, openssl (apk)"
+    apk add --no-cache -q wireguard-tools nftables iproute2 curl openssl ca-certificates
   else
     echo "no supported package manager; install wireguard-tools, nftables and iproute2 yourself, then re-run with --no-deps" >&2
     exit 1
@@ -110,6 +139,10 @@ fi
 for tool in wg nft ip curl; do
   command -v "$tool" >/dev/null 2>&1 || { echo "$tool is not installed" >&2; exit 1; }
 done
+if [ -n "$CA_FP" ] && ! command -v openssl >/dev/null 2>&1; then
+  echo "openssl is not installed; it is needed to check --ca-fingerprint" >&2
+  exit 1
+fi
 if [ "$UPGRADE" = "0" ]; then
   if ! ip link add opnmesh-probe type wireguard 2>/dev/null; then
     echo "WARNING: the kernel refused to create a WireGuard interface. On Ubuntu 22.04+ WireGuard is built in;" >&2
@@ -124,22 +157,35 @@ mkdir -p /etc/opnmesh /var/lib/opnmesh
 
 # 2. Private CA (optional) ----------------------------------------------------
 CURL_CA=""
+CA_PIN=/etc/opnmesh/controller-ca.crt
 if [ -n "$CA_FP" ]; then
   log "downloading the controller's CA certificate"
-  curl -fsSk "$CONTROLLER/ca.crt" -o /etc/opnmesh/controller-ca.crt.new
-  GOT="$(sha256sum /etc/opnmesh/controller-ca.crt.new | cut -d' ' -f1)"
-  WANT="$(printf '%s' "$CA_FP" | tr 'A-F' 'a-f' | tr -cd 'a-f0-9')"
-  if [ "$GOT" != "$WANT" ]; then
-    rm -f /etc/opnmesh/controller-ca.crt.new
-    echo "ABORTING: CA certificate fingerprint mismatch (expected $WANT, got $GOT)." >&2
+  curl -fsSk "$CONTROLLER/ca.crt" -o "$CA_PIN.new"
+  # Newer controllers give the certificate's own fingerprint (SHA-256 of its
+  # DER form), older ones the SHA-256 of the PEM file; either will do.
+  GOT_FILE="$(sha256sum "$CA_PIN.new" | cut -d' ' -f1)"
+  GOT_CERT="not a certificate"
+  if openssl x509 -in "$CA_PIN.new" -noout 2>/dev/null; then
+    GOT_CERT="$(openssl x509 -in "$CA_PIN.new" -outform DER | sha256sum | cut -d' ' -f1)"
+  fi
+  if [ "$CA_FP" = "$GOT_CERT" ]; then
+    # Pin exactly the certificate that matched, and nothing else the
+    # unverified download may have carried after it.
+    openssl x509 -in "$CA_PIN.new" -out "$CA_PIN.pem"
+    mv "$CA_PIN.pem" "$CA_PIN"
+    rm -f "$CA_PIN.new"
+  elif [ "$CA_FP" = "$GOT_FILE" ]; then
+    mv "$CA_PIN.new" "$CA_PIN"
+  else
+    rm -f "$CA_PIN.new"
+    echo "ABORTING: CA certificate fingerprint mismatch (expected $CA_FP; the certificate is $GOT_CERT, the file $GOT_FILE)." >&2
     echo "Someone may be intercepting this connection. Nothing has been sent." >&2
     exit 1
   fi
-  mv /etc/opnmesh/controller-ca.crt.new /etc/opnmesh/controller-ca.crt
   log "CA certificate verified and pinned"
 fi
 # A CA pinned now or by an earlier install verifies every download below.
-[ -f /etc/opnmesh/controller-ca.crt ] && CURL_CA="--cacert /etc/opnmesh/controller-ca.crt"
+[ -f "$CA_PIN" ] && CURL_CA="--cacert $CA_PIN"
 [ "$ALLOW_HTTP" = "1" ] && CURL_CA="" || true
 
 # 3. Agent binary (staged; installed after enrolment succeeds) ----------------
@@ -173,10 +219,12 @@ if [ "$UPGRADE" = "0" ]; then
 
   ENROL_FLAGS=""
   [ "$ALLOW_HTTP" = "1" ] && ENROL_FLAGS="$ENROL_FLAGS --insecure-http"
-  [ -f /etc/opnmesh/controller-ca.crt ] && ENROL_FLAGS="$ENROL_FLAGS --ca /etc/opnmesh/controller-ca.crt"
+  [ -f "$CA_PIN" ] && ENROL_FLAGS="$ENROL_FLAGS --ca $CA_PIN"
   log "enrolling with $CONTROLLER"
+  # The token travels in the agent's environment, which only root can read,
+  # rather than in its arguments, which every user can see in `ps`.
   # shellcheck disable=SC2086
-  if ! "$BIN.new" enrol --controller "$CONTROLLER" --token "$TOKEN" $ENROL_FLAGS; then
+  if ! OPNMESH_TOKEN="$TOKEN" "$BIN.new" enrol --controller "$CONTROLLER" $ENROL_FLAGS; then
     rm -f "$BIN.new"
     echo "ABORTING: enrolment failed; nothing else on this machine was changed." >&2
     exit 1
@@ -220,8 +268,22 @@ Type=simple
 ExecStart=/usr/local/bin/opnmesh-gw run
 Restart=always
 RestartSec=5
+# The agent runs wg, wg-quick, ip, nft and ufw; writes /etc/opnmesh,
+# /var/lib/opnmesh, /proc/sys/net and ufw's rules; and uses netlink, raw and
+# packet sockets. None of that is restricted here: file system and address
+# family limits would have to follow every one of those tools.
 ProtectHome=yes
 PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
