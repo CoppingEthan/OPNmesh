@@ -1,5 +1,5 @@
-import { json, withAdmin } from "@/server/http";
-import { AlertError, sendTestEmail } from "@/server/alerts";
+import { errorResponse, json, withAdmin } from "@/server/http";
+import { AlertError, SmtpError, sendTestEmail } from "@/server/alerts";
 
 export const dynamic = "force-dynamic";
 
@@ -10,6 +10,8 @@ export const POST = withAdmin(async (_req, { admin }) => {
     return json({ ok: true, to });
   } catch (e) {
     if (e instanceof AlertError) return json({ error: e.message }, 400);
-    return json({ error: `the mail server refused the message: ${e instanceof Error ? e.message : String(e)}` }, 502);
+    // A category only; the server's own reply is in the controller log.
+    if (e instanceof SmtpError) return json({ error: `the test email was not sent: ${e.message}` }, 502);
+    return errorResponse(e);
   }
 });

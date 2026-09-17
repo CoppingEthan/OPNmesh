@@ -3,6 +3,13 @@
  * policy) equal to what a site's router plan says, touching only objects
  * OPNmesh created. Pure planning functions plus one executor, so the plan can
  * be unit-tested and shown as a preview before anything is written.
+ *
+ * Ownership is by the `_id`s recorded on the link, never by name: a console
+ * can be shared by several controllers or sites, and an admin may use the
+ * `OPNmesh:` prefix for routes of their own. An unrecorded route is adopted
+ * only when it is exactly a route the plan wants (same network, same next
+ * hop), which covers routes typed in by hand from the router page and ids
+ * lost with a restored database, and nothing else.
  */
 import type { RouterPlan } from "@/core/generate/router";
 import type { UnifiClient, UnifiFirewallPolicy, UnifiRoute, UnifiZone } from "./client";
@@ -31,7 +38,19 @@ export function desiredRoutes(plan: RouterPlan): UnifiRoute[] {
 }
 
 export function isManagedRoute(r: UnifiRoute, managed: ManagedIds): boolean {
-  return (r._id !== undefined && Object.values(managed.routes).includes(r._id)) || r.name.startsWith(MANAGED_PREFIX);
+  return r._id !== undefined && Object.values(managed.routes).includes(r._id);
+}
+
+/** An unrecorded route that is exactly what we would create, so taking it over changes nothing it does. */
+export function isAdoptableRoute(r: UnifiRoute, desired: UnifiRoute): boolean {
+  return (
+    typeof r._id === "string" &&
+    typeof r.name === "string" &&
+    r.name.startsWith(MANAGED_PREFIX) &&
+    r["static-route_network"] === desired["static-route_network"] &&
+    r["static-route_type"] === desired["static-route_type"] &&
+    r["static-route_nexthop"] === desired["static-route_nexthop"]
+  );
 }
 
 export function routeDiffers(existing: UnifiRoute, desired: UnifiRoute): boolean {
@@ -59,7 +78,7 @@ export function planRoutes(existing: UnifiRoute[], desired: UnifiRoute[], manage
   const seen = new Set<string>();
   for (const d of desired) {
     const cidr = d["static-route_network"];
-    const cur = byCidr.get(cidr);
+    const cur = byCidr.get(cidr) ?? existing.find((r) => isAdoptableRoute(r, d) && !isManagedRoute(r, managed) && !seen.has(r._id!));
     if (cur && cur._id) {
       seen.add(cur._id);
       steps.push(routeDiffers(cur, d) ? { action: "update", route: d, id: cur._id } : { action: "keep", route: cur, id: cur._id });
@@ -92,9 +111,17 @@ export function desiredPolicy(plan: RouterPlan, zones: UnifiZone[]): UnifiFirewa
   };
 }
 
+const policyIps = (p: UnifiFirewallPolicy) => [...(p.destination?.ips ?? [])].sort().join(",");
+
 export function policyDiffers(existing: UnifiFirewallPolicy, desired: UnifiFirewallPolicy): boolean {
-  const ips = (p: UnifiFirewallPolicy) => [...(p.destination.ips ?? [])].sort().join(",");
-  return existing.name !== desired.name || existing.enabled !== desired.enabled || existing.action !== desired.action || ips(existing) !== ips(desired) || existing.connection_state_type !== desired.connection_state_type;
+  return existing.name !== desired.name || existing.enabled !== desired.enabled || existing.action !== desired.action || policyIps(existing) !== policyIps(desired) || existing.connection_state_type !== desired.connection_state_type;
+}
+
+/** Ours by recorded id; otherwise only a policy with our exact name and destinations, on the same terms as routes. */
+export function findOurPolicy(policies: UnifiFirewallPolicy[], desired: UnifiFirewallPolicy | null, managed: ManagedIds): UnifiFirewallPolicy | undefined {
+  const recorded = managed.policy !== undefined ? policies.find((p) => p._id === managed.policy) : undefined;
+  if (recorded || !desired) return recorded;
+  return policies.find((p) => typeof p._id === "string" && p.name === desired.name && policyIps(p) === policyIps(desired));
 }
 
 export interface SyncResult {
@@ -154,7 +181,7 @@ export async function syncSite(client: UnifiClient, plan: RouterPlan, managed: M
       const zones = await client.listZones();
       const desired = desiredPolicy(plan, zones);
       const policies = await client.listFirewallPolicies();
-      const ours = policies.find((p) => (managed.policy && p._id === managed.policy) || p.name.startsWith(`${MANAGED_PREFIX} allow all states to remote sites (${plan.siteSlug})`));
+      const ours = findOurPolicy(policies, desired, managed);
       if (!desired) {
         result.policy = "unsupported";
         result.warnings.push("Could not find the Internal zone on the console; create the all-states firewall policy by hand.");
@@ -186,7 +213,7 @@ export async function syncSite(client: UnifiClient, plan: RouterPlan, managed: M
   return result;
 }
 
-/** Remove everything OPNmesh created on the console (when unlinking). */
+/** Remove everything this link created on the console (when unlinking). */
 export async function removeAll(client: UnifiClient, managed: ManagedIds): Promise<{ deleted: number; warnings: string[] }> {
   let deleted = 0;
   const warnings: string[] = [];
