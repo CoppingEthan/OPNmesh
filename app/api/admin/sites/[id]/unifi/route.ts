@@ -17,6 +17,7 @@ const saveSchema = z.object({
   unifiSite: z.string().max(64).default("default"),
   auth: authSchema,
   standalone: z.boolean().optional(),
+  certMode: z.enum(["pinned", "system"]).optional(),
   certFingerprint: z.string().max(128).nullable().default(null),
   certPem: z.string().max(20_000).nullable().default(null),
 });

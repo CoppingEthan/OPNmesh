@@ -2,6 +2,7 @@
  * UniFi links: one per site, credentials sealed at rest, synced on demand,
  * on topology changes and on a timer.
  */
+import { X509Certificate } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb } from "@/db";
 import { unifiLinks, type UnifiLinkRow } from "@/db/schema";
@@ -14,12 +15,22 @@ import { getGenerated } from "../snapshot";
 import { fetchConsoleCertificate, UnifiClient, UnifiError, type ConsoleCertificate, type UnifiAuth } from "./client";
 import { removeAll, syncSite, type ManagedIds, type SyncResult } from "./reconcile";
 
+/**
+ * How an https console's certificate is checked. "pinned" (the default, for
+ * the self-signed certificate consoles ship with) trusts exactly the
+ * certificate the admin confirmed. "system" is for a publicly trusted
+ * certificate: the system CAs and the host name are checked on every
+ * connection, and a renewal needs no action.
+ */
+export type CertMode = "pinned" | "system";
+
 export interface LinkInput {
   baseUrl: string;
   unifiSite: string;
   auth: UnifiAuth;
   standalone?: boolean;
-  /** Fingerprint the admin confirmed (required unless the certificate is system-trusted). */
+  certMode?: CertMode;
+  /** Fingerprint and certificate the admin confirmed; required when pinned. */
   certFingerprint: string | null;
   certPem: string | null;
 }
@@ -52,6 +63,12 @@ function normaliseUrl(u: string): string {
   }
 }
 
+/** One line for the server log; the detail may hold text from the remote end. */
+function logFailure(what: string, e: unknown): void {
+  const detail = e instanceof UnifiError ? e.detail : e instanceof Error ? e.message : String(e);
+  console.error(`[opnmesh] ${what}: ${detail}`.replace(/\p{Cc}+/gu, " ").slice(0, 1000));
+}
+
 function unseal(row: UnifiLinkRow): Secret {
   return JSON.parse(open(row.secretEnc, env().secret, "unifi")) as Secret;
 }
@@ -74,6 +91,7 @@ export function linkView(row: UnifiLinkRow) {
     username: secret.auth.kind === "password" ? secret.auth.username : null,
     standalone: secret.standalone,
     certFingerprint: row.certFingerprint,
+    certMode: (row.baseUrl.startsWith("https://") ? (row.certFingerprint ? "pinned" : "system") : "none") as CertMode | "none",
     enabled: row.enabled,
     lastSyncAt: row.lastSyncAt,
     lastSyncStatus: row.lastSyncStatus,
@@ -89,7 +107,12 @@ export async function probeConsole(input: { baseUrl: string; unifiSite: string; 
   const baseUrl = normaliseUrl(input.baseUrl);
   let certificate: ConsoleCertificate | null = null;
   if (baseUrl.startsWith("https://")) {
-    certificate = await fetchConsoleCertificate(baseUrl);
+    try {
+      certificate = await fetchConsoleCertificate(baseUrl);
+    } catch (e) {
+      logFailure(`UniFi probe of ${baseUrl} failed`, e);
+      throw e;
+    }
   }
   // Credentials are only sent once the certificate is trusted (system or confirmed).
   const trusted = !certificate || certificate.systemTrusted || (input.trustFingerprint && input.trustFingerprint.toLowerCase() === certificate.fingerprint);
@@ -106,8 +129,22 @@ export async function probeConsole(input: { baseUrl: string; unifiSite: string; 
     const identity = await client.whoami();
     return { certificate, identity, error: null };
   } catch (e) {
-    return { certificate, identity: null, error: e instanceof Error ? e.message : String(e) };
+    logFailure(`UniFi probe of ${baseUrl} failed`, e);
+    return { certificate, identity: null, error: e instanceof UnifiError ? e.message : "the console check failed" };
   }
+}
+
+/** The confirmed certificate, checked to be the one the fingerprint names. */
+function checkPin(fingerprint: string | null, pem: string | null): { fingerprint: string; pem: string } {
+  if (!fingerprint || !pem) throw new UnifiLinkError("confirm the console certificate first");
+  let actual: string;
+  try {
+    actual = new X509Certificate(pem).fingerprint256.toLowerCase();
+  } catch {
+    throw new UnifiLinkError("the console certificate is not valid");
+  }
+  if (actual !== fingerprint.toLowerCase()) throw new UnifiLinkError("the console certificate does not match its fingerprint");
+  return { fingerprint: actual, pem };
 }
 
 export function saveLink(siteId: string, input: LinkInput, actor = "admin"): UnifiLinkRow {
@@ -116,15 +153,19 @@ export function saveLink(siteId: string, input: LinkInput, actor = "admin"): Uni
   const baseUrl = normaliseUrl(input.baseUrl);
   if (input.auth.kind === "api_key" && !input.auth.apiKey) throw new UnifiLinkError("API key is required");
   if (input.auth.kind === "password" && (!input.auth.username || !input.auth.password)) throw new UnifiLinkError("username and password are required");
-  if (baseUrl.startsWith("https://") && !input.certFingerprint && !input.certPem) throw new UnifiLinkError("confirm the console certificate first");
-  const secret: Secret = { auth: input.auth, certPem: input.certPem, standalone: input.standalone ?? false };
+  let pin: { fingerprint: string; pem: string } | null = null;
+  if (baseUrl.startsWith("https://")) {
+    if ((input.certMode ?? "pinned") === "pinned") pin = checkPin(input.certFingerprint, input.certPem);
+    else if (input.certFingerprint || input.certPem) throw new UnifiLinkError("a console checked against public CAs is not pinned; send no certificate");
+  }
+  const secret: Secret = { auth: input.auth, certPem: pin?.pem ?? null, standalone: input.standalone ?? false };
   const existing = getLink(siteId);
   const values = {
     baseUrl,
     unifiSite: input.unifiSite || "default",
     authKind: input.auth.kind,
     secretEnc: seal(JSON.stringify(secret), env().secret, "unifi"),
-    certFingerprint: input.certFingerprint,
+    certFingerprint: pin?.fingerprint ?? null,
     enabled: true,
     lastSyncStatus: "never",
     lastSyncDetail: "",
@@ -141,7 +182,7 @@ export function saveLink(siteId: string, input: LinkInput, actor = "admin"): Uni
       .values({ id: randomId(), siteId, managedIds: { routes: {} }, lastSyncAt: null, ...values })
       .run();
   }
-  logEvent("unifi", `UniFi console ${baseUrl} linked to "${site.name}"`, { actor, subject: siteId });
+  logEvent("unifi", `UniFi console ${baseUrl} linked to "${site.name}" (${pin ? "certificate pinned" : baseUrl.startsWith("https://") ? "public certificate" : "plain http"})`, { actor, subject: siteId });
   return getLink(siteId)!;
 }
 
@@ -163,7 +204,7 @@ export async function unlink(siteId: string, removeObjects: boolean, actor = "ad
   return out;
 }
 
-function clientFor(row: UnifiLinkRow): UnifiClient {
+function clientFor(row: UnifiLinkRow, signal?: AbortSignal): UnifiClient {
   const secret = unseal(row);
   return new UnifiClient({
     baseUrl: row.baseUrl,
@@ -171,21 +212,35 @@ function clientFor(row: UnifiLinkRow): UnifiClient {
     auth: secret.auth,
     standalone: secret.standalone,
     pin: row.certFingerprint && secret.certPem ? { fingerprint: row.certFingerprint, pem: secret.certPem } : null,
+    signal,
   });
 }
 
+/** The most one console may take to sync, so a stuck one cannot hold up the others. */
+export const LINK_SYNC_LIMIT_MS = 60_000;
+
 /** Sync one site now. Records the outcome on the link and in the event log. */
-export async function syncLink(siteId: string, actor = "system"): Promise<SyncResult> {
+export async function syncLink(siteId: string, actor = "system", limitMs = LINK_SYNC_LIMIT_MS): Promise<SyncResult> {
   const row = getLink(siteId);
   if (!row) throw new UnifiLinkError("this site is not linked to a console", 404);
   const site = getSite(siteId);
   const plan = getGenerated().bundle.routers[siteId];
   if (!site || !plan) throw new UnifiLinkError("this site has no active gateway yet, so there is nothing to push", 409);
   const started = now();
+  const abort = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  // Aborting stops the request in flight; the race gives up even if something ignores that.
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new UnifiError("the console took too long, so the sync was stopped");
+      abort.abort(err);
+      reject(err);
+    }, limitMs);
+  });
   try {
-    const client = clientFor(row);
-    await client.login();
-    const result = await syncSite(client, plan, row.managedIds as unknown as ManagedIds);
+    const client = clientFor(row, abort.signal);
+    const work = client.login().then(() => syncSite(client, plan, row.managedIds as unknown as ManagedIds));
+    const result = await Promise.race([work, expired]);
     const changes = result.created + result.updated + result.deleted;
     const status = result.warnings.length > 0 ? "warning" : "ok";
     const detail = [
@@ -204,31 +259,48 @@ export async function syncLink(siteId: string, actor = "system"): Promise<SyncRe
     return result;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    logFailure(`UniFi sync for "${site.name}" (${row.baseUrl}) failed`, e);
     getDb().update(unifiLinks).set({ lastSyncAt: started, lastSyncStatus: "error", lastSyncDetail: msg }).where(eq(unifiLinks.id, row.id)).run();
     logEvent("unifi", `UniFi sync for "${site.name}" failed: ${msg}`, { actor, subject: siteId });
     throw e instanceof UnifiError ? new UnifiLinkError(msg, 502) : e;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-const g = globalThis as unknown as { __opnmeshUnifiVersion?: number; __opnmeshUnifiLast?: number };
+const g = globalThis as unknown as { __opnmeshUnifiVersion?: number; __opnmeshUnifiLast?: number; __opnmeshUnifiRunning?: boolean };
 
 /**
  * Background: sync every enabled link when the topology changed since the
- * last pass, or at least every ten minutes.
+ * last pass, or at least every ten minutes. One pass at a time; a change made
+ * during a pass is picked up by the first tick after it.
  */
-export async function syncDueLinks(): Promise<void> {
+export async function syncDueLinks(limitMs = LINK_SYNC_LIMIT_MS): Promise<void> {
+  if (g.__opnmeshUnifiRunning) return;
   const version = getSettings().configVersion;
   const t = now();
   const due = g.__opnmeshUnifiVersion !== version || t - (g.__opnmeshUnifiLast ?? 0) > 10 * 60_000;
   if (!due) return;
   g.__opnmeshUnifiVersion = version;
   g.__opnmeshUnifiLast = t;
-  for (const row of listLinks()) {
-    if (!row.enabled) continue;
-    try {
-      await syncLink(row.siteId);
-    } catch {
-      /* recorded on the link */
+  g.__opnmeshUnifiRunning = true;
+  try {
+    for (const row of listLinks()) {
+      if (!row.enabled) continue;
+      try {
+        await syncLink(row.siteId, "system", limitMs);
+      } catch {
+        /* recorded on the link */
+      }
     }
+  } finally {
+    g.__opnmeshUnifiRunning = false;
   }
+}
+
+/** Tests: forget the last pass so the next one is due. */
+export function resetUnifiScheduleForTests(): void {
+  g.__opnmeshUnifiVersion = undefined;
+  g.__opnmeshUnifiLast = undefined;
+  g.__opnmeshUnifiRunning = false;
 }

@@ -1,8 +1,10 @@
 /**
  * A fake UniFi console: the subset of the classic and v2 APIs OPNmesh uses,
- * in memory, over plain HTTP. Used by unit tests and the simulation.
+ * in memory, over plain HTTP (or HTTPS with a given certificate). Used by
+ * unit tests and the simulation.
  */
-import { createServer, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
 import { randomBytes } from "node:crypto";
 
 interface Route extends Record<string, unknown> {
@@ -20,10 +22,12 @@ export interface FakeConsole {
   apiKey: string;
   password: { username: string; password: string };
   requests: Array<{ method: string; path: string; auth: string }>;
+  /** Tests: answer a request some other way (return true when handled), to play a broken or hostile console. */
+  intercept?: (req: IncomingMessage, res: ServerResponse, path: string) => boolean;
   close(): Promise<void>;
 }
 
-export async function startFakeConsole(opts: { site?: string; requirePassword?: boolean } = {}): Promise<FakeConsole> {
+export async function startFakeConsole(opts: { site?: string; requirePassword?: boolean; tls?: { key: string; cert: string } } = {}): Promise<FakeConsole> {
   const site = opts.site ?? "default";
   const state: FakeConsole = {
     server: null as never,
@@ -43,7 +47,7 @@ export async function startFakeConsole(opts: { site?: string; requirePassword?: 
   const sessions = new Set<string>();
   const csrf = "csrf-" + randomBytes(4).toString("hex");
 
-  state.server = createServer((req, res) => {
+  const handler = (req: IncomingMessage, res: ServerResponse) => {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", () => {
@@ -62,6 +66,7 @@ export async function startFakeConsole(opts: { site?: string; requirePassword?: 
       const session = /unifises=([^;]+)/.exec(cookie)?.[1];
       const authed = (!opts.requirePassword && apiKey === state.apiKey) || (session !== undefined && sessions.has(session));
       state.requests.push({ method: req.method ?? "", path, auth: apiKey ? "key" : session ? "cookie" : "none" });
+      if (state.intercept?.(req, res, path)) return;
 
       if (path === "/api/auth/login" && req.method === "POST") {
         if (body?.username === state.password.username && body?.password === state.password.password) {
@@ -118,11 +123,17 @@ export async function startFakeConsole(opts: { site?: string; requirePassword?: 
       }
       return send(404, { error: `no route for ${req.method} ${path}` });
     });
-  });
+  };
+  state.server = opts.tls ? createHttpsServer(opts.tls, handler) : createServer(handler);
   await new Promise<void>((r) => state.server.listen(0, "127.0.0.1", r));
   const addr = state.server.address();
   const port = typeof addr === "object" && addr ? addr.port : 0;
-  state.url = `http://127.0.0.1:${port}`;
-  state.close = () => new Promise((r) => state.server.close(() => r()));
+  state.url = `${opts.tls ? "https" : "http"}://127.0.0.1:${port}`;
+  state.close = () =>
+    new Promise((r) => {
+      // Keep-alive sockets from the client would hold close() open.
+      state.server.closeAllConnections();
+      state.server.close(() => r());
+    });
   return state;
 }

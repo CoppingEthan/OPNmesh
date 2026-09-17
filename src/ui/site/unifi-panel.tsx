@@ -1,6 +1,6 @@
 "use client";
 
-import { RefreshCw, ShieldCheck, Unplug } from "lucide-react";
+import { GlobeLock, RefreshCw, ShieldCheck, Unplug } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { LinkView } from "@/server/unifi";
 import type { SiteState } from "@/server/state";
@@ -80,12 +80,17 @@ export function UnifiPanel({ site }: { site: SiteState }) {
       {Object.keys(link.managed.routes).length > 0 && (
         <p className="mt-2 text-xs text-ink-3">
           Managing {Object.keys(link.managed.routes).length} route{Object.keys(link.managed.routes).length === 1 ? "" : "s"} named <Mono>OPNmesh: …</Mono>
-          {link.managed.policy ? " and one firewall policy" : ""}. Nothing else on the console is touched.
+          {link.managed.policy ? " and one firewall policy" : ""} that this connection created. Nothing else on the console is touched.
         </p>
       )}
-      {link.certFingerprint && (
+      {link.certMode === "pinned" && link.certFingerprint && (
         <p className="mt-1 flex items-center gap-1 text-xs text-ink-3">
           <ShieldCheck className="h-3.5 w-3.5" /> Certificate pinned <Mono>{link.certFingerprint.slice(0, 23)}…</Mono>
+        </p>
+      )}
+      {link.certMode === "system" && (
+        <p className="mt-1 flex items-center gap-1 text-xs text-ink-3">
+          <GlobeLock className="h-3.5 w-3.5" /> Public certificate, checked against trusted authorities and the host name on every connection
         </p>
       )}
       {msg && <div className="mt-3"><Notice tone={msg.tone}>{msg.text}</Notice></div>}
@@ -164,6 +169,8 @@ function LinkForm({ site, existing, onDone, onCancel }: { site: SiteState; exist
 
   const needsTrust = probe?.certificate && !probe.certificate.systemTrusted && trusted !== probe.certificate.fingerprint;
   const verified = probe && !probe.error && probe.identity;
+  // A public certificate is checked, not pinned: pinning it would break at each renewal.
+  const systemTrust = probe?.certificate?.systemTrusted === true;
 
   return (
     <form
@@ -179,8 +186,9 @@ function LinkForm({ site, existing, onDone, onCancel }: { site: SiteState; exist
             unifiSite,
             auth,
             standalone,
-            certFingerprint: probe?.certificate && !probe.certificate.systemTrusted ? probe.certificate.fingerprint : null,
-            certPem: probe?.certificate && !probe.certificate.systemTrusted ? probe.certificate.pem : null,
+            certMode: systemTrust ? "system" : "pinned",
+            certFingerprint: probe?.certificate && !systemTrust ? probe.certificate.fingerprint : null,
+            certPem: probe?.certificate && !systemTrust ? probe.certificate.pem : null,
           });
           await onDone();
         } catch (e2) {
@@ -250,6 +258,19 @@ function LinkForm({ site, existing, onDone, onCancel }: { site: SiteState; exist
           Connected{probe?.identity?.version ? ` to Network ${probe.identity.version}` : ""}
           {probe?.identity?.name ? ` as ${probe.identity.name}` : ""}.
         </Notice>
+      )}
+      {verified && probe?.certificate && (
+        <p className="flex items-start gap-1.5 text-xs text-ink-3">
+          {systemTrust ? (
+            <>
+              <GlobeLock className="mt-0.5 h-3.5 w-3.5 shrink-0" /> The console has a publicly trusted certificate ({probe.certificate.subject}). It will not be pinned: every connection checks it against trusted certificate authorities and the host name, so renewals need no action.
+            </>
+          ) : (
+            <>
+              <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" /> The certificate you confirmed will be pinned: connections are refused if the console presents any other one.
+            </>
+          )}
+        </p>
       )}
 
       <div className="flex flex-wrap gap-2">
