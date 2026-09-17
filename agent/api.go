@@ -52,8 +52,19 @@ func newClient(cfg Config, token string) (*Client, error) {
 	return &Client{
 		base:  strings.TrimRight(cfg.ControllerURL, "/"),
 		token: token,
-		http:  &http.Client{Transport: transport, Timeout: 30 * time.Second},
+		http:  &http.Client{Transport: transport, Timeout: 30 * time.Second, CheckRedirect: refuseRedirect},
 	}, nil
+}
+
+// refuseRedirect stops every redirect. The controller never redirects the
+// agent's API, and following one could carry the gateway token to another
+// host or down to plain http.
+func refuseRedirect(req *http.Request, _ []*http.Request) error {
+	status := 0
+	if req.Response != nil {
+		status = req.Response.StatusCode
+	}
+	return fmt.Errorf("the controller answered with a redirect (HTTP %d), which the agent does not follow", status)
 }
 
 type apiError struct {
@@ -75,8 +86,9 @@ const maxErrorSummary = 160
 
 // summariseBody turns an error response into one short line: the JSON
 // "error" field when there is one, otherwise the heading of an HTML page (a
-// proxy's or firewall's block page), with whitespace collapsed and a length
-// cap, so a failing report never floods the journal.
+// proxy's or firewall's block page), with whitespace collapsed, anything
+// non-printing dropped and a length cap, so a failing report never floods
+// or garbles the journal.
 func summariseBody(body string) string {
 	var parsed struct {
 		Error string `json:"error"`
@@ -95,7 +107,7 @@ func summariseBody(body string) string {
 			}
 		}
 	}
-	msg = strings.Join(strings.Fields(msg), " ")
+	msg = strings.Join(strings.Fields(printable(msg)), " ")
 	if msg == "" {
 		return "(empty response)"
 	}

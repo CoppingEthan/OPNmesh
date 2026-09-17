@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -70,7 +69,7 @@ func applyConfig(cfg Config, desired *ConfigResponse) error {
 	if !ok {
 		return errors.New("controller sent no wireguard.conf")
 	}
-	if err := validateHooks(wgConf, cfg.ConfDir); err != nil {
+	if err := validateFiles(desired.Files, cfg.ConfDir); err != nil {
 		return err
 	}
 	if got := hashFiles(desired.Files); got != desired.Hash {
@@ -93,7 +92,7 @@ func applyConfig(cfg Config, desired *ConfigResponse) error {
 	if len(changed) == 0 && !ifaceChanged && wgInterfaceExists(iface) {
 		return finishApply(cfg, desired, iface)
 	}
-	log.Printf("apply: %s changed (interface %s)", strings.Join(changed, ", "), iface)
+	logf("apply: %s changed (interface %s)", strings.Join(changed, ", "), iface)
 
 	restart := ifaceChanged || !wgInterfaceExists(oldIface) || interfaceSection(oldWg) != interfaceSection(wgConf)
 	if restart {
@@ -176,30 +175,21 @@ func finishApply(cfg Config, desired *ConfigResponse, iface string) error {
 	return nil
 }
 
-// applySysctl writes each "key = value" straight into /proc/sys.
+// applySysctl writes each allowed "key = value" straight into /proc/sys.
 func applySysctl(conf string) error {
-	for _, raw := range strings.Split(conf, "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		key := strings.TrimSpace(parts[0])
-		val := strings.TrimSpace(parts[1])
-		if !strings.HasPrefix(key, "net.") || strings.Contains(key, "..") || strings.ContainsAny(key, "/ ") {
-			return fmt.Errorf("refusing sysctl %q", key)
-		}
-		path := "/proc/sys/" + strings.ReplaceAll(key, ".", "/")
+	settings, err := parseSysctl(conf)
+	if err != nil {
+		return err
+	}
+	for _, s := range settings {
+		path := "/proc/sys/" + strings.ReplaceAll(s.Key, ".", "/")
 		// Already correct (e.g. set by the platform at boot) → nothing to do,
 		// which also covers containers where /proc/sys is read-only.
-		if cur, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(cur)) == val {
+		if cur, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(cur)) == s.Value {
 			continue
 		}
-		if err := os.WriteFile(path, []byte(val+"\n"), 0o644); err != nil {
-			return fmt.Errorf("sysctl %s: %w", key, err)
+		if err := os.WriteFile(path, []byte(s.Value+"\n"), 0o644); err != nil {
+			return fmt.Errorf("sysctl %s: %w", s.Key, err)
 		}
 	}
 	return nil
@@ -235,6 +225,11 @@ func applyFromDisk(cfg Config) error {
 	meta := cfg.loadMeta()
 	iface := meta.Interface
 	files := diskFiles(cfg, iface)
+	// Files on disk get the same checks as the controller's: they may be
+	// .prev copies, or have been written by an older agent.
+	if err := validateFiles(files, cfg.ConfDir); err != nil {
+		return err
+	}
 	if s, ok := files["sysctl.conf"]; ok {
 		if err := applySysctl(s); err != nil {
 			return err
@@ -246,9 +241,6 @@ func applyFromDisk(cfg Config) error {
 		}
 	}
 	if wg, ok := files["wireguard.conf"]; ok {
-		if err := validateHooks(wg, cfg.ConfDir); err != nil {
-			return err
-		}
 		if !wgInterfaceExists(iface) {
 			if err := wgQuickUp(realPath(cfg, iface, "wireguard.conf")); err != nil {
 				return err
@@ -300,13 +292,18 @@ func maintainTunnel(cfg Config, rr *reresolver, lastBringUp *time.Time) {
 		}
 		*lastBringUp = time.Now()
 		if err := applyFromDisk(cfg); err != nil {
-			log.Printf("bring-up from disk: %v", err)
+			logf("bring-up from disk: %v", err)
 			return
 		}
-		log.Printf("brought %s up from the files on disk", meta.Interface)
+		logf("brought %s up from the files on disk", meta.Interface)
+	}
+	// A file that fails the checks (left by an older agent, or edited by
+	// hand) steers neither the key nor the endpoints; bring-up reports why.
+	if validateWireGuard(wg, cfg.ConfDir) != nil {
+		return
 	}
 	if err := ensurePrivateKey(meta.Interface, privateKeyPathOf(wg)); err != nil {
-		log.Printf("restore private key: %v", err)
+		logf("restore private key: %v", err)
 	}
 	rr.run(meta.Interface, wg)
 }

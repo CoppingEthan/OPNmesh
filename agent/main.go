@@ -13,6 +13,9 @@
 //	opnmesh-gw rollback       restore the previous configuration files and re-apply
 //	opnmesh-gw status         print applied state and wg show
 //	opnmesh-gw version
+//
+// enrol reads the token from OPNMESH_TOKEN when --token is not given, which
+// keeps it out of the process list.
 package main
 
 import (
@@ -56,7 +59,7 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "opnmesh-gw %s: %v\n", os.Args[1], err)
+		fmt.Fprintf(os.Stderr, "opnmesh-gw %s: %s\n", os.Args[1], printable(err.Error()))
 		os.Exit(1)
 	}
 }

@@ -28,7 +28,7 @@ AllowedIPs = 10.99.1.11/32
 `
 
 func TestValidateHooks(t *testing.T) {
-	if err := validateHooks(sampleConf, "/etc/opnmesh"); err != nil {
+	if err := validateWireGuard(sampleConf, "/etc/opnmesh"); err != nil {
 		t.Fatalf("sanctioned PostUp rejected: %v", err)
 	}
 	bad := []string{
@@ -40,7 +40,7 @@ func TestValidateHooks(t *testing.T) {
 		"[Interface]\nPrivateKey = placeholder-the-line-is-refused-whatever-its-value\n",
 	}
 	for _, c := range bad {
-		if err := validateHooks(c, "/etc/opnmesh"); err == nil {
+		if err := validateWireGuard(c, "/etc/opnmesh"); err == nil {
 			t.Errorf("accepted dangerous config:\n%s", c)
 		}
 	}
