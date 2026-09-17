@@ -5,7 +5,9 @@
  * durable history comes from the telemetry tables.
  */
 import { liveState } from "./live";
+import { getSettings } from "./settings";
 import { getGenerated } from "./snapshot";
+import { liveMaxAgeMs } from "./status";
 import { meshSites } from "@/core/topology";
 
 export const LIVE_WINDOW = 120;
@@ -25,7 +27,8 @@ class LiveSeries {
 
   sample(at: number): void {
     const gen = getGenerated();
-    const live = liveState();
+    // A gateway that stopped reporting contributes nothing, not its last rate.
+    const live = liveState().recent(at, liveMaxAgeMs(getSettings().telemetryIntervalS));
     const rates: Record<string, { in: number; out: number }> = {};
     for (const s of meshSites(gen.snapshot)) {
       const l = live.get(s.gateway.id);

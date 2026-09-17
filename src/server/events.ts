@@ -37,10 +37,14 @@ export function logEvent(
     .run();
 }
 
+export const MAX_EVENTS_PAGE = 1000;
+
+/** Newest first, `limit` clamped to 1–1000 (SQLite reads a negative LIMIT as "no limit"). */
 export function listEvents(limit = 200, before?: number) {
   const db = getDb();
-  const q = db.select().from(events).orderBy(desc(events.id)).limit(Math.min(limit, 1000));
-  return before ? q.where(lt(events.id, before)).all() : q.all();
+  const n = Number.isFinite(limit) ? Math.min(Math.max(Math.trunc(limit), 1), MAX_EVENTS_PAGE) : 200;
+  const q = db.select().from(events).orderBy(desc(events.id)).limit(n);
+  return before !== undefined && Number.isSafeInteger(before) && before > 0 ? q.where(lt(events.id, before)).all() : q.all();
 }
 
 export function pruneEvents(olderThanMs: number): number {

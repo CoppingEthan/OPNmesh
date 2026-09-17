@@ -4,10 +4,10 @@
  * Every mutation that changes generated output bumps the config version so
  * agents pick it up on their next tick, and writes an audit event.
  */
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, isNull } from "drizzle-orm";
 import { getDb } from "@/db";
-import { enrolTokens, gateways, lans, sites, type GatewayRow, type LanRow, type SiteRow } from "@/db/schema";
-import { cidrHasHostBits, isHostname, isValidCidr, isValidIpv4, nextFreeIp, normalizeCidr } from "@/core/ip";
+import { clients, enrolTokens, gateways, lans, sites, type GatewayRow, type LanRow, type SiteRow } from "@/db/schema";
+import { cidrHasHostBits, isHostname, isUsableHostIp, isValidCidr, isValidIpv4, nextFreeIp, normalizeCidr } from "@/core/ip";
 import { randomId, randomToken, sha256Hex } from "@/core/crypto";
 import { SLUG_RE, WG_KEY_RE, slugify, type RouterLayout } from "@/core/model";
 import { logEvent } from "./events";
@@ -45,6 +45,18 @@ export function listSites(): SiteWithRelations[] {
 
 export function getSite(id: string): SiteWithRelations | null {
   return listSites().find((s) => s.id === id) ?? null;
+}
+
+export type PublicGateway = Omit<GatewayRow, "tokenHash">;
+
+/** A gateway row as the admin API returns it: the token hash stays in the database. */
+export function publicGateway(g: GatewayRow): PublicGateway {
+  const { tokenHash: _t, ...rest } = g;
+  return rest;
+}
+
+export function publicSite(s: SiteWithRelations): Omit<SiteWithRelations, "gateway"> & { gateway: PublicGateway | null } {
+  return { ...s, gateway: s.gateway ? publicGateway(s.gateway) : null };
 }
 
 function uniqueSlug(base: string, exceptId?: string): string {
@@ -214,25 +226,32 @@ export function removeLan(siteId: string, lanId: string, actor = "admin"): void 
 
 export const ENROL_TOKEN_TTL_MS = 30 * 60 * 1000;
 
+/** A site has at most one unused token: issuing a new one revokes the others. */
 export function createEnrolToken(siteId: string, opts: { autoApprove?: boolean; ttlMs?: number } = {}, actor = "admin"): { token: string; expiresAt: number } {
   const site = getSite(siteId);
   if (!site) throw new SiteError("site not found", 404);
   const token = randomToken();
   const expiresAt = now() + (opts.ttlMs ?? ENROL_TOKEN_TTL_MS);
-  getDb()
-    .insert(enrolTokens)
-    .values({
-      id: randomId(),
-      siteId,
-      tokenHash: sha256Hex(token),
-      autoApprove: opts.autoApprove ?? true,
-      expiresAt,
-      usedAt: null,
-      createdBy: actor,
-      createdAt: now(),
-    })
-    .run();
-  logEvent("enrol", `Enrolment token issued for "${site.name}"`, { actor, subject: siteId });
+  let revoked = 0;
+  getDb().transaction((tx) => {
+    revoked = tx
+      .delete(enrolTokens)
+      .where(and(eq(enrolTokens.siteId, siteId), isNull(enrolTokens.usedAt)))
+      .run().changes;
+    tx.insert(enrolTokens)
+      .values({
+        id: randomId(),
+        siteId,
+        tokenHash: sha256Hex(token),
+        autoApprove: opts.autoApprove ?? true,
+        expiresAt,
+        usedAt: null,
+        createdBy: actor,
+        createdAt: now(),
+      })
+      .run();
+  });
+  logEvent("enrol", `Enrolment token issued for "${site.name}"${revoked > 0 ? " (earlier unused tokens revoked)" : ""}`, { actor, subject: siteId });
   return { token, expiresAt };
 }
 
@@ -256,7 +275,17 @@ export interface EnrolRequest {
 
 export type EnrolResult =
   | { ok: true; gatewayId: string; gatewayToken: string; status: "pending" | "active"; siteName: string }
-  | { ok: false; reason: "invalid-token" | "expired" | "used" | "bad-key" | "no-address" };
+  | { ok: false; reason: "invalid-token" | "expired" | "used" | "bad-key" | "duplicate-key" | "no-address" };
+
+/** Thrown inside the enrolment transaction when another request spent the token first. */
+class TokenSpent extends Error {}
+
+function isUniqueViolation(e: unknown, column: string): boolean {
+  for (let x: unknown = e; x instanceof Error; x = x.cause) {
+    if ((x as { code?: unknown }).code === "SQLITE_CONSTRAINT_UNIQUE" && x.message.includes(column)) return true;
+  }
+  return false;
+}
 
 /**
  * Consume a token and create (or replace) the site's gateway. The private key
@@ -274,9 +303,16 @@ export function enrolGateway(req: EnrolRequest): EnrolResult {
   if (!WG_KEY_RE.test(req.publicKey)) return { ok: false, reason: "bad-key" };
   const site = getSite(tok.siteId);
   if (!site) return { ok: false, reason: "invalid-token" };
-
-  const addresses = req.addresses.filter(isValidIpv4).slice(0, 16);
   const previous = site.gateway;
+
+  // A key is one peer's identity mesh-wide. A roaming client's key accepted
+  // here would give its holder a gateway token; a rebuilt VM may keep its own.
+  const keyGateway = db.select({ id: gateways.id }).from(gateways).where(eq(gateways.publicKey, req.publicKey)).get();
+  const keyClient = db.select({ id: clients.id }).from(clients).where(eq(clients.publicKey, req.publicKey)).get();
+  if (keyClient || (keyGateway && keyGateway.id !== previous?.id)) return { ok: false, reason: "duplicate-key" };
+
+  // The first address becomes the router's next hop, so it must be one a host can hold.
+  const addresses = req.addresses.filter(isUsableHostIp).slice(0, 16);
   const lanIp = previous?.lanIp ?? addresses[0];
   if (!lanIp) return { ok: false, reason: "no-address" };
 
@@ -290,37 +326,55 @@ export function enrolGateway(req: EnrolRequest): EnrolResult {
   const status = tok.autoApprove ? "active" : "pending";
   const cleanHost = req.hostname.replace(/[^A-Za-z0-9._-]/g, "").slice(0, 63);
 
-  db.transaction((tx) => {
-    tx.update(enrolTokens).set({ usedAt: t }).where(eq(enrolTokens.id, tok.id)).run();
-    if (previous) tx.delete(gateways).where(eq(gateways.id, previous.id)).run();
-    tx.insert(gateways)
-      .values({
-        id,
-        siteId: site.id,
-        name: previous?.name ?? `${site.name} gateway`,
-        hostname: cleanHost,
-        publicKey: req.publicKey,
-        tunnelIp,
-        lanIp,
-        endpointHost: previous?.endpointHost ?? null,
-        listenPort: previous?.listenPort ?? null,
-        mtu: previous?.mtu ?? null,
-        tokenHash: sha256Hex(gatewayToken),
-        status,
-        enrolledAt: t,
-        approvedAt: status === "active" ? t : null,
-        lastSeenAt: null,
-        agentVersion: req.agentVersion.slice(0, 32),
-        os: req.os.replace(/[^A-Za-z0-9 ._-]/g, "").slice(0, 64),
-        arch: req.arch.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 16),
-        addresses,
-        lastError: "",
-        appliedHash: "",
-        diskHash: "",
-        alertState: "",
-      })
-      .run();
-  });
+  try {
+    db.transaction((tx) => {
+      const spent = tx
+        .update(enrolTokens)
+        .set({ usedAt: t })
+        .where(and(eq(enrolTokens.id, tok.id), isNull(enrolTokens.usedAt)))
+        .run();
+      if (spent.changes !== 1) throw new TokenSpent();
+      // The site's other unused tokens have nothing left to do.
+      tx.delete(enrolTokens)
+        .where(and(eq(enrolTokens.siteId, site.id), isNull(enrolTokens.usedAt)))
+        .run();
+      if (previous) tx.delete(gateways).where(eq(gateways.id, previous.id)).run();
+      tx.insert(gateways)
+        .values({
+          id,
+          siteId: site.id,
+          name: previous?.name ?? `${site.name} gateway`,
+          hostname: cleanHost,
+          publicKey: req.publicKey,
+          tunnelIp,
+          lanIp,
+          endpointHost: previous?.endpointHost ?? null,
+          listenPort: previous?.listenPort ?? null,
+          mtu: previous?.mtu ?? null,
+          tokenHash: sha256Hex(gatewayToken),
+          status,
+          enrolledAt: t,
+          approvedAt: status === "active" ? t : null,
+          lastSeenAt: null,
+          agentVersion: req.agentVersion.slice(0, 32),
+          os: req.os.replace(/[^A-Za-z0-9 ._-]/g, "").slice(0, 64),
+          arch: req.arch.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 16),
+          addresses,
+          lastError: "",
+          appliedHash: "",
+          diskHash: "",
+          alertState: "",
+        })
+        .run();
+    });
+  } catch (e) {
+    if (e instanceof TokenSpent) return { ok: false, reason: "used" };
+    // Two enrolments racing with one key: the check above cannot see the other.
+    if (isUniqueViolation(e, "gateways.public_key")) return { ok: false, reason: "duplicate-key" };
+    throw e;
+  }
+  // The old VM's numbers must not stand in for the new one's.
+  if (previous) liveState().forget(previous.id);
   bumpConfigVersion();
   logEvent("gateway", `${previous ? "Replacement gateway" : "Gateway"} "${cleanHost}" enrolled for "${site.name}" (${status})`, {
     actor: "gateway",
@@ -347,7 +401,7 @@ export function updateGateway(siteId: string, patch: GatewayPatch, actor = "admi
   const site = getSite(siteId);
   if (!site || !site.gateway) throw new SiteError("this site has no gateway", 404);
   const g = site.gateway;
-  if (patch.lanIp !== undefined && !isValidIpv4(patch.lanIp)) throw new SiteError("gateway address must be an IPv4 address");
+  if (patch.lanIp !== undefined && !isUsableHostIp(patch.lanIp)) throw new SiteError("gateway address must be a host's IPv4 address on the site's network");
   if (patch.endpointHost) {
     if (patch.endpointHost.includes(":")) throw new SiteError("endpoint is a host only — the port is set separately");
     if (!isValidIpv4(patch.endpointHost) && !isHostname(patch.endpointHost)) throw new SiteError("endpoint must be a public IP or hostname");
@@ -369,6 +423,8 @@ export function updateGateway(siteId: string, patch: GatewayPatch, actor = "admi
     })
     .where(eq(gateways.id, g.id))
     .run();
+  // A disabled gateway's last report would otherwise keep showing as current traffic.
+  if (patch.status === "disabled") liveState().forget(g.id);
   bumpConfigVersion();
   logEvent("gateway", `Gateway for "${site.name}" updated`, { actor, subject: siteId, detail: patch });
   return getSite(siteId)!.gateway!;

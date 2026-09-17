@@ -121,12 +121,33 @@ export function isHostname(s: string): boolean {
     .every((label) => /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/i.test(label));
 }
 
-/** Private or otherwise non-routable ranges that a LAN is allowed to be in. */
+/** Whether every address of `inner` lies inside `outer`. */
+export function cidrWithin(inner: string, outer: string): boolean {
+  const i = parseCidr(inner);
+  const o = parseCidr(outer);
+  if (i === null || o === null) return false;
+  return i.network >= o.network && i.broadcast <= o.broadcast;
+}
+
+const PRIVATE_RANGES = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"];
+
+/**
+ * RFC 1918 or shared address space (RFC 6598), wholly: a network that merely
+ * overlaps one (0.0.0.0/4 overlaps 10.0.0.0/8) still covers public addresses.
+ */
 export function isPrivateCidr(cidr: string): boolean {
-  return (
-    cidrOverlaps(cidr, "10.0.0.0/8") ||
-    cidrOverlaps(cidr, "172.16.0.0/12") ||
-    cidrOverlaps(cidr, "192.168.0.0/16") ||
-    cidrOverlaps(cidr, "100.64.0.0/10")
-  );
+  return PRIVATE_RANGES.some((r) => cidrWithin(cidr, r));
+}
+
+const UNUSABLE_HOST_RANGES = [
+  "0.0.0.0/8", // "this network", including the unspecified address
+  "127.0.0.0/8", // loopback
+  "169.254.0.0/16", // link-local
+  "224.0.0.0/4", // multicast
+  "240.0.0.0/4", // class E, and the limited broadcast address
+];
+
+/** An address a host can hold on a network and be reached at by a router. */
+export function isUsableHostIp(ip: string): boolean {
+  return isValidIpv4(ip) && !UNUSABLE_HOST_RANGES.some((r) => cidrContainsIp(r, ip));
 }

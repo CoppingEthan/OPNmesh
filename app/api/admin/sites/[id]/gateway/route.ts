@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { json, parseBody, withAdmin } from "@/server/http";
-import { removeGateway, updateGateway } from "@/server/sites";
+import { publicGateway, removeGateway, updateGateway } from "@/server/sites";
 
 export const dynamic = "force-dynamic";
 
@@ -17,7 +17,7 @@ type P = { id: string };
 
 export const PATCH = withAdmin<P>(async (req, { params, admin }) => {
   const body = await parseBody(req, schema);
-  return json(updateGateway(params.id, body, admin.email));
+  return json(publicGateway(updateGateway(params.id, body, admin.email)));
 });
 
 export const DELETE = withAdmin<P>(async (_req, { params, admin }) => {

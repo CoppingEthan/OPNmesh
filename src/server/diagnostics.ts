@@ -10,7 +10,7 @@
  * and whether full-size packets survive the path to each peer.
  */
 import { promises as dns } from "node:dns";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { z } from "zod";
 import { getDb } from "@/db";
 import { gateways, type GatewayRow } from "@/db/schema";
@@ -22,7 +22,7 @@ import { liveState } from "./live";
 import { getSettings, publicUrl } from "./settings";
 import { getSite } from "./sites";
 import { getGenerated } from "./snapshot";
-import { gatewayHealth } from "./status";
+import { gatewayHealth, liveMaxAgeMs } from "./status";
 
 export type CheckStatus = "pass" | "warn" | "fail" | "skip";
 
@@ -162,11 +162,22 @@ export function buildAgentRequest(gw: GatewayRow, id: string): AgentDiagRequest 
   return req;
 }
 
-/** Keep the gateway's answer. Returns false for an answer to an older request. */
+/**
+ * Keep the gateway's answer. Returns false unless the gateway is active and
+ * this answers the request it was given, once: a report nobody asked for, or
+ * one for an older or already answered request, is not kept.
+ */
 export function storeAgentReport(gw: GatewayRow, report: AgentDiagReport): boolean {
-  if (gw.diagRequestedAt !== null && report.id !== String(gw.diagRequestedAt)) return false;
-  getDb().update(gateways).set({ diagJson: JSON.stringify(report), diagAt: now() }).where(eq(gateways.id, gw.id)).run();
-  return true;
+  if (gw.status !== "active" || gw.diagRequestedAt === null) return false;
+  if (report.id !== String(gw.diagRequestedAt)) return false;
+  if (gw.diagAt !== null && gw.diagAt >= gw.diagRequestedAt) return false;
+  // Conditional on the request still being the one answered, in case a new run was asked for meanwhile.
+  const r = getDb()
+    .update(gateways)
+    .set({ diagJson: JSON.stringify(report), diagAt: now() })
+    .where(and(eq(gateways.id, gw.id), eq(gateways.diagRequestedAt, gw.diagRequestedAt)))
+    .run();
+  return r.changes === 1;
 }
 
 function fmtAgo(ms: number): string {
@@ -281,8 +292,10 @@ export async function controllerChecks(siteId: string, at = now()): Promise<Chec
     }
   }
 
-  // 5. Can anything dial in?
+  // 5. Can anything dial in? Only this site's own report and those of the
+  // outbound-only gateways that must dial it count, and only while current.
   if (isReachable(mine)) {
+    const recent = live.recent(at, liveMaxAgeMs(settings.telemetryIntervalS));
     const dialers: Array<{ name: string; key: string; gwId: string | null }> = [];
     for (const other of all) {
       if (other.id !== mine.id && !isReachable(other) && pairStatus(snap, mine.id, other.id).kind === "direct") dialers.push({ name: other.name, key: other.gateway.publicKey, gwId: other.gateway.id });
@@ -294,13 +307,16 @@ export async function controllerChecks(siteId: string, at = now()): Promise<Chec
     } else if (dialers.length === 0) {
       checks.push({ id: "inbound", status: "skip", title: "Nothing dials in to this site yet", detail: "Every other site accepts connections itself and there are no clients, so inbound cannot be tested from outside." });
     } else {
-      // A dialer that reaches some other site but not this one points squarely at this site's port forward.
+      // A dialer that reaches some other site but not this one points squarely
+      // at this site's port forward. "Other site" means another reachable
+      // gateway, the only peers a dialer can have dialled.
+      const otherHubs = new Set(all.filter((s) => s.id !== mine.id && isReachable(s)).map((s) => s.gateway.publicKey));
       const elsewhere = dialers.filter((d) => {
         if (!d.gwId) return false;
-        const rep = live.get(d.gwId)?.report;
-        return rep?.peers.some((p) => p.publicKey !== mine.gateway.publicKey && (hsAge(p.latestHandshake) ?? Infinity) < FRESH_HANDSHAKE_S) ?? false;
+        const rep = recent.get(d.gwId)?.report;
+        return rep?.peers.some((p) => otherHubs.has(p.publicKey) && (hsAge(p.latestHandshake) ?? Infinity) < FRESH_HANDSHAKE_S) ?? false;
       });
-      const online = dialers.filter((d) => d.gwId && live.get(d.gwId));
+      const online = dialers.filter((d) => d.gwId && recent.get(d.gwId));
       if (elsewhere.length > 0) {
         checks.push({ id: "inbound", status: "fail", title: "Nothing can dial in to this site", detail: `${elsewhere.map((d) => d.name).join(", ")} reach other sites but not this one.`, hint: `Check the router forwards UDP ${myPort} to ${gw.lanIp} and that ${myEndpoint} is this site's current public address.` });
       } else if (online.length > 0) {

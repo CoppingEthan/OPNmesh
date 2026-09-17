@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { apiFetch } from "./api";
+import { ApiError, apiFetch } from "./api";
 import { Button, Card, Pre } from "./components";
 import { CopyButton, Notice } from "./components-client";
 
@@ -25,6 +25,8 @@ export function InvitePickup({ token }: { token: string }) {
   const [peek, setPeek] = useState<Peek | null>(null);
   const [picked, setPicked] = useState<Picked | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  // A reveal that failed without using up the link: shown in place, so it can be retried.
+  const [revealErr, setRevealErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -46,16 +48,20 @@ export function InvitePickup({ token }: { token: string }) {
         <p className="text-sm text-ink-2">
           This link works <strong>once</strong>. Have the WireGuard app ready on the device you want to connect, then reveal the configuration.
         </p>
+        {revealErr && <div className="mt-3"><Notice tone="error">{revealErr}</Notice></div>}
         <Button
           variant="primary"
           className="mt-4 w-full"
           disabled={!peek || busy}
           onClick={async () => {
             setBusy(true);
+            setRevealErr(null);
             try {
               setPicked(await apiFetch<Picked>("POST", `/api/invite/${encodeURIComponent(token)}`));
             } catch (e) {
-              setErr(e instanceof Error ? e.message : String(e));
+              const message = e instanceof Error ? e.message : String(e);
+              if (e instanceof ApiError && e.status === 409) setRevealErr(message);
+              else setErr(message);
             } finally {
               setBusy(false);
             }

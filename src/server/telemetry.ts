@@ -1,19 +1,24 @@
 /**
  * Telemetry ingest and time-series storage.
  *
- * Every report updates live state (rates), the gateway row (last seen,
- * applied hash, errors) and, when rates were computable, appends 5-second
- * samples. A scheduled rollup averages 5 s → 1 min → 1 h and prunes.
+ * Every stored report updates live state (rates), the gateway row (last
+ * seen, applied hash, errors) and, when rates were computable, appends
+ * 5-second samples. A scheduled rollup averages 5 s → 1 min → 1 h and prunes.
+ *
+ * A gateway token is only trusted for the gateway's own view: a report keeps
+ * only the peers and counters that gateway's generated config defines, at
+ * the rate the gateway was asked to report, so one compromised gateway can
+ * neither fill the disk nor speak for another site.
  */
 import { and, gte, lt, sql } from "drizzle-orm";
 import { getDb } from "@/db";
 import { pair1h, pair1m, pair5s, telemetry1h, telemetry1m, telemetry5s } from "@/db/schema";
 import type { GatewayRow } from "@/db/schema";
 import { logEvent } from "./events";
-import { liveState, type TelemetryReport } from "./live";
+import { HANDSHAKE_SKEW_MS, liveState, type CounterReport, type PeerReport, type TelemetryReport } from "./live";
 import { recordClientHandshake } from "./clients";
 import { recordGatewayReport } from "./sites";
-import { getGenerated } from "./snapshot";
+import { getGenerated, type Reportable } from "./snapshot";
 import { getSettings } from "./settings";
 import { now } from "./env";
 
@@ -22,15 +27,52 @@ export interface IngestOutcome {
   intervalSeconds: number;
 }
 
-export function ingestTelemetry(gw: GatewayRow, report: TelemetryReport): IngestOutcome {
+/** A gateway failing the same way on every report gets one audit event per this long. */
+export const APPLY_ERROR_LOG_GAP_MS = 5 * 60_000;
+
+/** Control and bidi-override characters, which could forge lines or reorder text in the UI and log. */
+const UNPRINTABLE_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]+/g;
+
+export function cleanAgentError(s: string): string {
+  return s.replace(UNPRINTABLE_RE, " ").trim().slice(0, 500);
+}
+
+/**
+ * The part of a report this gateway may speak for: its own peers and
+ * counters, each once, and no handshake from the future.
+ */
+export function ownReport(report: TelemetryReport, own: Reportable | undefined, at: number): TelemetryReport {
+  const latest = Math.floor((at + HANDSHAKE_SKEW_MS) / 1000);
+  const peers = new Map<string, PeerReport>();
+  for (const p of report.peers) {
+    if (!own?.peers.has(p.publicKey) || peers.has(p.publicKey)) continue;
+    peers.set(p.publicKey, p.latestHandshake > latest ? { ...p, latestHandshake: 0 } : p);
+  }
+  const counters = new Map<string, CounterReport>();
+  for (const c of report.counters) {
+    if (own?.counters.has(c.name) && !counters.has(c.name)) counters.set(c.name, c);
+  }
+  return { ...report, lastError: cleanAgentError(report.lastError), peers: [...peers.values()], counters: [...counters.values()] };
+}
+
+export function ingestTelemetry(gw: GatewayRow, raw: TelemetryReport): IngestOutcome {
   const t = now();
   const gen = getGenerated();
-  const desired = gen.bundle.gateways[gw.id]?.hash ?? "";
-  const { live, hasRates } = liveState().ingest(gw.id, gw.siteId, report, t);
+  const state = liveState();
+  // While someone is watching the overview, one report a second makes the
+  // picture genuinely live; otherwise the configured interval keeps things quiet.
+  const intervalSeconds = state.fastMode(t) ? 1 : getSettings().telemetryIntervalS;
+  // A held configuration is not advertised, so the agent keeps what it runs.
+  const configHash = gen.held.gateways[gw.id] !== undefined ? "" : (gen.bundle.gateways[gw.id]?.hash ?? "");
+  // The agent waits at least the interval between reports. One that comes
+  // much sooner still gets its answer, so the agent carries on, but is not kept.
+  if (!state.admitReport(gw.id, t, (intervalSeconds * 1000) / 2)) return { configHash, intervalSeconds };
 
-  const prevError = gw.lastError;
+  const report = ownReport(raw, gen.reportable[gw.id], t);
+  const { live, hasRates } = state.ingest(gw.id, gw.siteId, report, t);
+
   recordGatewayReport(gw.id, { agentVersion: report.version, appliedHash: report.appliedHash, diskHash: report.diskHash, lastError: report.lastError });
-  if (report.lastError && report.lastError !== prevError) {
+  if (report.lastError && report.lastError !== gw.lastError && state.errorLogDue(gw.id, t, APPLY_ERROR_LOG_GAP_MS)) {
     logEvent("apply-error", `Gateway ${gw.name} failed to apply configuration: ${report.lastError.slice(0, 300)}`, { actor: "gateway", subject: gw.siteId });
   }
 
@@ -73,9 +115,7 @@ export function ingestTelemetry(gw: GatewayRow, report: TelemetryReport): Ingest
     });
   }
 
-  // While someone is watching the overview, one report a second makes the
-  // picture genuinely live; otherwise the configured interval keeps things quiet.
-  return { configHash: desired, intervalSeconds: liveState().fastMode(t) ? 1 : getSettings().telemetryIntervalS };
+  return { configHash, intervalSeconds };
 }
 
 // ---------------------------------------------------------------------------

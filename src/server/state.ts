@@ -20,6 +20,7 @@ import {
   clientViews,
   desiredHashFor,
   gatewayView,
+  liveMaxAgeMs,
   pairRateViews,
   tunnelViews,
   type ClientSiteRateView,
@@ -119,9 +120,11 @@ function computeState(at: number): StatePayload {
   const s = getSettings();
   const gen = getGenerated();
   const live = liveState();
+  // Traffic and handshakes only from reports recent enough to be current.
+  const recent = live.recent(at, liveMaxAgeMs(s.telemetryIntervalS));
   const sites: SiteState[] = listSites().map((site) => {
     const gw = site.gateway;
-    const view = gw ? gatewayView(gw, site.slug, live.get(gw.id), desiredHashFor(gen.bundle, gw.id), at, s.telemetryIntervalS) : null;
+    const view = gw ? gatewayView(gw, site.slug, live.get(gw.id), desiredHashFor(gen.bundle, gw.id), at, s.telemetryIntervalS, gen.held.gateways[gw.id] ?? null) : null;
     return {
       id: site.id,
       name: site.name,
@@ -159,7 +162,7 @@ function computeState(at: number): StatePayload {
   });
 
   const siteRates: SiteRateView[] = meshSites(gen.snapshot).map((site) => {
-    const l = live.get(site.gateway.id);
+    const l = recent.get(site.gateway.id);
     let inBps = 0;
     let outBps = 0;
     if (l) {
@@ -171,9 +174,10 @@ function computeState(at: number): StatePayload {
     return { siteId: site.id, inBps, outBps };
   });
 
-  const tunnels = tunnelViews(gen.snapshot, live, at);
-  const clients = clientViews(listClients(), gen.snapshot, live, at);
-  const headline = computeHeadline(sites, tunnels, gen.findings);
+  const tunnels = tunnelViews(gen.snapshot, recent, at);
+  const clients = clientViews(listClients(), gen.snapshot, recent, at, gen.held.clients);
+  const heldCount = Object.keys(gen.held.gateways).length + Object.keys(gen.held.clients).length;
+  const headline = computeHeadline(sites, tunnels, gen.findings, heldCount);
 
   return {
     at,
@@ -192,9 +196,9 @@ function computeState(at: number): StatePayload {
     },
     sites,
     tunnels,
-    pairs: pairRateViews(gen.snapshot, live),
+    pairs: pairRateViews(gen.snapshot, recent),
     siteRates,
-    clientSiteRates: clientSiteRates(gen.snapshot, live),
+    clientSiteRates: clientSiteRates(gen.snapshot, recent),
     clients,
     findings: gen.findings,
     spof: spofAnalysis(gen.snapshot),
@@ -208,14 +212,18 @@ function list(names: string[]): string {
   return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
 }
 
-export function computeHeadline(sites: SiteState[], tunnels: TunnelView[], findings: Finding[]): Headline {
+/** `held` counts the gateway and client configs that errors are holding back. */
+export function computeHeadline(sites: SiteState[], tunnels: TunnelView[], findings: Finding[], held = 0): Headline {
   const inMesh = sites.filter((s) => s.inMesh);
   if (sites.length === 0) return { level: "empty", title: "Add your first site", detail: "A site is a location with its own router and networks. Create one, then install a gateway there." };
   if (inMesh.length === 0) {
     return { level: "empty", title: "Waiting for your first gateway", detail: "No gateway has connected yet. Open a site and run the install command it shows you." };
   }
   const errors = findings.filter((f) => f.level === "error");
-  if (errors.length > 0) return { level: "bad", title: "Your configuration has a problem", detail: errors[0]!.message };
+  if (errors.length > 0) {
+    const onHold = held > 0 ? `. Until it is fixed, ${held} affected configuration${held === 1 ? " is" : "s are"} on hold: gateways keep running their last good one, and client configs cannot be handed out.` : "";
+    return { level: "bad", title: "Your configuration has a problem", detail: errors[0]!.message + onHold };
+  }
 
   const offline = inMesh.filter((s) => s.gateway && (s.gateway.health === "offline" || s.gateway.health === "never"));
   if (offline.length > 0) {

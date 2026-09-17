@@ -6,12 +6,16 @@ export const dynamic = "force-dynamic";
 
 /**
  * The gateway's desired configuration. ETag is the bundle hash for this
- * gateway; an If-None-Match hit returns 304 with no body.
+ * gateway; an If-None-Match hit returns 304 with no body. While a validation
+ * error reaches this gateway's config it is held: 409, and the agent keeps
+ * running what it has (telemetry does not advertise the held hash either).
  */
 export const GET = withGateway(async (req, { gateway }) => {
   if (gateway.status === "pending") return json({ status: "pending", message: "waiting for approval in the OPNmesh UI" }, 202);
   if (gateway.status === "disabled") return json({ status: "disabled", message: "this gateway has been disabled" }, 403);
   const gen = getGenerated();
+  const held = gen.held.gateways[gateway.id];
+  if (held !== undefined) return json({ status: "held", error: `configuration on hold until an error is fixed in the OPNmesh UI: ${held}` }, 409);
   const entry = gen.bundle.gateways[gateway.id];
   if (!entry) return json({ status: "pending", message: "no configuration generated yet" }, 202);
   const etag = `"${entry.hash}"`;

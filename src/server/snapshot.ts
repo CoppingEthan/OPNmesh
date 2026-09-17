@@ -5,7 +5,7 @@
  */
 import type { ClientSnapshot, SiteSnapshot, Snapshot } from "@/core/model";
 import { generateAll, type Bundle } from "@/core/generate";
-import { validateAll, type Finding } from "@/core/validate";
+import { heldConfigs, parsePeers, validateAll, type Finding, type Held } from "@/core/validate";
 import { CLIENT_PRIVATE_KEY_PLACEHOLDER } from "@/core/generate/wireguard";
 import { clientPrivateKey, listClients } from "./clients";
 import { getSettings } from "./settings";
@@ -62,14 +62,41 @@ export function loadSnapshot(): Snapshot {
   };
 }
 
+/** What a gateway's own configuration lets it report: its peers' keys and its counters' names. */
+export interface Reportable {
+  peers: Set<string>;
+  counters: Set<string>;
+}
+
 export interface Generated {
   version: number;
   snapshot: Snapshot;
   bundle: Bundle;
   findings: Finding[];
+  /** Configs an error finding keeps from being handed out. */
+  held: Held;
+  /** gateway id → what its telemetry may contain. */
+  reportable: Record<string, Reportable>;
 }
 
 const g = globalThis as unknown as { __opnmeshGenerated?: Generated };
+
+const COUNTER_RE = /^\s*counter (\S+) \{\}$/gm;
+
+/**
+ * Read from the generated text itself, like the validators, so telemetry is
+ * judged against exactly what the gateway was told to run.
+ */
+function reportableFrom(bundle: Bundle): Record<string, Reportable> {
+  const out: Record<string, Reportable> = {};
+  for (const [id, gw] of Object.entries(bundle.gateways)) {
+    out[id] = {
+      peers: new Set(parsePeers(gw.files["wireguard.conf"]).flatMap((p) => (p.publicKey ? [p.publicKey] : []))),
+      counters: new Set([...gw.files["nftables.conf"].matchAll(COUNTER_RE)].map((m) => m[1]!)),
+    };
+  }
+  return out;
+}
 
 /** The current generated state, recomputed only when the config version changes. */
 export function getGenerated(): Generated {
@@ -79,7 +106,7 @@ export function getGenerated(): Generated {
   const snapshot = loadSnapshot();
   const bundle = generateAll(snapshot);
   const findings = validateAll(snapshot, bundle);
-  g.__opnmeshGenerated = { version, snapshot, bundle, findings };
+  g.__opnmeshGenerated = { version, snapshot, bundle, findings, held: heldConfigs(snapshot, findings), reportable: reportableFrom(bundle) };
   return g.__opnmeshGenerated;
 }
 
@@ -87,12 +114,22 @@ export function invalidateGenerated(): void {
   g.__opnmeshGenerated = undefined;
 }
 
-/** A client's complete config with its real private key filled in. */
+/** Why a gateway's configuration is being held back, or null when it may be served. */
+export function gatewayConfHeld(gatewayId: string): string | null {
+  return getGenerated().held.gateways[gatewayId] ?? null;
+}
+
+/** Why a client's configuration is being held back, or null when it may be handed out. */
+export function clientConfHeld(clientId: string): string | null {
+  return getGenerated().held.clients[clientId] ?? null;
+}
+
+/** A client's complete config with its real private key filled in. Null when unavailable or held. */
 export function renderClientConf(clientId: string): string | null {
   const gen = getGenerated();
   const entry = gen.bundle.clients[clientId];
   const row = listClients().find((c) => c.id === clientId);
-  if (!entry || !row) return null;
+  if (!entry || !row || gen.held.clients[clientId] !== undefined) return null;
   // A config with no [Peer] cannot connect anywhere; treat it as unavailable
   // so the UI explains why instead of handing out something useless.
   if (!entry.conf.includes("[Peer]")) return null;

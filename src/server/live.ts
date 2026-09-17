@@ -44,6 +44,14 @@ export const telemetrySchema = z.object({
 
 export type TelemetryReport = z.infer<typeof telemetrySchema>;
 export type PeerReport = z.infer<typeof peerReportSchema>;
+export type CounterReport = z.infer<typeof pairReportSchema>;
+
+/**
+ * How far ahead of the controller's clock a handshake time may be and still
+ * be believed. Anything later is a wrong clock or a lie, and would otherwise
+ * keep a client "online" for as long as it says.
+ */
+export const HANDSHAKE_SKEW_MS = 120_000;
 
 export interface PeerRate {
   rxBps: number;
@@ -60,6 +68,11 @@ export interface LiveGateway {
   counterRates: Map<string, number>;
 }
 
+/** The live reports a view may use. */
+export interface LiveReader {
+  get(gatewayId: string): LiveGateway | undefined;
+}
+
 export interface IngestResult {
   live: LiveGateway;
   /** True when a previous report existed and rates could be computed. */
@@ -69,8 +82,24 @@ export interface IngestResult {
 /** How long gateways keep reporting every second after the last overview closes. */
 export const FAST_MODE_GRACE_MS = 20_000;
 
+/**
+ * Reports a gateway may send back to back before the minimum gap applies: an
+ * agent reports at once when it starts, and the interval it was last given
+ * may be longer than the one it is about to be given.
+ */
+export const REPORT_BURST = 3;
+
+interface Gate {
+  /** Reports that may still be stored now (a token bucket). */
+  tokens: number;
+  at: number;
+  /** When an apply error was last written to the audit log. */
+  errorLoggedAt: number | null;
+}
+
 export class LiveState {
   private gateways = new Map<string, LiveGateway>();
+  private gates = new Map<string, Gate>();
   private listeners = new Set<() => void>();
   private fastViewers = 0;
   private lastFastViewerLeft = 0;
@@ -131,6 +160,32 @@ export class LiveState {
     return { live, hasRates };
   }
 
+  /**
+   * Whether a report arriving now may be stored. Each gateway earns one
+   * report per `minGapMs`, up to REPORT_BURST in hand; a gateway reporting
+   * faster than it was asked to is answered but not kept, which bounds what
+   * one gateway token can make the controller write.
+   */
+  admitReport(gatewayId: string, at: number, minGapMs: number): boolean {
+    const gate = this.gates.get(gatewayId) ?? { tokens: REPORT_BURST, at, errorLoggedAt: null };
+    // A clock that stepped backwards earns nothing, and counting resumes from the new time.
+    gate.tokens = Math.min(REPORT_BURST, gate.tokens + Math.max(0, at - gate.at) / Math.max(1, minGapMs));
+    gate.at = at;
+    this.gates.set(gatewayId, gate);
+    if (gate.tokens < 1) return false;
+    gate.tokens -= 1;
+    return true;
+  }
+
+  /** Whether an apply error may go to the audit log now; if so, the time is noted. */
+  errorLogDue(gatewayId: string, at: number, minGapMs: number): boolean {
+    const gate = this.gates.get(gatewayId) ?? { tokens: REPORT_BURST, at, errorLoggedAt: null };
+    this.gates.set(gatewayId, gate);
+    if (gate.errorLoggedAt !== null && at - gate.errorLoggedAt < minGapMs && at >= gate.errorLoggedAt) return false;
+    gate.errorLoggedAt = at;
+    return true;
+  }
+
   get(gatewayId: string): LiveGateway | undefined {
     return this.gateways.get(gatewayId);
   }
@@ -139,8 +194,22 @@ export class LiveState {
     return [...this.gateways.values()];
   }
 
+  /**
+   * Reports no older than `maxAgeMs` at `at`. Rates and handshakes from a
+   * gateway that has gone quiet describe the past, not the present.
+   */
+  recent(at: number, maxAgeMs: number): LiveReader {
+    return {
+      get: (gatewayId) => {
+        const l = this.gateways.get(gatewayId);
+        return l && at - l.at <= maxAgeMs ? l : undefined;
+      },
+    };
+  }
+
   forget(gatewayId: string): void {
     this.gateways.delete(gatewayId);
+    this.gates.delete(gatewayId);
     this.generation++;
     this.notify();
   }
@@ -162,6 +231,7 @@ export class LiveState {
 
   clearForTests(): void {
     this.gateways.clear();
+    this.gates.clear();
   }
 }
 

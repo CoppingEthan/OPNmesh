@@ -108,6 +108,33 @@ describe("agent request", () => {
     expect(requestDiagnostics("nope", "admin@example.com")).toBeNull();
   });
 
+  it("keeps only an active gateway's first answer to a request that was made", () => {
+    const { dc } = twoSites();
+    const answer = (id: string) => ({ id, ranAt: now, checks: [] });
+    // Never asked.
+    expect(storeAgentReport(getSite(dc.id)!.gateway!, answer("null"))).toBe(false);
+    expect(storeAgentReport(getSite(dc.id)!.gateway!, answer(String(now)))).toBe(false);
+    requestDiagnostics(dc.id, "admin@example.com");
+    const id = String(now);
+    // Not while disabled or pending.
+    for (const status of ["disabled", "pending"] as const) {
+      expect(storeAgentReport({ ...getSite(dc.id)!.gateway!, status }, answer(id))).toBe(false);
+    }
+    now += 1000;
+    expect(storeAgentReport(getSite(dc.id)!.gateway!, answer(id))).toBe(true);
+    // Once.
+    expect(storeAgentReport(getSite(dc.id)!.gateway!, answer(id))).toBe(false);
+    // An answer to a request that was replaced while the answer was on its way is not kept.
+    now += 1000;
+    requestDiagnostics(dc.id, "admin@example.com");
+    const first = String(now);
+    const asLoaded = getSite(dc.id)!.gateway!;
+    now += 1000;
+    requestDiagnostics(dc.id, "admin@example.com");
+    expect(storeAgentReport(asLoaded, answer(first))).toBe(false);
+    expect(storeAgentReport(getSite(dc.id)!.gateway!, answer(String(now)))).toBe(true);
+  });
+
   it("gives up waiting after two minutes", async () => {
     const { dc } = twoSites();
     requestDiagnostics(dc.id, "admin@example.com");
