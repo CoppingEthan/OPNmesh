@@ -108,7 +108,9 @@ describe("gateway lifecycle through the API", () => {
     // The installer is served with the URL baked in.
     const script = await (await installGet()).text();
     expect(script).toContain('CONTROLLER="http://controller.test"');
-    expect(script).toContain('enrol --controller "$CONTROLLER" --token "$TOKEN"');
+    // The token reaches the agent through its environment, never its argv.
+    expect(script).toContain('OPNMESH_TOKEN="$TOKEN" "$BIN.new" enrol --controller "$CONTROLLER"');
+    expect(script).not.toContain('--token "$TOKEN"');
     expect(script).not.toContain("__OPNMESH_URL__");
 
     // Agent side: enrol with only the public key.

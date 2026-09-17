@@ -186,7 +186,7 @@ function AlertsForm({ smtp }: { smtp: SmtpFormView }) {
           <Input className="mono" value={v.smtpHost} onChange={(e) => set("smtpHost", e.target.value)} placeholder="smtp.example.com" />
         </Field>
         <div className="grid grid-cols-[1fr_auto] items-end gap-3">
-          <Field label="Port" hint="587 with STARTTLS is the usual choice; 465 needs the box ticked.">
+          <Field label="Port" hint="587 with STARTTLS is the usual choice; 465 needs the box ticked. Without the box, the server must offer STARTTLS: OPNmesh never sends the password unencrypted.">
             <Input className="mono" type="number" min={1} max={65535} value={v.smtpPort} onChange={(e) => set("smtpPort", Number(e.target.value))} />
           </Field>
           <label className="mb-6 flex items-center gap-2 text-sm text-ink">

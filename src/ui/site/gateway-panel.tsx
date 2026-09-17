@@ -152,7 +152,15 @@ export function GatewayPanel({ site }: { site: SiteState }) {
         <Item label="Load / memory">
           {g.load1 === null ? "—" : g.load1.toFixed(2)} / {g.memUsedPct === null ? "—" : `${Math.round(g.memUsedPct)}%`}
         </Item>
-        <Item label="Configuration">{g.configCurrent ? <span className="text-good-ink">up to date</span> : <span className="text-warn-ink">applying…</span>}</Item>
+        <Item label="Configuration">
+          {g.held ? (
+            <span className="text-warn-ink">on hold</span>
+          ) : g.configCurrent ? (
+            <span className="text-good-ink">up to date</span>
+          ) : (
+            <span className="text-warn-ink">applying…</span>
+          )}
+        </Item>
         <Item label="Tunnel address">
           <span className="mono">{g.tunnelIp}</span>
         </Item>

@@ -93,8 +93,12 @@ The UniFi integration is covered by the unit suite against
 `test/server/fake-unifi.ts`, a small http server implementing the subset of
 classic and v2 endpoints OPNmesh uses: link a site, assert the routes created,
 change the topology, assert reconciliation, delete a LAN, assert the managed
-route is removed and an unmanaged one left alone. Certificate pinning against
-a real console has not been exercised automatically.
+route is removed and an unmanaged one left alone. The fake also serves HTTPS
+with certificates generated when the tests run, which covers both trust
+modes: a pinned fingerprint, and a public certificate checked against a CA
+with its host name. Neither has been exercised against a real console.
+Alert email runs against `test/server/fake-smtp.ts`, which proves a
+server that does not offer STARTTLS never receives the password.
 
 ## The deployment smoke test
 

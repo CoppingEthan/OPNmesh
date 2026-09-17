@@ -277,6 +277,10 @@ A client is a WireGuard peer that belongs to a person, not a site.
   app), a `.conf` download (desktop apps), and a **one-time link**
   (`https://controller/invite/<token>`) that shows the QR/config once and then
   expires, so the admin can send a link over Teams/email without pasting keys.
+  A client has at most one link. A new link replaces the old one, and the
+  link is cancelled by *Cancel link*, by rotating keys, and by disabling or
+  deleting the client. A link that cannot be served (client disabled, config
+  on hold) is not used up.
 - **DNS**: optional. A site can declare a DNS server; clients get it in their
   config with the site's search domain. No DNS proxying in 2.0.
 
@@ -479,6 +483,23 @@ Properties enforced by tests:
   masquerade site) have committed golden outputs; a change to any generated
   byte must be reviewed in a diff.
 
+**Validation holds configurations.** Validation errors are shown in the UI,
+and they also stop the affected configurations from going out:
+- **What is held:** a gateway's bundle is held when an error reaches its
+  site or a site it carries traffic for, and a client's configuration is
+  held when an error reaches that client. Settings-level errors hold
+  everything.
+- **What a gateway sees:** telemetry advertises no new hash, and
+  `/api/agent/config` answers 409 with the reason. The gateway keeps
+  running its last good configuration.
+- **What a client sees:** its configuration, QR code and invite pickup
+  answer 409. An invite link is not used up by a held pickup.
+- **What the admin sees:** the headline, the gateway card and the client
+  page say what is on hold and why.
+- **What is not held:** a pair with no possible path, and an overlap with a
+  site that is not yet in the mesh. In both cases the generated files are
+  correct.
+
 ### 9.1 `opnmesh0.conf` (gateway)
 
 ```ini
@@ -567,10 +588,10 @@ HTTPS, JSON, gateway always initiates. The controller never dials a gateway.
 |---|---|---|
 | `GET /install.sh` | none | Installer script. The UI shows its SHA-256 next to the one-liner. |
 | `GET /dl/opnmesh-gw-linux-{amd64,arm64}` | none | Agent binary (+ `.sha256`). |
-| `POST /api/agent/enrol` | one-time token | `{token, publicKey, hostname, os, arch, addresses}` → `{gatewayId, gatewayToken, status}`. Token is single-use, bound to a site, 30-minute TTL. |
-| `GET /api/agent/config` | gateway token | `If-None-Match: <version>` → `304`, or `200 {version, files, meta}`, or `202 {status:"pending"}` before approval. |
-| `POST /api/agent/telemetry` | gateway token | Body §11.1. Response `{configHash, intervalSeconds, actions}` so a changed config is fetched on the very next tick without a second poll loop; `actions` carries anything the admin asked for (§11.4). |
-| `POST /api/agent/diagnostics` | gateway token | The gateway's answer to a `diagnose` action: `{id, ranAt, checks[]}` (§11.4). |
+| `POST /api/agent/enrol` | one-time token | `{token, publicKey, hostname, os, arch, addresses}` → `{gatewayId, gatewayToken, status}`. The token is single-use, bound to a site and valid for 30 minutes. Issuing a new token, or enrolling with one, revokes the site's other tokens. The public key must be unused by any gateway or client (409 otherwise), and the reported LAN address must be a usable host address. |
+| `GET /api/agent/config` | gateway token | `If-None-Match: <version>` → `304`, or `200 {version, files, meta}`, or `202 {status:"pending"}` before approval, or `409` while the configuration is on hold (§9). |
+| `POST /api/agent/telemetry` | gateway token | Body §11.1. Response `{configHash, intervalSeconds, actions}`: a changed config is fetched on the very next tick without a second poll loop, and `actions` carries anything the admin asked for (§11.4). `configHash` is empty while the configuration is on hold. |
+| `POST /api/agent/diagnostics` | gateway token | The gateway's answer to a `diagnose` action: `{id, ranAt, checks[]}` (§11.4). A disabled gateway gets 403. An answer to a request that was never made, is out of date or was already answered gets 409. |
 
 Agent loop, every `intervalSeconds` (default 5, jittered ±20%):
 
@@ -586,9 +607,20 @@ Apply rules (from v1, kept because they were right):
 - Files are written only under `/etc/opnmesh/` by exact allowlisted name.
   The logical `wireguard.conf` lands as `/etc/opnmesh/<interface>.conf`
   because wg-quick takes the interface name from the file name.
-- The only `PostUp`/`PreUp`/`PostDown`/`PreDown` accepted is
-  `wg set %i private-key /etc/opnmesh/private.key`. Anything else is refused
-  and reported; the existing tunnel is left alone.
+- Every file is checked against an allowlist before it is written, on every
+  path that applies one: a controller update, rollback, and the boot path.
+  The existing tunnel is left alone when a check fails, and the failure is
+  reported.
+  - **WireGuard:** only `[Interface]` (Address, ListenPort, MTU, PostUp) and
+    `[Peer]` (PublicKey, PresharedKey, AllowedIPs, Endpoint,
+    PersistentKeepalive) are accepted, each with a checked value. The file
+    is read the way wg-quick reads it: control characters, NUL included,
+    are refused, and so is anything non-ASCII outside comments. The only
+    hook allowed is `PostUp = wg set %i private-key /etc/opnmesh/private.key`.
+  - **sysctl:** only `net.ipv4.ip_forward` is accepted, set to 0 or 1.
+  - **nftables:** only the three statements the generator emits for
+    `table inet opnmesh` are allowed outside that table's body, and
+    `include` is refused anywhere.
 - If only `[Peer]` sections changed, `wg syncconf` is used (no flap). The
   temporary file handed to syncconf has the private key injected from the
   gateway's key file, because syncconf replaces the whole `[Interface]` and a
@@ -608,6 +640,13 @@ Apply rules (from v1, kept because they were right):
   interface up from disk if it is missing (a boot before DNS was ready, a
   manual `wg-quick down`), restores a lost private key, and re-resolves
   stale hostname endpoints (§7.4).
+- The agent follows no redirects, and it strips control characters from
+  anything it logs that came from the network.
+- The controller stores only the peers and counters that belong to the
+  reporting gateway's own configuration, and at most one report per half
+  interval (allowing a short burst); extra reports get the normal answer and
+  are dropped. Handshake times in the future are ignored, and an apply error
+  is logged when it changes, at most once every 5 minutes per gateway.
 - When reports fail (controller down, or a proxy or firewall refusing the
   request), the agent drops back to the configured interval and doubles the
   wait after each further failure, up to a minute, then resumes the normal
@@ -703,8 +742,12 @@ to *offline* produces one "not responding" email; its return to *online*
 produces one "is back" email. The last notified state is stored on the
 gateway row, so a controller restart never re-sends, and a two-minute grace
 after start avoids a storm of mails for gateways that simply have not
-reported yet. Send failures are written to the event log. A "send a test
-email" button exercises the real path.
+reported yet. Only one evaluation runs at a time. The new state is recorded
+before the email is sent, so overlapping passes cannot send twice. A failed
+send restores the old state and is retried after a minute, backing off to an
+hour. Send failures are written to the event log. A "send a test email"
+button exercises the real path. Without TLS on connect the server must
+offer STARTTLS; the password is never sent unencrypted.
 
 ### 11.2c Adaptive reporting
 

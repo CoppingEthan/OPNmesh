@@ -202,10 +202,16 @@ Two modes, chosen per site:
    header returned at login on every write. Must be a *local* account, not a
    UniFi cloud account, and should be a dedicated one with the minimum role.
 
-Consoles use a self-signed certificate unless the admin installed one. OPNmesh
-does **not** turn off certificate checking: on first connect it shows the
-console's certificate fingerprint and asks the admin to confirm it; the
-fingerprint is pinned for that site from then on.
+OPNmesh never turns off certificate checking. Each link uses one of two
+modes:
+
+- **Pinned** (the default, for the self-signed certificate most consoles
+  have). On first connect OPNmesh shows the console's certificate
+  fingerprint and asks the admin to confirm it. That certificate is then the
+  only one trusted for the site, and nothing is sent to the console until it
+  matches.
+- **Public certificate**, for a console with a certificate from a public CA.
+  The chain is checked against the system CAs, together with the host name.
 
 ### 4.3 Reconciliation
 
@@ -213,10 +219,16 @@ OPNmesh treats the routes and policies it created as its own and nothing else
 on the console as its business:
 
 1. Compute the desired set for the site from the current topology.
-2. `GET` the existing routes; select those whose `_id` is in
-   `unifi_links.managed_ids` **or** whose name starts with `OPNmesh:`.
-3. Create missing, update differing, delete managed ones no longer desired.
-   Record ids.
+2. `GET` the existing routes and select those whose `_id` is in
+   `unifi_links.managed_ids`.
+   - A route named `OPNmesh: …` whose id is not recorded is adopted only
+     when its network, type and next hop exactly match a route the site
+     wants.
+   - Anything else is left alone, including another controller's routes and
+     a user's route with that prefix.
+   - Firewall policies follow the same rule.
+3. Create missing routes, update differing ones, and delete managed ones
+   that are no longer desired. Record the ids.
 4. Store status (`in sync` / `changed 3` / error text) and show it on the site
    page; log an event.
 
@@ -228,9 +240,18 @@ not created.
 ### 4.4 Failure handling
 
 The console being unreachable never affects the mesh; it only affects route
-sync, which is reported. Every API response is validated before use (Zod), the
-sync has a 20 s budget, and nothing is deleted unless the delete target is
-positively identified as OPNmesh-managed.
+sync, which is reported. Sync limits:
+
+- **Per request:** responses are capped at 4 MB, and each request has a
+  20-second deadline.
+- **Per link:** a sync stops after 60 seconds, so one stuck console cannot
+  hold up the others.
+- **Per pass:** a pass never starts while the previous one is running.
+
+Nothing is deleted unless it is recorded as OPNmesh-managed. Errors are shown
+as a category (connection refused, TLS handshake failed, fingerprint
+mismatch, unexpected HTTP status). The console's response text is never
+echoed back.
 
 ## 5. Other routers
 
