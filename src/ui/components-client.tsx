@@ -3,7 +3,7 @@
 import { Check, Copy } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Button, buttonClass, cx } from "./components";
-import { ago } from "./format";
+import { ago, dateTime } from "./format";
 
 export function CopyButton({ text, label = "Copy", size = "sm", className }: { text: string; label?: string; size?: "sm" | "md"; className?: string }) {
   const [done, setDone] = useState(false);
@@ -41,6 +41,15 @@ export function Ago({ ts }: { ts: number | null | undefined }) {
     <span title={ts ? new Date(ts).toLocaleString() : undefined} suppressHydrationWarning>
       {ago(ts)}
     </span>
+  );
+}
+
+/** A date and time in the viewer's locale and time zone, which the server cannot know. */
+export function DateTime({ ts }: { ts: number }) {
+  return (
+    <time dateTime={new Date(ts).toISOString()} suppressHydrationWarning>
+      {dateTime(ts)}
+    </time>
   );
 }
 

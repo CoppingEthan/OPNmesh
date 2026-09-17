@@ -73,7 +73,9 @@ send the person a one-time link.
   `Caddyfile`, `.env` (site name, public URL, ports, TLS mode) and two
   directories: `data` (the SQLite database and `secret.key`, owned by uid
   1000, the unprivileged user the image runs as) and `caddy` (certificates).
-- **Upgrades**: the controller with
+- **Upgrades**: the controller first. `.env` pins the image, so set the new
+  release in `OPNMESH_IMAGE` (for example
+  `ghcr.io/coppingethan/opnmesh:2.1.1`), then run
   `cd /opt/opnmesh && docker compose pull && docker compose up -d`. Then each
   gateway: when its agent is older than the controller, the site's Gateway card
   shows the upgrade command,

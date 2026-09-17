@@ -137,6 +137,22 @@ The controller's containers run on the same host throughout, which proves the
 gateway firewall leaves container bridges alone. Only use `--gateway-test`
 on a disposable machine.
 
+## Releasing
+
+1. Bump `version` in `package.json` and `package-lock.json`, commit, and
+   wait for CI to pass on main.
+2. Tag the commit `vX.Y.Z` and push the tag. The release workflow publishes
+   the image and the agent binaries; `latest` moves only for stable
+   versions.
+3. Once the image is published, point the controller installer at it: set
+   `VERSION` in `deploy/controller/install.sh` and `OPNMESH_IMAGE` in both
+   `deploy/controller/.env.example` files, and commit that to main. This
+   step must come after the release exists: the one-line install fetches
+   the installer from main, and the installer then fetches the release's
+   files and image.
+4. Upgrade a controller, then upgrade its gateways with the command shown
+   on each site page, and check the dashboard.
+
 ## Conventions
 
 - Tests never need real keys or real networks; the sim generates everything.

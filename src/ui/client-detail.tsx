@@ -8,8 +8,8 @@ import type { StatePayload } from "@/server/state";
 import { apiFetch } from "./api";
 import { ClientForm } from "./client-form";
 import { Badge, Button, Callout, Card, PageHeader, Pre } from "./components";
-import { Ago, ConfirmButton, CopyButton, Notice } from "./components-client";
-import { dateTime, formatBits } from "./format";
+import { Ago, ConfirmButton, CopyButton, DateTime, Notice } from "./components-client";
+import { formatBits } from "./format";
 import { useLiveState } from "./use-live";
 
 export interface ClientRowView {
@@ -83,8 +83,8 @@ export function ClientDetail({ initial, row }: { initial: StatePayload; row: Cli
         description={
           <>
             <span className="mono">{row.tunnelIp}</span>
-            {row.owner ? ` · ${row.owner}` : ""} · added {dateTime(row.createdAt)}
-            {row.expiresAt ? ` · expires ${dateTime(row.expiresAt)}` : ""}
+            {row.owner ? ` · ${row.owner}` : ""} · added <DateTime ts={row.createdAt} />
+            {row.expiresAt ? <> · expires <DateTime ts={row.expiresAt} /></> : ""}
           </>
         }
         actions={
@@ -172,7 +172,7 @@ export function ClientDetail({ initial, row }: { initial: StatePayload; row: Cli
                         <Button variant="ghost" size="sm" onClick={cancelLink}>
                           Cancel link
                         </Button>
-                        <span className="text-xs text-ink-3">expires {dateTime(invite.expiresAt)}</span>
+                        <span className="text-xs text-ink-3">expires <DateTime ts={invite.expiresAt} /></span>
                       </div>
                     </div>
                   ) : (
@@ -190,7 +190,7 @@ export function ClientDetail({ initial, row }: { initial: StatePayload; row: Cli
                       </Button>
                       {pending && (
                         <>
-                          <span className="text-xs text-ink-3">An earlier link has not been used; it works until {dateTime(pending.expiresAt)}.</span>
+                          <span className="text-xs text-ink-3">An earlier link has not been used; it works until <DateTime ts={pending.expiresAt} />.</span>
                           <Button variant="ghost" size="sm" onClick={cancelLink}>
                             Cancel link
                           </Button>

@@ -21,8 +21,9 @@ that port.
 2. **Firewall the port to the proxy's addresses.** A port published by Docker
    bypasses the host's INPUT chain, so `ufw` and ordinary `nftables` input
    rules do not protect it. `opnmesh-backend-firewall` puts its rules in
-   Docker's `DOCKER-USER` chain instead, and a systemd unit re-applies them
-   whenever Docker starts. They drop new connections from anyone not listed
+   Docker's `DOCKER-USER` chain instead. Two systemd units apply them: one
+   at boot before Docker starts, so the port is never open, and one that
+   re-applies and checks them whenever Docker starts. They drop new connections from anyone not listed
    in `backend-allow`, whether the connection is for the published address
    or routed straight to the container's own address. Docker releases before
    28 let hosts on the same network segment do the latter; the firewall
@@ -42,9 +43,10 @@ cd /opt/opnmesh
 # copy docker-compose.yml, .env.example (as .env) and backend-allow.example
 # (as backend-allow) from deploy/controller/external-proxy/, then edit both
 sudo install -m 0755 opnmesh-backend-firewall /usr/local/sbin/
-sudo install -m 0644 opnmesh-backend-firewall.service /etc/systemd/system/
-sudo docker compose up -d
+sudo install -m 0644 opnmesh-backend-firewall.service opnmesh-backend-firewall-early.service /etc/systemd/system/
 sudo systemctl daemon-reload
+sudo systemctl enable opnmesh-backend-firewall-early
+sudo docker compose up -d
 sudo systemctl enable --now opnmesh-backend-firewall
 sudo docker compose logs controller | grep "setup code"
 ```

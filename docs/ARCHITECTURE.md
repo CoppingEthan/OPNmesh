@@ -976,7 +976,10 @@ On any Ubuntu 22.04/24.04 with Docker, this creates `/opt/opnmesh/` with a
 `docker-compose.yml`, `.env` (site name, public URL, ports, TLS mode),
 starts Caddy + the controller, and prints the URL and one-time setup code.
 The data directory is owned by uid 1000, the unprivileged user the image runs
-as. Upgrading is `docker compose pull && docker compose up -d`. Backup is the
+as. The installer belongs to one release: the compose file, the Caddyfile
+and the image all come from that release. To upgrade, set the new version in
+`OPNMESH_IMAGE` in `.env`, then run
+`docker compose pull && docker compose up -d`. Backup is the
 `/opt/opnmesh/data` directory (or the database download in Settings, which
 is consistent while the controller runs) plus `.env`.
 

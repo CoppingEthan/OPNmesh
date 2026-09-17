@@ -1,0 +1,18 @@
+[Unit]
+Description=OPNmesh: close the controller backend before Docker starts
+Documentation=file:///opt/opnmesh/backend-allow
+# Runs before Docker publishes the controller's port, so there is no moment
+# at boot when the backend is open. opnmesh-backend-firewall.service checks
+# the result again once Docker is up.
+DefaultDependencies=no
+After=local-fs.target
+Before=docker.service network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/opnmesh-backend-firewall --early
+
+[Install]
+WantedBy=multi-user.target

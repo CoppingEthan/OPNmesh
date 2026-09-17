@@ -14,7 +14,19 @@
 # allow-list is replaced in one iptables-restore transaction. If anything is
 # wrong, including a missing file or one without sources, nothing may reach
 # the backend until it is fixed and the script runs again.
+#
+# --early is for boot, before Docker starts (opnmesh-backend-firewall-early
+# .service): the rules are in place before the container publishes its port,
+# and the checks that need Docker wait for the run after it has started.
 set -eu
+
+EARLY=0
+case ${1:-} in
+  --early) EARLY=1 ;;
+  "") ;;
+  *) printf "usage: %s [--early]
+" "$0" >&2; exit 2 ;;
+esac
 
 CONF=${OPNMESH_BACKEND_ALLOW:-/opt/opnmesh/backend-allow}
 # docker compose's .env beside it: OPNMESH_BACKEND_BIND is what is published.
@@ -196,10 +208,12 @@ trap 'exit 1' HUP INT TERM
 # Docker's nftables firewall backend (Docker 29+) never consults DOCKER-USER.
 # Older clients cannot report the backend, so look for Docker's own table too.
 fw=""
-if command -v docker >/dev/null 2>&1; then
+if [ "$EARLY" = 1 ]; then
+  : # Docker is not running yet; the run after it starts checks its backend.
+elif command -v docker >/dev/null 2>&1; then
   fw=$(dk info --format '{{.FirewallBackend.Driver}}' 2>/dev/null) || fw=""
 fi
-if [ -z "$fw" ] && command -v nft >/dev/null 2>&1 && nft list table ip docker-bridges >/dev/null 2>&1; then
+if [ "$EARLY" = 0 ] && [ -z "$fw" ] && command -v nft >/dev/null 2>&1 && nft list table ip docker-bridges >/dev/null 2>&1; then
   fw=nftables
 fi
 case $fw in
@@ -309,7 +323,7 @@ $published
 EOF
   ip link show "$BRIDGE" >/dev/null 2>&1 ||
     log "WARNING: no $BRIDGE bridge. Only the published address is filtered until the controller is recreated with the current docker-compose.yml (docker compose up -d)."
-elif [ -z "$fw" ]; then
+elif [ -z "$fw" ] && [ "$EARLY" = 0 ]; then
   log "warning: cannot ask Docker what it publishes; applying the rules anyway"
 fi
 
@@ -325,7 +339,8 @@ apply || apply
 state=applied
 log "backend $(words "$targets") and $BRIDGE port $CPORT open to: $(words "$sources"); everything else is dropped"
 
-if ! ipt -C FORWARD -j DOCKER-USER 2>/dev/null; then
+# At boot Docker adds this jump itself when it starts.
+if [ "$EARLY" = 0 ] && ! ipt -C FORWARD -j DOCKER-USER 2>/dev/null; then
   log "ERROR: the FORWARD chain does not jump to DOCKER-USER, so these rules have no effect."
   log "  Is Docker running with its iptables integration turned off?"
   exit 1
