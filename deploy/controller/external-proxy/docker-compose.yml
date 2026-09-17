@@ -12,10 +12,18 @@
 # Data lives in ./data (SQLite + secret.key). Back it up as a whole.
 name: opnmesh
 
+# Container logs are rotated so they cannot fill the disk.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
 services:
   controller:
     image: ${OPNMESH_IMAGE:-ghcr.io/coppingethan/opnmesh:latest}
     restart: unless-stopped
+    logging: *logging
     environment:
       OPNMESH_DATA_DIR: /data
       OPNMESH_PUBLIC_URL: ${OPNMESH_PUBLIC_URL:?set OPNMESH_PUBLIC_URL in .env}

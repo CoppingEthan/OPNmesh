@@ -14,10 +14,18 @@
 # Back up ./data as a whole; the secret encrypts client private keys.
 name: opnmesh
 
+# Container logs are rotated so they cannot fill the disk.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
 services:
   controller:
     image: ${OPNMESH_IMAGE:-ghcr.io/coppingethan/opnmesh:latest}
     restart: unless-stopped
+    logging: *logging
     environment:
       OPNMESH_DATA_DIR: /data
       OPNMESH_PUBLIC_URL: ${OPNMESH_PUBLIC_URL:?set OPNMESH_PUBLIC_URL in .env}
@@ -55,6 +63,7 @@ services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    logging: *logging
     ports:
       - "${OPNMESH_HTTP_PORT:-80}:80"
       - "${OPNMESH_HTTPS_PORT:-443}:443"
