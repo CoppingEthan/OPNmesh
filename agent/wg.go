@@ -6,8 +6,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 )
@@ -23,44 +21,6 @@ func isManagedFile(name string) bool {
 		}
 	}
 	return false
-}
-
-// allowedPostUp is the only hook the controller may place in the WireGuard
-// config: loading this gateway's own private key from a path under ConfDir.
-var allowedPostUp = regexp.MustCompile(`^PostUp\s*=\s*wg set %i private-key ([A-Za-z0-9._/-]+)$`)
-
-// validateHooks refuses any wg-quick hook other than the sanctioned PostUp.
-// wg-quick runs hooks as root through a shell, so without this a compromised
-// controller would have root on every gateway.
-func validateHooks(conf, confDir string) error {
-	confDir = filepath.Clean(confDir)
-	for _, raw := range strings.Split(conf, "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		eq := strings.IndexByte(line, '=')
-		if eq < 0 {
-			continue
-		}
-		key := strings.ToLower(strings.TrimSpace(line[:eq]))
-		switch key {
-		case "preup", "predown", "postdown":
-			return fmt.Errorf("refusing config: %s hook present", strings.TrimSpace(line[:eq]))
-		case "postup":
-			m := allowedPostUp.FindStringSubmatch(line)
-			if m == nil {
-				return fmt.Errorf("refusing config: PostUp may only load the private key, got %q", line)
-			}
-			p := filepath.Clean(m[1])
-			if p != confDir && !strings.HasPrefix(p, confDir+string(os.PathSeparator)) {
-				return fmt.Errorf("refusing config: private-key path %q is outside %s", m[1], confDir)
-			}
-		case "privatekey":
-			return fmt.Errorf("refusing config: it contains a PrivateKey line")
-		}
-	}
-	return nil
 }
 
 func runCmd(name string, args ...string) (string, error) {
@@ -184,8 +144,10 @@ func wgQuickDown(confPath string) error {
 // privateKeyPathOf extracts the key path from the sanctioned PostUp line.
 func privateKeyPathOf(conf string) string {
 	for _, raw := range strings.Split(conf, "\n") {
-		if m := allowedPostUp.FindStringSubmatch(strings.TrimSpace(raw)); m != nil {
-			return m[1]
+		if _, key, value, _ := splitWgLine(raw); asciiLower(key) == "postup" {
+			if m := allowedPostUp.FindStringSubmatch(value); m != nil {
+				return m[1]
+			}
 		}
 	}
 	return ""

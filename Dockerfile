@@ -8,7 +8,7 @@
 ARG VERSION=2.0.0-dev
 
 # --- agent -------------------------------------------------------------------
-FROM golang:1.24 AS agent
+FROM golang:1.27 AS agent
 ARG VERSION
 WORKDIR /src
 COPY agent/go.mod agent/go.sum* ./
@@ -45,11 +45,15 @@ ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 \
 # iproute2: lets an operator (or the simulation) inspect and adjust routes.
 RUN apt-get update -qq && apt-get install -qq -y --no-install-recommends iproute2 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+# The app, the installer and the agent binaries under /dl stay owned by root,
+# read-only to the runtime user, so a flaw in the app cannot swap what
+# gateways download. Only the database and Next's server cache belong to
+# node. With a read-only root, mount a tmpfs owned by uid 1000 on the cache.
 COPY --from=build /app/.next/standalone ./
 COPY --from=build /app/.next/static ./.next/static
 COPY --from=build /app/public ./public
 COPY deploy/gateway/install.sh ./deploy/gateway/install.sh
-RUN mkdir -p /data && chown -R node:node /app /data
+RUN mkdir -p /data /app/.next/cache && chown -R node:node /data /app/.next/cache
 USER node
 VOLUME ["/data"]
 EXPOSE 3000

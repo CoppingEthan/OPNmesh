@@ -28,8 +28,11 @@ func cmdEnrol(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// The installer passes the token in the environment so it never shows
+	// in the process list; keep it from the tools started below as well.
+	_ = os.Unsetenv("OPNMESH_TOKEN")
 	if *controller == "" || *token == "" {
-		return errors.New("--controller and --token are required")
+		return errors.New("--controller and a token (OPNMESH_TOKEN or --token) are required")
 	}
 	cfg := defaultConfig()
 	cfg.ControllerURL = strings.TrimRight(*controller, "/")
@@ -91,7 +94,7 @@ func cmdEnrol(args []string) error {
 	if err := saveConfig(*configPath, cfg); err != nil {
 		return err
 	}
-	fmt.Printf("enrolled as gateway %s for site %q (%s)\n", resp.GatewayID, resp.SiteName, resp.Status)
+	fmt.Printf("enrolled as gateway %s for site %q (%s)\n", printable(resp.GatewayID), printable(resp.SiteName), printable(resp.Status))
 	if resp.Status == "pending" {
 		fmt.Println("this gateway is waiting for approval in the OPNmesh UI")
 	}
@@ -138,7 +141,7 @@ func cmdRun(args []string, once bool) error {
 	// Disk is the truth after a reboot: if the files changed under us
 	// (rollback, manual edit), report what is really there.
 	if dh := hashFiles(diskFiles(cfg, meta.Interface)); dh != appliedHash && appliedHash != "" {
-		log.Printf("files on disk differ from last applied config; will re-fetch")
+		logf("files on disk differ from last applied config; will re-fetch")
 		appliedHash = ""
 	}
 	lastError := ""
@@ -149,7 +152,7 @@ func cmdRun(args []string, once bool) error {
 	interval := configured
 	failures := 0
 	lastFailure := ""
-	log.Printf("opnmesh-gw %s: controller %s, interface %s, reporting every %s", version, cfg.ControllerURL, meta.Interface, interval)
+	logf("opnmesh-gw %s: controller %s, interface %s, reporting every %s", version, cfg.ControllerURL, meta.Interface, interval)
 
 	// A configuration that failed to apply here, and when: it is not fetched
 	// again until applyRetryAfter has passed or the controller changes it.
@@ -165,13 +168,13 @@ func cmdRun(args []string, once bool) error {
 		maintainTunnel(cfg, rr, &lastBringUp)
 		token, err := cfg.token()
 		if err != nil {
-			log.Printf("%v", err)
+			logf("%v", err)
 		} else if client, err := newClient(cfg, token); err != nil {
-			log.Printf("%v", err)
+			logf("%v", err)
 		} else {
 			resp, err := client.SendTelemetry(collectReport(cfg, started, appliedHash, lastError))
 			if err == nil && failures > 0 {
-				log.Printf("controller reachable again after %d failed report(s)", failures)
+				logf("controller reachable again after %d failed report(s)", failures)
 				failures, lastFailure = 0, ""
 			}
 			switch {
@@ -184,13 +187,13 @@ func cmdRun(args []string, once bool) error {
 				// the error, and then only every 20th repeat.
 				interval = backoffInterval(configured, failures)
 				if msg := err.Error(); msg != lastFailure || failures%20 == 1 {
-					log.Printf("report failed (%d in a row; the tunnel keeps running), next try in %s: %v", failures, interval, err)
+					logf("report failed (%d in a row; the tunnel keeps running), next try in %s: %v", failures, interval, err)
 					lastFailure = msg
 				}
 			case resp.Status == "pending":
-				log.Printf("waiting for approval in the OPNmesh UI")
+				logf("waiting for approval in the OPNmesh UI")
 			case resp.Status == "disabled":
-				log.Printf("this gateway is disabled in the OPNmesh UI")
+				logf("this gateway is disabled in the OPNmesh UI")
 			case resp.ConfigHash != "" && resp.ConfigHash != appliedHash:
 				if resp.IntervalSeconds > 0 {
 					interval = time.Duration(resp.IntervalSeconds) * time.Second
@@ -200,13 +203,13 @@ func cmdRun(args []string, once bool) error {
 					// back). Leave the running tunnel alone until the retry is due
 					// or the controller changes something.
 				} else if desired, notModified, err := client.FetchConfig(""); err != nil {
-					log.Printf("fetch config: %v", err)
+					logf("fetch config: %v", err)
 				} else if notModified || desired == nil || desired.Status != "active" {
-					log.Printf("config not available yet")
+					logf("config not available yet")
 				} else if err := applyConfig(cfg, desired); err != nil {
 					lastError = err.Error()
 					failedHash, failedAt = desired.Hash, time.Now()
-					log.Printf("apply failed: %v (next attempt in %s unless the configuration changes)", err, applyRetryAfter)
+					logf("apply failed: %v (next attempt in %s unless the configuration changes)", err, applyRetryAfter)
 				} else {
 					lastError = ""
 					failedHash = ""
@@ -215,7 +218,7 @@ func cmdRun(args []string, once bool) error {
 						configured = reportInterval(desired.Meta.TelemetryIntervalSeconds)
 						interval = configured
 					}
-					log.Printf("applied configuration %s", desired.Hash[:12])
+					logf("applied configuration %s", desired.Hash[:12])
 				}
 			default:
 				if resp.IntervalSeconds > 0 {
@@ -324,7 +327,7 @@ func cmdStatus(args []string) error {
 	meta := cfg.loadMeta()
 	fmt.Printf("controller:   %s\n", cfg.ControllerURL)
 	fmt.Printf("interface:    %s (%s)\n", meta.Interface, map[bool]string{true: "up", false: "down"}[wgInterfaceExists(meta.Interface)])
-	fmt.Printf("site:         %s\n", meta.SiteSlug)
+	fmt.Printf("site:         %s\n", printable(meta.SiteSlug))
 	fmt.Printf("applied hash: %s\n", meta.AppliedHash)
 	if meta.AppliedAt > 0 {
 		fmt.Printf("applied at:   %s\n", time.Unix(meta.AppliedAt, 0).Format(time.RFC3339))

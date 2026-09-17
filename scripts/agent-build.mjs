@@ -39,7 +39,7 @@ const r = spawnSync(
     "opnmesh-v2-gomod:/go/pkg/mod",
     "-e",
     "GOFLAGS=-mod=mod",
-    "golang:1.24",
+    "golang:1.27",
     "sh",
     "-c",
     script,

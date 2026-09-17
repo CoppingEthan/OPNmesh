@@ -1,7 +1,6 @@
 package main
 
 import (
-	"log"
 	"net"
 	"strings"
 	"time"
@@ -107,7 +106,7 @@ func (r *reresolver) run(iface, conf string) {
 		}
 		r.lastAttempt[p.PublicKey] = now
 		if _, err := runCmd("wg", "set", iface, "peer", p.PublicKey, "endpoint", p.Endpoint); err != nil {
-			log.Printf("re-resolve %s: %v", p.Endpoint, err)
+			logf("re-resolve %s: %v", p.Endpoint, err)
 		}
 	}
 }

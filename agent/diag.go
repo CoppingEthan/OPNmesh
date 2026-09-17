@@ -3,7 +3,8 @@ package main
 // Health checks run on the gateway when the controller asks (via the
 // telemetry response). Everything here is read-only apart from the router
 // probe's own policy-routing rule and table entry, which are removed again
-// as soon as the probe finishes.
+// as soon as the probe finishes. Lookups and probes only reach this
+// gateway's own mesh (see probeScope), however the request is worded.
 
 import (
 	"bytes"
@@ -13,10 +14,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -86,12 +88,12 @@ func dispatchDiagnostics(cfg Config, client *Client, resp TelemetryResponse, las
 		}
 		*last = a.Request.ID
 		go func(req DiagRequest) {
-			log.Printf("running health checks (%s)", req.ID)
+			logf("running health checks (%s)", req.ID)
 			report := runDiagnostics(cfg, req)
 			if err := client.SendDiagnostics(report); err != nil {
-				log.Printf("send health checks: %v", err)
+				logf("send health checks: %v", err)
 			} else {
-				log.Printf("health checks done: %s", summarise(report.Checks))
+				logf("health checks done: %s", summarise(report.Checks))
 			}
 		}(a.Request)
 	}
@@ -108,6 +110,11 @@ func summarise(checks []Check) string {
 func runDiagnostics(cfg Config, req DiagRequest) DiagReport {
 	meta := cfg.loadMeta()
 	iface := meta.Interface
+	var scope probeScope
+	if wg := diskFiles(cfg, iface)["wireguard.conf"]; validateWireGuard(wg, cfg.ConfDir) == nil {
+		scope = scopeOf(wg)
+	}
+	req, refused := scope.confine(req)
 	checks := []Check{checkForwarding()}
 	checks = append(checks, checkInterface(iface, req.ListenPort)...)
 	checks = append(checks, checkFirewall())
@@ -115,10 +122,143 @@ func runDiagnostics(cfg Config, req DiagRequest) DiagReport {
 		checks = append(checks, c)
 	}
 	checks = append(checks, checkEndpoints(req.EndpointHosts)...)
+	checks = append(checks, refused.hosts...)
 	checks = append(checks, checkRoutes(iface, req.RemoteNets)...)
 	checks = append(checks, checkRouter(req)...)
+	checks = append(checks, refused.nets...)
 	checks = append(checks, checkMTU(req)...)
+	checks = append(checks, refused.targets...)
 	return DiagReport{ID: req.ID, RanAt: time.Now().UnixMilli(), Checks: checks}
+}
+
+// --- what the checks may reach ---------------------------------------------------
+
+// The most targets of each kind one request may name: plenty for a real
+// mesh, and a bound on the work a misbehaving controller can ask for.
+const maxDiagTargets = 64
+
+// Router probes also go to the client range, which the WireGuard file only
+// lists client by client, so they may use any private or shared (CGNAT)
+// address, the ranges LANs and tunnels live in.
+var routerProbeRanges = []netip.Prefix{
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+}
+
+// probeScope is what the health checks may look up or send packets to: this
+// gateway's own mesh, as its WireGuard file on disk describes it. The
+// controller picks the targets but is not trusted to aim the gateway's
+// lookups and probes anywhere else.
+type probeScope struct {
+	nets  []netip.Prefix  // peer AllowedIPs and endpoint addresses, and the tunnel range
+	hosts map[string]bool // peer endpoint host names, lower case
+}
+
+func scopeOf(wgConf string) probeScope {
+	s := probeScope{hosts: map[string]bool{}}
+	for _, raw := range strings.Split(wgConf, "\n") {
+		_, key, value, _ := splitWgLine(raw)
+		switch asciiLower(key) {
+		case "address", "allowedips":
+			for _, item := range strings.Split(value, ",") {
+				item = strings.TrimSpace(item)
+				if p, err := netip.ParsePrefix(item); err == nil {
+					s.nets = append(s.nets, p.Masked())
+				} else if a, err := netip.ParseAddr(item); err == nil {
+					s.nets = append(s.nets, netip.PrefixFrom(a, a.BitLen()))
+				}
+			}
+		case "endpoint":
+			host, _, err := net.SplitHostPort(value)
+			if err != nil || host == "" {
+				continue
+			}
+			if a, err := netip.ParseAddr(host); err == nil {
+				s.nets = append(s.nets, netip.PrefixFrom(a, a.BitLen()))
+			} else {
+				s.hosts[strings.ToLower(host)] = true
+			}
+		}
+	}
+	return s
+}
+
+func (s probeScope) inMesh(ip string) bool {
+	a, err := netip.ParseAddr(ip)
+	if err != nil || !a.Is4() {
+		return false
+	}
+	for _, p := range s.nets {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s probeScope) routerProbeOK(ip string) bool {
+	if s.inMesh(ip) {
+		return true
+	}
+	a, err := netip.ParseAddr(ip)
+	return err == nil && a.Is4() && slices.ContainsFunc(routerProbeRanges, func(p netip.Prefix) bool { return p.Contains(a) })
+}
+
+type refusals struct{ hosts, nets, targets []Check }
+
+// In normal use a refusal only happens when the checks run just before the
+// gateway has applied a change to the mesh.
+const refusedHint = "If the mesh changed a moment ago, run the checks again once this gateway has applied its new configuration."
+
+// confine keeps the targets this gateway may reach, up to the cap, and
+// turns every other one into a check that says why it was not tested.
+func (s probeScope) confine(req DiagRequest) (DiagRequest, refusals) {
+	var r refusals
+	req.EndpointHosts, r.hosts = vet(req.EndpointHosts, "dns", "host names",
+		func(h DiagHost) bool { return s.hosts[strings.ToLower(h.Host)] },
+		func(h DiagHost) Check {
+			return Check{ID: "dns:" + h.Host, Status: "warn", Title: "Did not look up " + h.Host,
+				Detail: h.Host + " is not a peer endpoint in this gateway's WireGuard configuration, and the agent only looks up names in its own mesh.",
+				Hint:   refusedHint}
+		})
+	req.RemoteNets, r.nets = vet(req.RemoteNets, "networks", "networks",
+		func(n DiagNet) bool { return s.routerProbeOK(n.IP) },
+		func(n DiagNet) Check {
+			return Check{ID: "route:" + n.CIDR, Status: "warn", Title: "Did not test " + n.CIDR,
+				Detail: fmt.Sprintf("The test address %q is neither in this gateway's mesh nor in a private range, so the agent sent nothing to it.", n.IP),
+				Hint:   refusedHint}
+		})
+	req.MTUTargets, r.targets = vet(req.MTUTargets, "mtu", "peers",
+		func(t DiagTarget) bool { return s.inMesh(t.IP) },
+		func(t DiagTarget) Check {
+			return Check{ID: "mtu:" + t.IP, Status: "warn", Title: "Did not test packet size to " + t.Label,
+				Detail: fmt.Sprintf("%q is not an address in this gateway's WireGuard configuration, so the agent sent nothing to it.", t.IP),
+				Hint:   refusedHint}
+		})
+	return req, r
+}
+
+// vet splits items into those allowed, up to maxDiagTargets, and a check for
+// each one refused, plus one for any beyond the cap.
+func vet[T any](items []T, kind, plural string, allowed func(T) bool, refuse func(T) Check) ([]T, []Check) {
+	var keep []T
+	var refused []Check
+	for i, item := range items {
+		if i == maxDiagTargets {
+			refused = append(refused, Check{ID: "limit:" + kind, Status: "warn",
+				Title:  fmt.Sprintf("Only the first %d of %d %s were tested", maxDiagTargets, len(items), plural),
+				Detail: fmt.Sprintf("The agent tests at most %d %s in one run.", maxDiagTargets, plural)})
+			break
+		}
+		if allowed(item) {
+			keep = append(keep, item)
+		} else {
+			refused = append(refused, refuse(item))
+		}
+	}
+	return keep, refused
 }
 
 // --- kernel, interface, firewall ---------------------------------------------
