@@ -7,7 +7,7 @@
 #   install command).
 #
 #   cp .env.example .env    # then edit
-#   mkdir -p data && chown 1000:1000 data
+#   mkdir -p data && chown 1000:1000 data && chmod 700 data
 #   docker compose up -d
 #
 # Data lives in ./data (SQLite + secret.key) and ./caddy (certificates).
@@ -26,13 +26,26 @@ services:
       # Caddy's private CA root, when Caddy issues the certificates. Served at
       # /ca.crt for gateway installers; its fingerprint goes into install commands.
       OPNMESH_CA_FILE: /caddy/caddy/pki/authorities/local/root.crt
+      # Temporary files (the database backup is a full copy) go to disk, not
+      # to the memory-backed /tmp.
+      TMPDIR: /data
     volumes:
       # The image runs as uid 1000 (node); ./data must be owned by that user.
-      # The installer does this; by hand: chown 1000:1000 data
+      # The installer does this; by hand: chown 1000:1000 data && chmod 700 data
       - ./data:/data
       - ./caddy:/caddy:ro
     expose: ["3000"]
+    # Nothing in the image may change at run time: the controller writes only
+    # to /data, Next.js's cache and /tmp.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /app/.next/cache:size=64m,uid=1000,gid=1000,mode=0700
+    cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+    # Password hashing takes 64 MiB per sign-in, up to four at once.
+    mem_limit: 1g
+    pids_limit: 256
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/admin/setup').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
@@ -56,6 +69,17 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./caddy:/data
       - caddy-config:/config
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    # Caddy runs as root in its image, which owns everything it writes. The
+    # caddy binary carries the file capability to bind ports 80 and 443, and
+    # the kernel refuses to run it at all unless the container may have it.
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    pids_limit: 256
     # Caddy keeps its data directory and CA files root-only. The root
     # *certificate* is public by nature (gateways download it), so once Caddy
     # has created it, make that one file readable and let other users pass

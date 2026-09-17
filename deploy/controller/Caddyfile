@@ -13,12 +13,19 @@
 	# address, which behind Docker's port forwarding is the container's
 	# internal IP. Treat such connections as being for the site itself.
 	default_sni {$OPNMESH_SITE}
+	# Nothing in this container needs to trust the private CA, and its root
+	# filesystem is read-only.
+	skip_install_trust
 }
 
 {$OPNMESH_SITE} {
 	{$OPNMESH_TLS}
 	encode zstd gzip
 	header Strict-Transport-Security "max-age=31536000"
+	# The controller refuses larger bodies itself; stop them here first.
+	request_body {
+		max_size 1MiB
+	}
 	reverse_proxy controller:3000 {
 		# Server-Sent Events must stream, not buffer.
 		flush_interval -1
