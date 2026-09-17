@@ -506,7 +506,13 @@ AllowedIPs = 10.99.1.10/32
 ### 9.2 `nftables.conf` (gateway)
 
 Everything lives in `table inet opnmesh`, replaced atomically on reload; the
-operator's own tables are untouched.
+operator's own tables are untouched. The forward chain's drop policy covers
+every packet the host forwards, so traffic on container and VM bridges
+(Docker, Podman, LXD, libvirt) is accepted here and left to those runtimes'
+own rules, as long as it does not enter or leave the mesh. That lets a
+gateway share a host with containers, including the controller itself.
+Forwarding between the host's other interfaces stays dropped, so switching on
+`ip_forward` for the mesh never turns a multi-homed gateway into a router.
 
 ```
 table inet opnmesh {
@@ -520,6 +526,9 @@ table inet opnmesh {
 
   chain forward {
     type filter hook forward priority filter; policy drop;
+    # container/VM bridges, when the traffic does not touch the mesh
+    iifname "docker0" oifname != "opnmesh0" accept     # likewise br-*, podman*, cni-*, lxdbr*, virbr*
+    oifname "docker0" iifname != "opnmesh0" accept
     ct state established,related accept
     ct state invalid drop
     # MSS clamp both ways
@@ -599,6 +608,35 @@ Apply rules (from v1, kept because they were right):
   interface up from disk if it is missing (a boot before DNS was ready, a
   manual `wg-quick down`), restores a lost private key, and re-resolves
   stale hostname endpoints (§7.4).
+- When reports fail (controller down, or a proxy or firewall refusing the
+  request), the agent drops back to the configured interval and doubles the
+  wait after each further failure, up to a minute, then resumes the normal
+  pace on the first success. It logs the first failure, any change in the
+  error, and every twentieth repeat, each as one line: an HTML error page
+  from a proxy is reduced to its title.
+
+### 10.1 Updating the agent
+
+`install.sh --upgrade` updates an enrolled gateway in place: it downloads the
+agent the controller ships, checks it against the published SHA-256, installs
+it with the current systemd units and restarts `opnmesh-gw`. It needs no
+token, the gateway keeps its identity, keys and telemetry history, and
+`opnmesh-wg` is left running so the tunnel stays up. The site page shows the
+command when a gateway reports an older agent than the controller.
+
+Enrolling with `--token` runs the new binary's `enrol` before installing it,
+so a refused token (used, expired, wrong) changes nothing on the machine.
+With a fresh token it replaces the site's gateway, which is how a VM is
+rebuilt or moved.
+
+The install and upgrade one-liners depend on how the controller is reached:
+
+- **Public certificate:** `curl -fsSL <url>/install.sh | sudo bash -s -- …`.
+  TLS verifies the download.
+- **Private CA:** the VM does not trust the CA yet, so the command downloads
+  the installer without verification, checks it against the SHA-256 shown in
+  the UI, and only then runs it with `--ca-fingerprint`; everything after
+  that is verified against the pinned CA.
 
 ## 11. Real-time traffic and the dashboard
 
@@ -854,6 +892,11 @@ as. Upgrading is `docker compose pull && docker compose up -d`. Backup is the
 `/opt/opnmesh/data` directory (or the database download in Settings, which
 is consistent while the controller runs) plus `.env`.
 
+To run it behind a reverse proxy you already operate instead of the
+bundled Caddy, use `deploy/controller/external-proxy/` and
+[REVERSE-PROXY.md](REVERSE-PROXY.md): the controller then listens on a
+private address, and a firewall rule admits only the proxy.
+
 Where to run it: the recommended place is a small VM at the primary site
 (the datacentre), with the router forwarding TCP 443 to it so gateways at
 other sites can enrol. It may share the VM with that site's gateway. Any VPS
@@ -976,7 +1019,7 @@ hard to deploy. v2 keeps the ideas and removes the weight:
 | Config in `sites.yml`, edited via UI, committed to a local git repo | SQLite, edited via UI, audit log in a table | One less concept; no YAML/git failure modes; proper relational integrity. |
 | Two processes (dev control server + Next.js UI) sharing files | One Next.js process with route handlers | Half the code, one port, one log. |
 | Prometheus + Alertmanager + Grafana + mailpit for observability | Built-in telemetry, rollups and charts in SQLite; optional `/metrics` | The dashboard is the product; the stack was four extra services to run. |
-| Minisign-signed self-updates with A/B installs, commit-confirm, boot watchdog | Agent is updated by re-running the installer, which downloads the binary from the controller and verifies its SHA-256 | The failsafe machinery was more code than the rest of the agent and solved a problem small fleets do not have. |
+| Minisign-signed self-updates with A/B installs, commit-confirm, boot watchdog | Agent is updated in place with `install.sh --upgrade`, which downloads the binary from the controller, verifies its SHA-256 and restarts the agent (§10.1) | The failsafe machinery was more code than the rest of the agent and solved a problem small fleets do not have. |
 | Coordinated mesh-wide port-change transaction | Change port; agents apply on next tick; UI shows which have not | Simpler mental model; a failed change is visible and reversible in the same place. |
 | Full-mesh / multi-hub / single-hub as an explicit topology setting | Derived automatically from which sites are reachable, plus a hub priority list | Zero-config topology; the setting existed to describe a fact the data already knew. |
 | Client private keys never on the controller (placeholder in config) | Generated and stored encrypted; QR is complete and re-showable | Admins send QR codes; that requires the key. |

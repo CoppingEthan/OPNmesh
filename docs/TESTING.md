@@ -110,12 +110,28 @@ the compose file and Caddyfile come from the branch under test), and then
 root appears where the compose file expects it, `/api/admin/setup` answers
 over TLS signed by that CA, `/ca.crt` serves the same root, the controller
 process is uid 1000, first-run setup works with the persisted code, the
-install command carries the CA fingerprint, and the agent checksum downloads
-over TLS. It runs against any deployment made by the installer:
+install command verifies the installer's checksum and carries the CA
+fingerprint, and the agent checksum downloads over TLS. It runs against any
+deployment made by the installer:
 
 ```bash
 sudo -E node scripts/deploy-smoke.mjs --dir /opt/opnmesh --url https://<host>
 ```
+
+In CI it runs with `--gateway-test`, which turns the runner into a real
+gateway using the install command the controller printed. That covers the
+gateway path the simulation cannot, because its containers have no systemd:
+
+- the gateway enrols, both systemd units run and it reports online;
+- `--upgrade` restarts the agent and the gateway keeps its identity;
+- re-running the install command with its used token is refused and leaves
+  the installed agent alone;
+- stopping the units takes the tunnel down, and `opnmesh-wg` alone brings it
+  back from disk.
+
+The controller's containers run on the same host throughout, which proves the
+gateway firewall leaves container bridges alone. Only use `--gateway-test`
+on a disposable machine.
 
 ## Conventions
 

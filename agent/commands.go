@@ -143,7 +143,12 @@ func cmdRun(args []string, once bool) error {
 	}
 	lastError := ""
 	lastDiag := ""
-	interval := time.Duration(meta.TelemetryEverySec) * time.Second
+	// The configured reporting interval. The controller may ask for faster
+	// reports while someone watches the dashboard; failures slow them down.
+	configured := reportInterval(meta.TelemetryEverySec)
+	interval := configured
+	failures := 0
+	lastFailure := ""
 	log.Printf("opnmesh-gw %s: controller %s, interface %s, reporting every %s", version, cfg.ControllerURL, meta.Interface, interval)
 
 	// A configuration that failed to apply here, and when: it is not fetched
@@ -165,9 +170,23 @@ func cmdRun(args []string, once bool) error {
 			log.Printf("%v", err)
 		} else {
 			resp, err := client.SendTelemetry(collectReport(cfg, started, appliedHash, lastError))
+			if err == nil && failures > 0 {
+				log.Printf("controller reachable again after %d failed report(s)", failures)
+				failures, lastFailure = 0, ""
+			}
 			switch {
 			case err != nil:
-				log.Printf("report failed (controller unreachable is fine, tunnel keeps running): %v", err)
+				failures++
+				// Fast reporting only makes sense while the controller answers.
+				// Fall back to the configured interval and back off, so an
+				// unreachable or refusing controller costs a request a minute
+				// rather than one a second. Log the first failure, any change in
+				// the error, and then only every 20th repeat.
+				interval = backoffInterval(configured, failures)
+				if msg := err.Error(); msg != lastFailure || failures%20 == 1 {
+					log.Printf("report failed (%d in a row; the tunnel keeps running), next try in %s: %v", failures, interval, err)
+					lastFailure = msg
+				}
 			case resp.Status == "pending":
 				log.Printf("waiting for approval in the OPNmesh UI")
 			case resp.Status == "disabled":
@@ -193,7 +212,8 @@ func cmdRun(args []string, once bool) error {
 					failedHash = ""
 					appliedHash = desired.Hash
 					if desired.Meta.TelemetryIntervalSeconds > 0 {
-						interval = time.Duration(desired.Meta.TelemetryIntervalSeconds) * time.Second
+						configured = reportInterval(desired.Meta.TelemetryIntervalSeconds)
+						interval = configured
 					}
 					log.Printf("applied configuration %s", desired.Hash[:12])
 				}
@@ -209,9 +229,38 @@ func cmdRun(args []string, once bool) error {
 		if once {
 			return nil
 		}
-		jitter := time.Duration(rand.Int63n(int64(interval / 5)))
+		jitter := time.Duration(rand.Int63n(int64(interval/5) + 1))
 		time.Sleep(interval + jitter)
 	}
+}
+
+// The longest wait between reports while the controller keeps failing.
+const maxReportBackoff = time.Minute
+
+// reportInterval turns a configured number of seconds into an interval,
+// defaulting to five seconds when nothing sensible is configured.
+func reportInterval(seconds int) time.Duration {
+	if seconds < 1 {
+		seconds = 5
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// backoffInterval is the wait after a run of failed reports: the configured
+// interval after the first, doubling with each further failure up to a
+// minute, and never shorter than the configured interval itself.
+func backoffInterval(configured time.Duration, failures int) time.Duration {
+	if configured >= maxReportBackoff {
+		return configured
+	}
+	d := configured
+	for i := 1; i < failures && d < maxReportBackoff; i++ {
+		d *= 2
+	}
+	if d > maxReportBackoff {
+		d = maxReportBackoff
+	}
+	return d
 }
 
 // --- up / down / rollback / status --------------------------------------------

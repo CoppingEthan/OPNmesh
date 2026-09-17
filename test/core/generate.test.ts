@@ -143,6 +143,21 @@ describe("nftables", () => {
     expect(office).not.toContain("c_shop_north_to_shop_south");
     expect(office).not.toContain('oifname "opnmesh0" ip saddr @lan_shop_north');
   });
+  it("leaves container bridges to their own rules without letting them into the mesh", () => {
+    const snap = scenarios["two-spokes"]!();
+    const dc = generateNftables(snap, "site-dc");
+    for (const p of ["docker0", "br-*", "podman*", "cni-*", "lxdbr*", "virbr*"]) {
+      expect(dc).toContain(`iifname "${p}" oifname != "opnmesh0" accept`);
+      expect(dc).toContain(`oifname "${p}" iifname != "opnmesh0" accept`);
+    }
+    // No wildcard sets (nftables 1.0.2 on Ubuntu 22.04 rejects them), and no
+    // blanket accept for traffic between the host's own interfaces.
+    expect(dc).not.toMatch(/ifname \{[^}]*\*/);
+    expect(dc).not.toContain('iifname != "opnmesh0" oifname != "opnmesh0" accept');
+    // They come before any mesh verdict but after the chain's drop policy.
+    expect(dc.indexOf('iifname "docker0"')).toBeGreaterThan(dc.indexOf("policy drop"));
+    expect(dc.indexOf('iifname "docker0"')).toBeLessThan(dc.indexOf("ct state established,related accept"));
+  });
   it("isolates clients and honours allow-inbound and restrictions", () => {
     const snap = scenarios["policies"]!();
     const dc = generateNftables(snap, "site-dc");

@@ -10,8 +10,10 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Client talks to the controller. Every request carries the gateway token
@@ -60,14 +62,55 @@ type apiError struct {
 }
 
 func (e *apiError) Error() string {
-	msg := e.Body
+	return fmt.Sprintf("controller returned %d: %s", e.Status, summariseBody(e.Body))
+}
+
+var (
+	htmlTitleRE = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
+	htmlH1RE    = regexp.MustCompile(`(?is)<h1[^>]*>(.*?)</h1>`)
+	htmlTagRE   = regexp.MustCompile(`(?s)<[^>]*>`)
+)
+
+const maxErrorSummary = 160
+
+// summariseBody turns an error response into one short line: the JSON
+// "error" field when there is one, otherwise the heading of an HTML page (a
+// proxy's or firewall's block page), with whitespace collapsed and a length
+// cap, so a failing report never floods the journal.
+func summariseBody(body string) string {
 	var parsed struct {
 		Error string `json:"error"`
 	}
-	if json.Unmarshal([]byte(e.Body), &parsed) == nil && parsed.Error != "" {
+	msg := body
+	if json.Unmarshal([]byte(body), &parsed) == nil && parsed.Error != "" {
 		msg = parsed.Error
+	} else if looksLikeHTML(body) {
+		msg = "HTML page"
+		for _, re := range []*regexp.Regexp{htmlTitleRE, htmlH1RE} {
+			if m := re.FindStringSubmatch(body); m != nil {
+				if t := strings.Join(strings.Fields(htmlTagRE.ReplaceAllString(m[1], " ")), " "); t != "" {
+					msg = t + " (HTML page)"
+					break
+				}
+			}
+		}
 	}
-	return fmt.Sprintf("controller returned %d: %s", e.Status, strings.TrimSpace(msg))
+	msg = strings.Join(strings.Fields(msg), " ")
+	if msg == "" {
+		return "(empty response)"
+	}
+	if utf8.RuneCountInString(msg) > maxErrorSummary {
+		msg = string([]rune(msg)[:maxErrorSummary]) + "…"
+	}
+	return msg
+}
+
+func looksLikeHTML(body string) bool {
+	head := strings.ToLower(strings.TrimSpace(body))
+	if len(head) > 512 {
+		head = head[:512]
+	}
+	return strings.HasPrefix(head, "<!doctype html") || strings.HasPrefix(head, "<html") || strings.Contains(head, "<html")
 }
 
 func (c *Client) do(method, path string, body any, headers map[string]string, out any) (*http.Response, error) {

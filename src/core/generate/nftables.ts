@@ -11,6 +11,14 @@
  *    outbound-only sites — per client when the client is restricted;
  *  - nothing may open a connection to a client unless the client allows it.
  *
+ * Forwarding that never touches the mesh interface is not judged here,
+ * except that the drop policy would otherwise catch it: container and VM
+ * bridges on the same host (Docker, Podman, LXD, libvirt) are accepted so
+ * their traffic is left to their own rules, which still apply because an
+ * accept in one table never overrides a drop in another. Anything else the
+ * host forwards between its own interfaces stays dropped, so enabling
+ * ip_forward for the mesh does not turn a multi-homed gateway into a router.
+ *
  * Named counters per ordered site pair (and per site ⇄ clients) sit before
  * the verdicts, so the controller can read a site-to-site traffic matrix
  * straight from the forwarding gateway. No NAT exists except the explicit
@@ -28,6 +36,13 @@ import {
   sharedCidrs,
   type MeshSite,
 } from "../topology";
+
+/**
+ * Interfaces that container and VM runtimes create for their own networks.
+ * One rule per pattern: nftables before 1.0.3 (Ubuntu 22.04 ships 1.0.2)
+ * rejects wildcard names inside a set.
+ */
+export const HOST_BRIDGE_PATTERNS = ["docker0", "br-*", "podman*", "cni-*", "lxdbr*", "virbr*"] as const;
 
 export function nftIdent(slug: string): string {
   return slug.replace(/[^a-z0-9]/g, "_");
@@ -115,6 +130,11 @@ export function generateNftables(snap: Snapshot, siteId: string): string {
   const has = (s: MeshSite) => sharedCidrs(s).length > 0;
 
   lines.push("", "  chain forward {", "    type filter hook forward priority filter; policy drop;");
+
+  lines.push("", "    # Container and VM bridges on this host forward under their own rules.");
+  for (const pattern of HOST_BRIDGE_PATTERNS) {
+    lines.push(`    iifname "${pattern}" oifname != "${wg}" accept`, `    oifname "${pattern}" iifname != "${wg}" accept`);
+  }
 
   // Count first, decide later: counting rules carry no verdict, and they sit
   // ahead of the established/related accept so every packet of every

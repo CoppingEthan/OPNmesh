@@ -1,0 +1,35 @@
+# OPNmesh controller behind your own reverse proxy (docs/REVERSE-PROXY.md).
+#
+#   The proxy terminates TLS for OPNMESH_PUBLIC_URL and forwards plain HTTP to
+#   OPNMESH_BACKEND_BIND. Only the proxy may reach that address: the allowed
+#   sources are listed in ./backend-allow and enforced by
+#   opnmesh-backend-firewall.service.
+#
+#   The proxy must pass the original Host header (or X-Forwarded-Host), set
+#   X-Forwarded-For, and stream responses without buffering (the dashboard's
+#   live view is a server-sent event stream).
+#
+# Data lives in ./data (SQLite + secret.key). Back it up as a whole.
+name: opnmesh
+
+services:
+  controller:
+    image: ${OPNMESH_IMAGE:-ghcr.io/coppingethan/opnmesh:latest}
+    restart: unless-stopped
+    environment:
+      OPNMESH_DATA_DIR: /data
+      OPNMESH_PUBLIC_URL: ${OPNMESH_PUBLIC_URL:?set OPNMESH_PUBLIC_URL in .env}
+      # Reverse proxies in front of the controller; the client address is
+      # counted from the right of X-Forwarded-For (docs/REVERSE-PROXY.md).
+      OPNMESH_TRUST_PROXY: ${OPNMESH_TRUST_PROXY:-1}
+    volumes:
+      # The image runs as uid 1000 (node); ./data must be owned by that user.
+      - ./data:/data
+    ports:
+      - "${OPNMESH_BACKEND_BIND:?set OPNMESH_BACKEND_BIND in .env, e.g. 10.0.0.5:3000}:3000"
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/admin/setup').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

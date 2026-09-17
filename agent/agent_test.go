@@ -228,3 +228,47 @@ func TestStaleHostnamePeers(t *testing.T) {
 		t.Fatalf("stale = %v", keys)
 	}
 }
+
+func TestSummariseBody(t *testing.T) {
+	blockPage := "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n<title>Request blocked</title>\n<style>body{}</style></head>\n<body><h1>Request blocked</h1>\n" + strings.Repeat("<p>line</p>\n", 200) + "</body></html>"
+	cases := map[string]string{
+		`{"error":"invalid gateway token"}`: "invalid gateway token",
+		blockPage:                           "Request blocked (HTML page)",
+		"<html><body><h1> Bad\n gateway </h1></body></html>":  "Bad gateway (HTML page)",
+		"<!DOCTYPE html><html><body>no heading</body></html>": "HTML page",
+		"  upstream\n\n  timed   out \n":                      "upstream timed out",
+		"":                                                    "(empty response)",
+	}
+	for in, want := range cases {
+		if got := summariseBody(in); got != want {
+			t.Errorf("summariseBody(%.40q) = %q, want %q", in, got, want)
+		}
+	}
+	long := summariseBody(strings.Repeat("é", 400))
+	if n := len([]rune(long)); n != maxErrorSummary+1 || !strings.HasSuffix(long, "…") {
+		t.Errorf("long body not capped cleanly: %d runes", n)
+	}
+	err := (&apiError{Status: 403, Body: blockPage}).Error()
+	if strings.Contains(err, "\n") || len(err) > 200 {
+		t.Errorf("error for a block page must be one short line, got %q", err)
+	}
+}
+
+func TestReportBackoff(t *testing.T) {
+	s := time.Second
+	want := []time.Duration{5 * s, 10 * s, 20 * s, 40 * s, 60 * s, 60 * s}
+	for i, w := range want {
+		if got := backoffInterval(5*s, i+1); got != w {
+			t.Errorf("backoff after %d failures = %s, want %s", i+1, got, w)
+		}
+	}
+	if got := backoffInterval(5*s, 1000); got != time.Minute {
+		t.Errorf("backoff must cap at a minute, got %s", got)
+	}
+	if got := backoffInterval(120*s, 3); got != 120*s {
+		t.Errorf("a long configured interval is never shortened, got %s", got)
+	}
+	if reportInterval(0) != 5*s || reportInterval(-3) != 5*s || reportInterval(30) != 30*s {
+		t.Error("reportInterval defaults and passes through wrongly")
+	}
+}

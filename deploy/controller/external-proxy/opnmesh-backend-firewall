@@ -1,0 +1,30 @@
+#!/bin/sh
+# OPNmesh: only the reverse proxy may open connections to the controller's
+# backend port. Docker-published ports bypass the INPUT chain, so the rule
+# lives in DOCKER-USER and matches the original (pre-DNAT) destination.
+#
+# Reads /opt/opnmesh/backend-allow:
+#   BACKEND=<ip>:<port>      the published backend address
+#   <ip or cidr>             one allowed source per line
+set -eu
+CONF=${OPNMESH_BACKEND_ALLOW:-/opt/opnmesh/backend-allow}
+CHAIN=OPNMESH-BACKEND
+
+backend=$(sed -n 's/^BACKEND=//p' "$CONF" | tail -1)
+ip=${backend%:*}
+port=${backend##*:}
+[ -n "$ip" ] && [ -n "$port" ] || { echo "no BACKEND=<ip>:<port> in $CONF" >&2; exit 1; }
+sources=$(grep -vE '^\s*(#|$|BACKEND=)' "$CONF" | tr -d ' \t')
+[ -n "$sources" ] || { echo "no allowed sources in $CONF; refusing to lock the backend completely" >&2; exit 1; }
+
+iptables -N "$CHAIN" 2>/dev/null || iptables -F "$CHAIN"
+for s in $sources; do
+  iptables -A "$CHAIN" -s "$s" -j RETURN
+done
+iptables -A "$CHAIN" -j DROP
+
+iptables -N DOCKER-USER 2>/dev/null || true
+match="-p tcp -m conntrack --ctstate NEW --ctorigdst $ip --ctorigdstport $port -j $CHAIN"
+# shellcheck disable=SC2086
+iptables -C DOCKER-USER $match 2>/dev/null || iptables -I DOCKER-USER 1 $match
+echo "backend $ip:$port open to: $(echo $sources)"

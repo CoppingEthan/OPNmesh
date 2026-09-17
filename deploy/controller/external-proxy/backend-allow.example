@@ -1,0 +1,12 @@
+# OPNmesh backend allow-list, read by opnmesh-backend-firewall.
+# Copy to /opt/opnmesh/backend-allow and edit, then:
+#   sudo systemctl restart opnmesh-backend-firewall
+#
+# The address the controller publishes for the reverse proxy
+# (must match OPNMESH_BACKEND_BIND in .env):
+BACKEND=10.0.0.5:3000
+#
+# The only sources allowed to connect to it: your reverse proxy's addresses
+# as the controller host sees them (one address or CIDR per line).
+10.0.0.2
+10.0.0.3

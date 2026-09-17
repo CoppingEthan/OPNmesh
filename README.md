@@ -27,7 +27,9 @@ prints them and can create them on UniFi). The controller is never in the
 data path: switch it off and the tunnels keep running.
 
 Full design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Router details and
-the UniFi specifics: [docs/ROUTERS.md](docs/ROUTERS.md).
+the UniFi specifics: [docs/ROUTERS.md](docs/ROUTERS.md). Running the
+controller behind your own reverse proxy:
+[docs/REVERSE-PROXY.md](docs/REVERSE-PROXY.md).
 
 ## Install
 
@@ -45,6 +47,11 @@ authority instead: the controller is then reached by its IP address (or pass
 command carries the CA fingerprint so the installer verifies what it
 downloads before trusting it. The script prints the URL and a one-time setup
 code; open the URL, enter the code, and create the admin account.
+
+Already run a reverse proxy or web application firewall? Put the controller
+behind it instead of the bundled Caddy: see
+[docs/REVERSE-PROXY.md](docs/REVERSE-PROXY.md) for the layout, what the proxy
+must do, and which paths gateways need.
 
 **Gateways**: in the UI, add a site, then click *Generate install command*
 and paste it into an Ubuntu VM at that site:
@@ -66,9 +73,14 @@ send the person a one-time link.
   `Caddyfile`, `.env` (site name, public URL, ports, TLS mode) and two
   directories: `data` (the SQLite database and `secret.key`, owned by uid
   1000, the unprivileged user the image runs as) and `caddy` (certificates).
-- **Upgrades**: `cd /opt/opnmesh && docker compose pull && docker compose up -d`.
-  Gateways are upgraded by re-running their install command; the binary comes
-  from the controller and is checked against its SHA-256.
+- **Upgrades**: the controller with
+  `cd /opt/opnmesh && docker compose pull && docker compose up -d`. Then each
+  gateway: when its agent is older than the controller, the site's Gateway card
+  shows the upgrade command,
+  `curl -fsSL https://<controller>/install.sh | sudo bash -s -- --upgrade`.
+  It installs the agent the controller ships (checked against its SHA-256) and
+  restarts it; the gateway keeps its identity and its tunnel stays up. No
+  token is needed.
 - **Backups**: back up `data` as a whole. `secret.key` encrypts the client
   private keys stored in the database, so neither file is useful without the
   other. *Settings → Download database backup* gives a consistent copy while
@@ -147,7 +159,7 @@ controller installer. See [docs/TESTING.md](docs/TESTING.md).
 | `app/` | Next.js pages and API route handlers |
 | `src/ui/` | React components, the live map, charts |
 | `agent/` | The Go gateway agent (`opnmesh-gw`) |
-| `deploy/` | Controller installer + compose + Caddyfile; gateway installer |
+| `deploy/` | Controller installer + compose + Caddyfile, the layout for your own reverse proxy, and the gateway installer |
 | `scripts/` | Agent build and tests in Docker, simulation driver, UI and deployment smoke tests |
 | `sim/` | The four-site Docker simulation and its integration suite |
 | `docs/` | Architecture, routers/UniFi, testing, prior art |

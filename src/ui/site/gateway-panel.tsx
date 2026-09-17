@@ -2,12 +2,60 @@
 
 import { KeyRound, Terminal } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { SiteState } from "@/server/state";
 import { apiFetch } from "../api";
 import { Badge, Button, Callout, Card, Field, Input, Mono, Pre, healthLabel, healthTone } from "../components";
 import { Ago, ConfirmButton, CopyButton, Dialog, Notice } from "../components-client";
 import { duration } from "../format";
+
+interface AgentUpdateInfo {
+  controllerVersion: string;
+  command: string;
+}
+
+/**
+ * Says when the gateway's agent is older than the one this controller ships,
+ * and gives the command that updates it in place.
+ */
+function AgentUpdate({ agentVersion }: { agentVersion: string }) {
+  const [info, setInfo] = useState<AgentUpdateInfo | null>(null);
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch<AgentUpdateInfo>("GET", "/api/admin/agent-update")
+      .then((i) => {
+        if (!cancelled) setInfo(i);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  if (!info) return null;
+  const outdated = agentVersion !== "" && agentVersion !== info.controllerVersion;
+  if (!outdated && !open) {
+    return (
+      <p className="mt-4 text-xs text-ink-3">
+        Agent {agentVersion || "?"} matches this controller.{" "}
+        <button type="button" className="underline decoration-dotted underline-offset-2 hover:text-ink" onClick={() => setOpen(true)}>
+          Show the update command
+        </button>
+      </p>
+    );
+  }
+  return (
+    <div className="mt-4">
+      <Callout tone={outdated ? "warn" : "info"} title={outdated ? `Agent update available: ${agentVersion} → ${info.controllerVersion}` : "Update the agent"}>
+        <p>Run this on the gateway VM. It installs the agent this controller ships and restarts it; the gateway keeps its identity and its tunnel stays up.</p>
+        <Pre className="mt-2 whitespace-pre-wrap break-all">{info.command}</Pre>
+        <div className="mt-2">
+          <CopyButton text={info.command} label="Copy command" />
+        </div>
+      </Callout>
+    </div>
+  );
+}
 
 interface TokenResponse {
   token: string;
@@ -118,6 +166,8 @@ export function GatewayPanel({ site }: { site: SiteState }) {
           <span className="mono text-xs">{g.addresses.join(", ") || "—"}</span>
         </Item>
       </dl>
+
+      <AgentUpdate agentVersion={g.agentVersion} />
 
       <ReachabilityForm site={site} />
 

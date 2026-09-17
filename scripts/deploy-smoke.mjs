@@ -9,12 +9,19 @@
  *
  *   sudo -E node scripts/deploy-smoke.mjs --dir /opt/opnmesh --url https://203.0.113.5
  *
- * Root is needed only to read data/setup-code, which the controller writes
- * for its own user alone.
+ * Root is needed to read data/setup-code, which the controller writes for its
+ * own user alone.
+ *
+ * With --gateway-test (CI) it also makes this host a gateway with the install
+ * command the controller prints, under systemd; upgrades it in place; checks
+ * that a used token is refused without side effects and that the tunnel
+ * comes back from disk with the agent stopped; then removes it all again. The
+ * controller's own containers keep working throughout, which proves the
+ * gateway firewall leaves container bridges alone. Disposable machines only.
  */
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import https from "node:https";
 import { join } from "node:path";
 
@@ -24,6 +31,7 @@ const opt = (name, def) => {
   return i >= 0 && args[i + 1] !== undefined ? args[i + 1] : def;
 };
 const dir = opt("--dir", "/opt/opnmesh");
+const gatewayTest = args.includes("--gateway-test");
 const base = opt("--url", "").replace(/\/+$/, "");
 if (!base.startsWith("https://")) {
   console.error("usage: deploy-smoke.mjs --dir <install dir> --url https://<host>[:port]");
@@ -71,6 +79,18 @@ const json = (r) => {
   }
 };
 const compose = (...a) => execFileSync("docker", ["compose", ...a], { cwd: dir, encoding: "utf8", timeout: 60_000 });
+function sh(cmd, timeout = 300_000) {
+  const r = spawnSync("bash", ["-c", cmd], { encoding: "utf8", timeout });
+  return { code: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+}
+const unit = (name, prop) => sh(`systemctl show -p ${prop} --value ${name}`).out.trim();
+const lastLines = (text) => "\n" + text.trim().split("\n").slice(-15).join("\n");
+const removeGateway = () =>
+  sh(
+    "systemctl disable --now opnmesh-gw opnmesh-wg 2>/dev/null; ip link del opnmesh0 2>/dev/null; nft delete table inet opnmesh 2>/dev/null; " +
+      "rm -f /etc/systemd/system/opnmesh-gw.service /etc/systemd/system/opnmesh-wg.service; systemctl daemon-reload; " +
+      "rm -rf /etc/opnmesh /var/lib/opnmesh /usr/local/bin/opnmesh-gw",
+  );
 
 try {
   // 1. Caddy issued a private CA and the compose file made its root readable.
@@ -122,8 +142,13 @@ try {
   const tok = json(await request(`/api/admin/sites/${site.id}/enrol-token`, { ca, method: "POST", body: {}, headers: { cookie } }));
   check(tok?.caFingerprint === caFingerprint, "install command carries the CA fingerprint");
   check(
-    typeof tok?.command === "string" && tok.command.includes(`curl -fsSL ${base}/install.sh`) && tok.command.includes(`--ca-fingerprint ${caFingerprint}`) && !tok.command.includes("--insecure-http"),
-    "install command uses the public URL over https",
+    typeof tok?.command === "string" &&
+      tok.command.includes(`${base}/install.sh`) &&
+      tok.command.includes(`echo "${tok.installScriptSha256}  $f" | sha256sum -c`) &&
+      tok.command.includes(`--ca-fingerprint ${caFingerprint}`) &&
+      !tok.command.includes("| sudo bash") &&
+      !tok.command.includes("--insecure-http"),
+    "install command checks the installer's checksum before running it, then pins the CA",
   );
   const script = await request("/install.sh", { ca });
   check(script.status === 200 && script.body.includes(`CONTROLLER="${base}"`), "installer is served with the controller URL baked in");
@@ -131,9 +156,58 @@ try {
   check(sum.status === 200 && /^[a-f0-9]{64}/.test(sum.body), "agent binary checksum downloads over TLS (the image ships the agent)");
   const state = json(await request("/api/admin/state", { ca, headers: { cookie } }));
   check(state?.sites?.length === 1, "dashboard state is served to the signed-in admin");
+
+  if (gatewayTest) {
+    const gatewayWhere = async (want) => {
+      for (let i = 0; i < 60; i++) {
+        const st = json(await request("/api/admin/state", { ca, headers: { cookie } }));
+        const g = st?.sites?.find((x) => x.id === site.id)?.gateway ?? null;
+        if (g && want(g)) return g;
+        await sleep(2000);
+      }
+      return null;
+    };
+
+    // 6. A real gateway on this host, from the printed command, under systemd.
+    const r1 = sh(tok.command);
+    check(r1.code === 0, `the printed install command enrols this host (exit ${r1.code})${r1.code ? lastLines(r1.out) : ""}`);
+    const g1 = await gatewayWhere((g) => g.health === "online" && g.configCurrent);
+    check(!!g1, "gateway reports online with its configuration applied");
+    check(unit("opnmesh-gw", "ActiveState") === "active" && unit("opnmesh-wg", "ActiveState") === "active", "opnmesh-gw and opnmesh-wg run under systemd");
+    check(sh("ip link show opnmesh0").code === 0, "tunnel interface opnmesh0 exists");
+    check(json(await request("/api/admin/setup", { ca }))?.needsSetup === false, "the controller's containers are still reachable with the gateway firewall loaded");
+    const pid1 = unit("opnmesh-gw", "MainPID");
+
+    // 7. Upgrade in place: no token, same identity, agent restarted.
+    const up = json(await request("/api/admin/agent-update", { ca, headers: { cookie } }));
+    check(typeof up?.command === "string" && up.command.includes("--upgrade") && !up.command.includes("--token"), "the controller offers an upgrade command without a token");
+    const r2 = sh(up.command);
+    check(r2.code === 0 && /agent updated/.test(r2.out), `the upgrade command updates the agent (exit ${r2.code})${r2.code ? lastLines(r2.out) : ""}`);
+    const pid2 = unit("opnmesh-gw", "MainPID");
+    check(pid2 !== pid1 && unit("opnmesh-gw", "ActiveState") === "active", `the agent restarted on the new binary (pid ${pid1} -> ${pid2})`);
+    const g2 = await gatewayWhere((g) => g.health === "online" && g.lastSeenAt > (g1?.lastSeenAt ?? 0));
+    check(!!g2 && g2.gatewayId === g1?.gatewayId && g2.publicKey === g1?.publicKey, "the gateway kept its identity and key through the upgrade");
+
+    // 8. Re-running the used install command fails before changing anything.
+    const before = statSync("/usr/local/bin/opnmesh-gw").mtimeMs;
+    const r3 = sh(tok.command);
+    check(r3.code !== 0 && /enrolment failed/.test(r3.out), "re-running the install command with its used token is refused");
+    check(statSync("/usr/local/bin/opnmesh-gw").mtimeMs === before && unit("opnmesh-gw", "MainPID") === pid2, "the installed agent was left untouched and running");
+
+    // 9. Boot path: opnmesh-wg alone brings the tunnel up from the files on disk.
+    sh("systemctl stop opnmesh-gw opnmesh-wg");
+    check(sh("ip link show opnmesh0").code !== 0, "stopping opnmesh-wg takes the tunnel down");
+    sh("systemctl start opnmesh-wg");
+    check(sh("ip link show opnmesh0").code === 0, "opnmesh-wg brings the tunnel back from disk with no agent running");
+    sh("systemctl start opnmesh-gw");
+    const g3 = await gatewayWhere((g) => g.health === "online" && g.lastSeenAt > (g2?.lastSeenAt ?? 0));
+    check(!!g3, "the agent reports again after the restart");
+  }
 } catch (e) {
   console.error(e);
   failed = true;
+} finally {
+  if (gatewayTest) removeGateway();
 }
 if (failed) {
   try {

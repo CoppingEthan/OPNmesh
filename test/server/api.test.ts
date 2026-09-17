@@ -28,6 +28,8 @@ import { GET as configGet } from "../../app/api/agent/config/route";
 import { POST as telemetryPost } from "../../app/api/agent/telemetry/route";
 import { GET as installGet } from "../../app/install.sh/route";
 import { GET as backupGet } from "../../app/api/admin/backup/route";
+import { GET as agentUpdateGet } from "../../app/api/admin/agent-update/route";
+import { APP_VERSION } from "@/server/env";
 import Database from "better-sqlite3";
 import { listEvents } from "@/server/events";
 
@@ -106,7 +108,7 @@ describe("gateway lifecycle through the API", () => {
     // The installer is served with the URL baked in.
     const script = await (await installGet()).text();
     expect(script).toContain('CONTROLLER="http://controller.test"');
-    expect(script).toContain("opnmesh-gw enrol --controller");
+    expect(script).toContain('enrol --controller "$CONTROLLER" --token "$TOKEN"');
     expect(script).not.toContain("__OPNMESH_URL__");
 
     // Agent side: enrol with only the public key.
@@ -270,5 +272,21 @@ describe("public endpoints and operations", () => {
     expect((copy.prepare("SELECT COUNT(*) AS n FROM sites").get() as { n: number }).n).toBe(1);
     copy.close();
     expect(listEvents().some((e) => e.message === "Database backup downloaded")).toBe(true);
+  }, 30_000);
+});
+
+describe("agent updates", () => {
+  it("gives the admin the in-place upgrade command, without a token", async () => {
+    expect((await agentUpdateGet(req("GET", "/api/admin/agent-update"))).status).toBe(401);
+    await setupAndLogin();
+    const r = await agentUpdateGet(req("GET", "/api/admin/agent-update", undefined, asAdmin()));
+    expect(r.status).toBe(200);
+    const body = await r.json();
+    expect(body.controllerVersion).toBe(APP_VERSION);
+    expect(body.command).toBe("curl -fsSL http://controller.test/install.sh | sudo bash -s -- --upgrade --insecure-http");
+    expect(body.command).not.toContain("--token");
+    expect(body.installScriptSha256).toMatch(/^[a-f0-9]{64}$/);
+    // The served installer understands the flag the command uses.
+    expect(await (await installGet()).text()).toContain("--upgrade) UPGRADE=1");
   }, 30_000);
 });

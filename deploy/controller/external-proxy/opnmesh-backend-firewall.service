@@ -1,0 +1,14 @@
+[Unit]
+Description=OPNmesh: only the reverse proxy may reach the controller backend
+Documentation=file:///opt/opnmesh/backend-allow
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/opnmesh-backend-firewall
+
+[Install]
+WantedBy=multi-user.target docker.service
