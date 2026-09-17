@@ -15,19 +15,28 @@
 #                       https://203.0.113.5 or https://mesh.lan (default: this
 #                       host's address); Caddy then issues certificates from a
 #                       private CA that gateways pin at install time
-#   --image <ref>       controller image (default ghcr.io/coppingethan/opnmesh:latest)
+#   --version <x.y.z>   release to install (default: the one this installer
+#                       belongs to, see VERSION below)
+#   --image <ref>       controller image (default ghcr.io/coppingethan/opnmesh:<version>)
 #   --http-port <n>     host port for Caddy's HTTP listener (default 80)
 #   --https-port <n>    host port for Caddy's HTTPS listener (default 443)
 #   --no-start          write files but do not start
 set -eu
 
+# The release this installer belongs to; bump it once a release's image is
+# published. The compose file, the Caddyfile and the image all come from
+# that release, so a new install gets files that were released together and
+# that do not change under it when main moves on. The image is pinned in
+# .env too: to upgrade, set the new version in OPNMESH_IMAGE there, then
+# docker compose pull && docker compose up -d.
+VERSION="${OPNMESH_VERSION:-2.1.0}"
 DIR=/opt/opnmesh
 DOMAIN="${OPNMESH_DOMAIN:-}"
 URL="${OPNMESH_PUBLIC_URL:-}"
-IMAGE="${OPNMESH_IMAGE:-ghcr.io/coppingethan/opnmesh:latest}"
+IMAGE="${OPNMESH_IMAGE:-}"
 HTTP_PORT="${OPNMESH_HTTP_PORT:-80}"
 HTTPS_PORT="${OPNMESH_HTTPS_PORT:-443}"
-RAW="${OPNMESH_RAW_BASE:-https://raw.githubusercontent.com/CoppingEthan/OPNmesh/main/deploy/controller}"
+RAW="${OPNMESH_RAW_BASE:-}"
 START=1
 # The image runs as this unprivileged user; the data directory must be its.
 DATA_UID=1000
@@ -37,6 +46,7 @@ while [ $# -gt 0 ]; do
     --dir) DIR="$2"; shift 2 ;;
     --domain) DOMAIN="$2"; shift 2 ;;
     --url) URL="$2"; shift 2 ;;
+    --version) VERSION="$2"; shift 2 ;;
     --image) IMAGE="$2"; shift 2 ;;
     --http-port) HTTP_PORT="$2"; shift 2 ;;
     --https-port) HTTPS_PORT="$2"; shift 2 ;;
@@ -47,6 +57,13 @@ done
 
 [ "$(id -u)" = "0" ] || { echo "run as root (sudo)" >&2; exit 2; }
 log() { printf '\033[1;32m[opnmesh]\033[0m %s\n' "$*"; }
+# 2.1.0 here is v2.1.0 as a git tag; accept either.
+VERSION="${VERSION#v}"
+case "$VERSION" in
+  '' | *[!0-9A-Za-z.-]*) echo "bad version: $VERSION" >&2; exit 2 ;;
+esac
+IMAGE="${IMAGE:-ghcr.io/coppingethan/opnmesh:$VERSION}"
+RAW="${RAW:-https://raw.githubusercontent.com/CoppingEthan/OPNmesh/v$VERSION/deploy/controller}"
 
 # Read one value out of .env without executing the file. Sourcing it would run
 # any value that contains a space (OPNMESH_TLS="tls internal") as a command,
@@ -67,7 +84,9 @@ docker compose version >/dev/null 2>&1 || { echo "docker compose plugin missing;
 mkdir -p "$DIR/data" "$DIR/caddy"
 # The controller runs unprivileged inside its container and must own its data
 # (SQLite, secret.key, the setup code). A root-owned directory would leave it
-# unable to start.
+# unable to start. The same uid on the host is often the first login user,
+# who can therefore read the secrets; 0700 keeps every other account out.
+# Where uid 1000 is a person, treat that account as a controller admin.
 chown "$DATA_UID:$DATA_UID" "$DIR/data"
 chmod 0700 "$DIR/data"
 cd "$DIR"
@@ -109,7 +128,7 @@ fi
 
 # Start ----------------------------------------------------------------------
 if [ "$START" = "1" ]; then
-  log "starting OPNmesh"
+  log "starting OPNmesh ($(env_value OPNMESH_IMAGE))"
   docker compose pull -q --ignore-pull-failures
   docker compose up -d
   PUBLIC_URL="$(env_value OPNMESH_PUBLIC_URL)"

@@ -158,6 +158,24 @@ try {
   const state = json(await request("/api/admin/state", { ca, headers: { cookie } }));
   check(state?.sites?.length === 1, "dashboard state is served to the signed-in admin");
 
+  // 5b. The containers' hardening, the data directory's mode, the CSP and the body limit.
+  for (const svc of ["controller", "caddy"]) {
+    const id = compose("ps", "-q", svc).trim();
+    const host = JSON.parse(execFileSync("docker", ["inspect", "-f", "{{json .HostConfig}}", id], { encoding: "utf8" }));
+    check(host.ReadonlyRootfs === true && host.CapDrop?.includes("ALL") && host.SecurityOpt?.includes("no-new-privileges:true") && host.Memory > 0 && host.PidsLimit > 0, `${svc} runs read-only, without capabilities or new privileges, with memory and process limits`);
+  }
+  const capBnd = compose("exec", "-T", "controller", "grep", "CapBnd", "/proc/self/status");
+  check(/CapBnd:\s*0+\s*$/.test(capBnd), "the controller's capability bounding set is empty");
+  const write = spawnSync("docker", ["compose", "exec", "-T", "controller", "sh", "-c", "touch /app/smoke 2>&1; touch /data/.smoke /app/.next/cache/smoke && rm /data/.smoke /app/.next/cache/smoke && echo writable"], { cwd: dir, encoding: "utf8" });
+  check(/read-only file system/i.test(write.stdout) && /writable/.test(write.stdout), "the controller can write to /data and its cache, not to the image");
+  check((statSync(join(dir, "data")).mode & 0o777) === 0o700, "the data directory is closed to other users (0700)");
+  const csp = String((await request("/login", { ca })).headers["content-security-policy"] ?? "");
+  check(/default-src 'self'/.test(csp) && /frame-ancestors 'none'/.test(csp) && !/unsafe-eval/.test(csp), "pages carry the production Content-Security-Policy");
+  const big = await request("/api/admin/login", { ca, method: "POST", body: { email: "x".repeat(1_200_000), password: "x" } }).catch((e) => ({ status: 0, body: String(e) }));
+  check(big.status === 413, `a request body over 1 MiB is refused (${big.status})`);
+  const logs = compose("logs", "--no-color", "controller");
+  check(!/EROFS|read-only file system|EACCES/i.test(logs), "the controller logged no write errors");
+
   if (gatewayTest) {
     const gatewayWhere = async (want) => {
       for (let i = 0; i < 60; i++) {

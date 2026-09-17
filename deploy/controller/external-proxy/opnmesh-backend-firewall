@@ -1,30 +1,332 @@
 #!/bin/sh
 # OPNmesh: only the reverse proxy may open connections to the controller's
-# backend port. Docker-published ports bypass the INPUT chain, so the rule
-# lives in DOCKER-USER and matches the original (pre-DNAT) destination.
+# backend port. Docker-published ports bypass the INPUT chain, so the rules
+# live in DOCKER-USER. One matches the original (pre-DNAT) destination of the
+# published port. The other matches anything forwarded to port 3000 on the
+# controller's own bridge, which also covers hosts that route straight to the
+# container's address (Docker before 28 lets hosts on the same segment do so).
 #
 # Reads /opt/opnmesh/backend-allow:
 #   BACKEND=<ip>:<port>      the published backend address
-#   <ip or cidr>             one allowed source per line
+#   <ip or cidr>             one allowed IPv4 source per line; # starts a comment
+#
+# It fails closed. The whole file is checked before anything changes, and the
+# allow-list is replaced in one iptables-restore transaction. If anything is
+# wrong, including a missing file or one without sources, nothing may reach
+# the backend until it is fixed and the script runs again.
 set -eu
+
 CONF=${OPNMESH_BACKEND_ALLOW:-/opt/opnmesh/backend-allow}
+# docker compose's .env beside it: OPNMESH_BACKEND_BIND is what is published.
+ENV_FILE=${OPNMESH_ENV_FILE:-$(dirname "$CONF")/.env}
 CHAIN=OPNMESH-BACKEND
+# Fixed by docker-compose.yml: the project name, the bridge name and the
+# port the controller listens on inside its container.
+PROJECT=opnmesh
+BRIDGE=opnmesh-br
+CPORT=3000
 
-backend=$(sed -n 's/^BACKEND=//p' "$CONF" | tail -1)
-ip=${backend%:*}
-port=${backend##*:}
-[ -n "$ip" ] && [ -n "$port" ] || { echo "no BACKEND=<ip>:<port> in $CONF" >&2; exit 1; }
-sources=$(grep -vE '^\s*(#|$|BACKEND=)' "$CONF" | tr -d ' \t')
-[ -n "$sources" ] || { echo "no allowed sources in $CONF; refusing to lock the backend completely" >&2; exit 1; }
-
-iptables -N "$CHAIN" 2>/dev/null || iptables -F "$CHAIN"
-for s in $sources; do
-  iptables -A "$CHAIN" -s "$s" -j RETURN
-done
-iptables -A "$CHAIN" -j DROP
-
-iptables -N DOCKER-USER 2>/dev/null || true
-match="-p tcp -m conntrack --ctstate NEW --ctorigdst $ip --ctorigdstport $port -j $CHAIN"
+log() { printf 'opnmesh-backend-firewall: %s\n' "$*" >&2; }
+# words <list>: the list with single spaces (its items are validated addresses).
 # shellcheck disable=SC2086
-iptables -C DOCKER-USER $match 2>/dev/null || iptables -I DOCKER-USER 1 $match
-echo "backend $ip:$port open to: $(echo $sources)"
+words() { echo $1; }
+ipt() { iptables -w 10 "$@"; }
+dk() { timeout 20 docker "$@"; }
+
+[ "$(id -u)" = 0 ] || { log "run as root"; exit 1; }
+command -v iptables-restore >/dev/null 2>&1 || { log "iptables is not installed"; exit 1; }
+
+# is_ipv4 <s>: a dotted quad, each part 0-255 with no leading zeros (some
+# tools read 010 as octal).
+is_ipv4() {
+  case $1 in
+    '' | *[!0-9.]* | .* | *. | *..*) return 1 ;;
+  esac
+  _ifs=$IFS
+  IFS=.
+  # shellcheck disable=SC2086 # split on the dots
+  set -- $1
+  IFS=$_ifs
+  [ $# -eq 4 ] || return 1
+  for _o; do
+    case $_o in 0?*) return 1 ;; esac
+    [ ${#_o} -le 3 ] && [ "$_o" -le 255 ] || return 1
+  done
+}
+
+ip_int() {
+  _ifs=$IFS
+  IFS=.
+  # shellcheck disable=SC2086
+  set -- $1
+  IFS=$_ifs
+  echo $((($1 << 24) + ($2 << 16) + ($3 << 8) + $4))
+}
+
+int_ip() {
+  echo "$(($1 >> 24 & 255)).$(($1 >> 16 & 255)).$(($1 >> 8 & 255)).$(($1 & 255))"
+}
+
+IPV6="IPv6 is not supported (this firewall filters IPv4 only)"
+
+# check_source <s>: prints why s is not an IPv4 address or network, if it is not.
+check_source() {
+  case $1 in
+    \[* | *:*:*) echo "$IPV6"; return ;;
+    *:*) echo "a source is an address or network, without a port"; return ;;
+    */*) _addr=${1%/*} _len=${1#*/} ;;
+    *) _addr=$1 _len=32 ;;
+  esac
+  is_ipv4 "$_addr" || { echo "not an IPv4 address or network"; return; }
+  case $_len in
+    '' | *[!0-9]* | 0*) echo "the prefix length must be 1 to 32"; return ;;
+  esac
+  [ "$_len" -le 32 ] || { echo "the prefix length must be 1 to 32"; return; }
+  [ "$_addr" != 0.0.0.0 ] || { echo "0.0.0.0 is not a source"; return; }
+  # 10.0.0.2/2 is a typo for /32, not a network.
+  _n=$(ip_int "$_addr")
+  [ $((_n & (0xFFFFFFFF >> _len))) -eq 0 ] ||
+    echo "host bits are set (a single address is /32; the network would be $(int_ip $((_n & ~(0xFFFFFFFF >> _len))))/$_len)"
+}
+
+# check_backend <s>: prints why s is not <IPv4 address>:<port>, if it is not.
+check_backend() {
+  case $1 in
+    \[* | *:*:*) echo "$IPV6"; return ;;
+    *:*) _ip=${1%:*} _port=${1##*:} ;;
+    *) echo "must be <IPv4 address>:<port>"; return ;;
+  esac
+  is_ipv4 "$_ip" || { echo "must be <IPv4 address>:<port>"; return; }
+  [ "$_ip" != 0.0.0.0 ] || { echo "0.0.0.0 means every address; use the one private address the port is published on"; return; }
+  case $_port in
+    '' | *[!0-9]* | 0*) echo "bad port"; return ;;
+  esac
+  [ "$_port" -le 65535 ] || echo "bad port"
+}
+
+# env_value <name>: one value from the compose .env, without executing it.
+env_value() {
+  [ -r "$ENV_FILE" ] || return 0
+  tr -d '\r' <"$ENV_FILE" | sed -n "s/^[[:space:]]*$1=//p" | tail -1 |
+    sed -e 's/[[:space:]]#.*$//' -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+
+# The rules that send new connections to the backend through $CHAIN, one per
+# line, for every backend address in $targets.
+jump_rules() {
+  for _t in $targets; do
+    echo "-p tcp -m conntrack --ctstate NEW --ctorigdst ${_t%:*} --ctorigdstport ${_t##*:} -j $CHAIN"
+  done
+  echo "-o $BRIDGE -p tcp -m tcp --dport $CPORT -m conntrack --ctstate NEW -j $CHAIN"
+}
+
+ensure_docker_user() {
+  ipt -S DOCKER-USER >/dev/null 2>&1 || ipt -N DOCKER-USER
+}
+
+# One transaction: the allow-list and its DROP replace the chain's contents,
+# and the jumps from an earlier run are swapped for the current ones.
+ruleset() {
+  echo "*filter"
+  echo ":$CHAIN - [0:0]"
+  for _s in $sources; do
+    echo "-A $CHAIN -s $_s -j RETURN"
+  done
+  echo "-A $CHAIN -j DROP"
+  ipt -S DOCKER-USER | sed -n "s/^-A DOCKER-USER \(.* -j $CHAIN\)\$/-D DOCKER-USER \1/p"
+  jump_rules | sed 's/^/-I DOCKER-USER 1 /'
+  echo "COMMIT"
+}
+
+apply() {
+  ensure_docker_user
+  _rules=$(ruleset)
+  printf '%s\n' "$_rules" | iptables-restore -w 10 --noflush
+}
+
+# Nothing reaches the backend: the chain holds a bare DROP and every backend
+# we know of jumps to it. Jumps from earlier runs stay; they lead here too.
+lock_down() {
+  set +e
+  ensure_docker_user
+  if ! printf '*filter\n:%s - [0:0]\n-A %s -j DROP\nCOMMIT\n' "$CHAIN" "$CHAIN" | iptables-restore -w 10 --noflush; then
+    ipt -N "$CHAIN" 2>/dev/null
+    ipt -I "$CHAIN" 1 -j DROP
+  fi
+  jump_rules | while IFS= read -r _r; do
+    # shellcheck disable=SC2086
+    ipt -C DOCKER-USER $_r 2>/dev/null || ipt -I DOCKER-USER 1 $_r
+  done
+  set -e
+}
+
+state=checking
+backend=""
+backend_lines=0
+sources=""
+targets=""
+problems=""
+problem() {
+  problems="$problems
+  $*"
+}
+
+finish() {
+  rc=$?
+  trap - EXIT
+  case $state in
+    applied | refused) ;;
+    *)
+      [ -z "$problems" ] || log "ERROR:$problems"
+      lock_down
+      if [ -n "$targets" ]; then
+        log "the backend ($(words "$targets")) is now CLOSED to every source."
+      else
+        log "no backend address is known: only $BRIDGE and backends from earlier runs are CLOSED to every source."
+      fi
+      log "fix $CONF, then run: systemctl restart opnmesh-backend-firewall"
+      [ "$rc" -ne 0 ] || rc=1
+      ;;
+  esac
+  exit "$rc"
+}
+trap finish EXIT
+trap 'exit 1' HUP INT TERM
+
+# Docker's nftables firewall backend (Docker 29+) never consults DOCKER-USER.
+# Older clients cannot report the backend, so look for Docker's own table too.
+fw=""
+if command -v docker >/dev/null 2>&1; then
+  fw=$(dk info --format '{{.FirewallBackend.Driver}}' 2>/dev/null) || fw=""
+fi
+if [ -z "$fw" ] && command -v nft >/dev/null 2>&1 && nft list table ip docker-bridges >/dev/null 2>&1; then
+  fw=nftables
+fi
+case $fw in
+  nftables*)
+    state=refused
+    log "Docker is using its nftables firewall backend ($fw), which ignores the DOCKER-USER chain,"
+    log "so these rules would not protect the backend. Either run Docker with its iptables backend"
+    log "(remove \"firewall-backend\" from /etc/docker/daemon.json), or filter the backend in an nftables"
+    log "table of your own; see https://docs.docker.com/engine/network/firewall-nftables/"
+    exit 1
+    ;;
+esac
+
+# Parse -------------------------------------------------------------------
+if [ ! -e "$CONF" ]; then
+  problem "$CONF does not exist"
+elif [ ! -f "$CONF" ] || [ ! -r "$CONF" ]; then
+  problem "$CONF is not a readable file"
+else
+  # Windows line endings, comments and stray spaces go first, so
+  # "10.0.0.2   # proxy" and "BACKEND = 10.0.0.5:3000" both read as meant.
+  lines=$(tr -d '\r' <"$CONF" | sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+    -e 's/^BACKEND[[:space:]]*=[[:space:]]*/BACKEND=/')
+  n=0
+  while IFS= read -r line; do
+    n=$((n + 1))
+    case $line in
+      '') ;;
+      BACKEND=*)
+        v=${line#BACKEND=}
+        why=$(check_backend "$v")
+        backend_lines=$((backend_lines + 1))
+        if [ "$backend_lines" -gt 1 ]; then
+          problem "line $n: a second BACKEND= line"
+        elif [ -n "$why" ]; then
+          problem "line $n: BACKEND=$v: $why"
+        else
+          backend=$v
+        fi
+        ;;
+      *[[:space:]]*) problem "line $n: '$line': one address per line" ;;
+      *)
+        why=$(check_source "$line")
+        if [ -n "$why" ]; then
+          problem "line $n: '$line': $why"
+        else
+          sources="$sources $line"
+        fi
+        ;;
+    esac
+  done <<EOF
+$lines
+EOF
+fi
+
+# The address docker compose publishes is the fallback when BACKEND= is
+# missing, and must agree with it otherwise.
+bind=$(env_value OPNMESH_BACKEND_BIND)
+if [ -n "$bind" ] && [ -n "$(check_backend "$bind")" ]; then
+  log "warning: ignoring OPNMESH_BACKEND_BIND=$bind in $ENV_FILE: $(check_backend "$bind")"
+  bind=""
+fi
+if [ -n "$backend" ] && [ -n "$bind" ] && [ "$backend" != "$bind" ]; then
+  problem "BACKEND=$backend does not match OPNMESH_BACKEND_BIND=$bind in $ENV_FILE"
+elif [ "$backend_lines" -eq 0 ] && [ -f "$CONF" ]; then
+  if [ -n "$bind" ]; then
+    log "no BACKEND= line in $CONF; using OPNMESH_BACKEND_BIND=$bind from $ENV_FILE"
+  else
+    problem "no BACKEND=<ip>:<port> in $CONF, and no OPNMESH_BACKEND_BIND in $ENV_FILE"
+  fi
+fi
+for t in $backend $bind; do
+  case " $targets " in *" $t "*) ;; *) targets="$targets $t" ;; esac
+done
+
+# Check what Docker actually publishes -------------------------------------
+cid=""
+if [ -n "$fw" ]; then
+  cid=$(dk ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter label=com.docker.compose.service=controller 2>/dev/null | head -1) || cid=""
+fi
+if [ -n "$cid" ]; then
+  published=$(dk port "$cid" "$CPORT/tcp" 2>/dev/null) || published=""
+  while IFS= read -r p; do
+    case $p in
+      '') ;;
+      0.0.0.0:*)
+        log "WARNING: the controller port is published on every IPv4 address ($p)."
+        log "  Only the bridge rule filters that. Set OPNMESH_BACKEND_BIND to one private address."
+        ;;
+      \[* | *::*)
+        log "WARNING: the controller port is also published on IPv6 ($p), which this firewall does not filter."
+        log "  Set OPNMESH_BACKEND_BIND to an IPv4 address, or disable IPv6 port publishing."
+        ;;
+      *)
+        case " $targets " in
+          *" $p "*) ;;
+          *)
+            # That is where the port really is, so filter it too.
+            log "WARNING: the controller port is published at $p, which is not the configured backend; filtering it too"
+            targets="$targets $p"
+            ;;
+        esac
+        ;;
+    esac
+  done <<EOF
+$published
+EOF
+  ip link show "$BRIDGE" >/dev/null 2>&1 ||
+    log "WARNING: no $BRIDGE bridge. Only the published address is filtered until the controller is recreated with the current docker-compose.yml (docker compose up -d)."
+elif [ -z "$fw" ]; then
+  log "warning: cannot ask Docker what it publishes; applying the rules anyway"
+fi
+
+[ -z "$problems" ] || exit 1
+if [ -z "$sources" ]; then
+  problem "$CONF lists no allowed sources"
+  exit 1
+fi
+
+# Apply --------------------------------------------------------------------
+# A retry covers Docker changing DOCKER-USER between reading and writing it.
+apply || apply
+state=applied
+log "backend $(words "$targets") and $BRIDGE port $CPORT open to: $(words "$sources"); everything else is dropped"
+
+if ! ipt -C FORWARD -j DOCKER-USER 2>/dev/null; then
+  log "ERROR: the FORWARD chain does not jump to DOCKER-USER, so these rules have no effect."
+  log "  Is Docker running with its iptables integration turned off?"
+  exit 1
+fi

@@ -22,14 +22,35 @@ services:
       # Reverse proxies in front of the controller; the client address is
       # counted from the right of X-Forwarded-For (docs/REVERSE-PROXY.md).
       OPNMESH_TRUST_PROXY: ${OPNMESH_TRUST_PROXY:-1}
+      # Temporary files (the database backup is a full copy) go to disk, not
+      # to the memory-backed /tmp.
+      TMPDIR: /data
     volumes:
-      # The image runs as uid 1000 (node); ./data must be owned by that user.
+      # The image runs as uid 1000 (node); ./data must be owned by that user
+      # and closed to everyone else: chown 1000:1000 data && chmod 700 data
       - ./data:/data
     ports:
       - "${OPNMESH_BACKEND_BIND:?set OPNMESH_BACKEND_BIND in .env, e.g. 10.0.0.5:3000}:3000"
+    # Nothing in the image may change at run time: the controller writes only
+    # to /data, Next.js's cache and /tmp.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /app/.next/cache:size=64m,uid=1000,gid=1000,mode=0700
+    cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+    # Password hashing takes 64 MiB per sign-in, up to four at once.
+    mem_limit: 1g
+    pids_limit: 256
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/admin/setup').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+networks:
+  default:
+    driver_opts:
+      # opnmesh-backend-firewall filters by this name, which also catches
+      # hosts that route straight to the container's address.
+      com.docker.network.bridge.name: opnmesh-br

@@ -2,8 +2,7 @@ node_modules
 .next
 out
 data
-.env
-.env.*
+backups
 sim/state
 .git
 .github
@@ -12,6 +11,15 @@ test
 coverage
 *.md
 !README.md
+# secrets and databases, wherever they sit in the checkout
+**/.env
+**/.env.*
+!**/.env.example
+**/*.key
+**/*.pem
+**/*.token
+**/*.db
+**/*.db-*
 # development-only material
 branding
 screenshots

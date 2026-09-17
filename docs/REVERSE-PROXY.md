@@ -16,14 +16,18 @@ The proxy talks to the controller over plain HTTP, so only the proxy may reach
 that port.
 
 1. **Bind the port to a private address.** Set `OPNMESH_BACKEND_BIND` to a
-   private address of the controller host and a port, such as
-   `10.0.0.5:3000`. Never use `0.0.0.0`.
+   private IPv4 address of the controller host and a port, such as
+   `10.0.0.5:3000`. Never use `0.0.0.0`, and do not publish the port on IPv6.
 2. **Firewall the port to the proxy's addresses.** A port published by Docker
    bypasses the host's INPUT chain, so `ufw` and ordinary `nftables` input
-   rules do not protect it. `opnmesh-backend-firewall` puts the rule in
-   Docker's `DOCKER-USER` chain instead. It matches the original destination
-   and drops new connections from anyone not listed in `backend-allow`, and a
-   systemd unit re-applies it whenever Docker starts.
+   rules do not protect it. `opnmesh-backend-firewall` puts its rules in
+   Docker's `DOCKER-USER` chain instead, and a systemd unit re-applies them
+   whenever Docker starts. They drop new connections from anyone not listed
+   in `backend-allow`, whether the connection is for the published address
+   or routed straight to the container's own address. Docker releases before
+   28 let hosts on the same network segment do the latter; the firewall
+   catches that by matching the controller's network bridge, which the
+   compose file names `opnmesh-br`.
 
 The firewall matters because the controller trusts `X-Forwarded-For` from its
 proxy (see §2). If anything else can reach the port, it can claim to be any
@@ -32,7 +36,8 @@ client address.
 To set it up by hand:
 
 ```bash
-sudo mkdir -p /opt/opnmesh/data && sudo chown 1000:1000 /opt/opnmesh/data
+sudo mkdir -p /opt/opnmesh/data
+sudo chown 1000:1000 /opt/opnmesh/data && sudo chmod 700 /opt/opnmesh/data
 cd /opt/opnmesh
 # copy docker-compose.yml, .env.example (as .env) and backend-allow.example
 # (as backend-allow) from deploy/controller/external-proxy/, then edit both
@@ -44,9 +49,51 @@ sudo systemctl enable --now opnmesh-backend-firewall
 sudo docker compose logs controller | grep "setup code"
 ```
 
+After changing `backend-allow`, run
+`sudo systemctl restart opnmesh-backend-firewall`.
+
 To confirm the lock works:
+- `systemctl status opnmesh-backend-firewall` is active, and its log names
+  the allowed sources;
 - from the proxy, `curl http://<backend>/api/admin/setup` must answer;
 - from any other machine, the same request must time out.
+
+### How the firewall behaves
+
+- **It fails closed.** It checks all of `backend-allow` before it changes
+  anything, then replaces the allow-list in one step. If a line is wrong, or
+  the file is missing or lists no sources, it closes the backend to everyone,
+  logs why, and the unit fails. Fix the file and restart the unit.
+- **One IPv4 address or network per line.** `#` starts a comment anywhere on
+  a line, and Windows line endings are fine. IPv6 addresses, host names,
+  ports and networks with host bits set (`10.0.0.2/24`) are refused, with the
+  line number.
+- **`BACKEND=` must match `OPNMESH_BACKEND_BIND` in `.env`.** Without a
+  `BACKEND=` line the firewall uses the `.env` value. If the two differ, it
+  closes both.
+- **It warns about what Docker really publishes.** A port published on
+  `0.0.0.0` or on IPv6 is not fully filtered, so fix `OPNMESH_BACKEND_BIND`.
+  A published address the files do not name is filtered as well.
+- **It refuses to run with Docker's nftables firewall backend** (Docker 29
+  and later with `"firewall-backend": "nftables"`), because that backend
+  ignores `DOCKER-USER`. Keep Docker's default iptables backend, or write
+  equivalent rules in an nftables table of your own.
+- **A network created before the `opnmesh-br` name** gets it the next time
+  `docker compose up -d` runs with the current compose file. Until then the
+  firewall warns and filters only the published address.
+
+### The controller container
+
+The compose file runs the controller with a read-only root filesystem, no
+Linux capabilities, no way to gain privileges, a 1 GiB memory limit and a
+process limit. It writes only to `./data` and to small in-memory mounts for
+`/tmp` and the Next.js cache. Temporary files, such as the copy of the
+database a backup makes, go to `./data`. The standard layout runs Caddy the
+same way, keeping only the capability to bind ports 80 and 443.
+
+`./data` holds the database and `secret.key`. It must belong to uid 1000,
+which the image runs as, with mode 700. On the host that uid is often the
+first login account, which can therefore read the controller's secrets.
 
 ## 2. What the proxy must do
 
@@ -58,7 +105,7 @@ To confirm the lock works:
 | Set `X-Forwarded-For` to the visitor's address, and set `OPNMESH_TRUST_PROXY` to the number of proxies in front (normally `1`) | Login throttling and the audit log use the client address. The controller takes it that many entries from the right, where a visitor cannot forge it. Better still, have the proxy drop any `X-Forwarded-For` the visitor sent. |
 | Stream responses: no buffering, and an idle timeout of at least several minutes, for `/api/admin/live` | The live dashboard is a server-sent event stream that sends an event every second while open. |
 | Pass the `Authorization` header through unchanged | Gateways authenticate with a bearer token. |
-| Allow request bodies of at least 1 MB, and cache nothing under `/api/` | These are the controller's own limits and responses. |
+| Pass request bodies up to 1 MiB (capping them there is fine), and cache nothing under `/api/` | The controller refuses bodies over 1 MiB itself, and its API responses are live and per user. |
 | Redirect HTTP to HTTPS and send `Strict-Transport-Security` | The session cookie is HTTPS-only. |
 | Health check `GET /api/admin/setup` (always 200) | The site root redirects to the login page. |
 
