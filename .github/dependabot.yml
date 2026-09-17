@@ -1,0 +1,26 @@
+# Weekly update pull requests for everything the build pulls in: the pinned
+# workflow actions, the agent's Go modules, the app's npm packages and the
+# base images of the controller and the simulation.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: gomod
+    directory: /agent
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directories:
+      - /
+      - /sim
+    schedule:
+      interval: weekly
