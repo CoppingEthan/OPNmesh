@@ -1,10 +1,10 @@
 import { z } from "zod";
 import { json, parseBody, withAdmin } from "@/server/http";
-import { createSite, listSites } from "@/server/sites";
+import { createSite, listSites, publicSite } from "@/server/sites";
 
 export const dynamic = "force-dynamic";
 
-export const GET = withAdmin(async () => json(listSites()));
+export const GET = withAdmin(async () => json(listSites().map(publicSite)));
 
 export const siteSchema = z.object({
   name: z.string().min(1).max(80),
@@ -19,5 +19,5 @@ export const siteSchema = z.object({
 
 export const POST = withAdmin(async (req, { admin }) => {
   const body = await parseBody(req, siteSchema);
-  return json(createSite(body, admin.email), 201);
+  return json(publicSite(createSite(body, admin.email)), 201);
 });

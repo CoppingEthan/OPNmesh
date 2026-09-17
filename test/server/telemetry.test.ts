@@ -145,12 +145,18 @@ describe("site series and live series", () => {
     ingestTelemetry(gwDc, report({ peers: [{ publicKey: officeKey, endpoint: null, latestHandshake: 0, rxBytes: 5000, txBytes: 10_000, rttMs: null }] }));
     const ls = liveSeries();
     ls.clearForTests();
-    for (let i = 0; i < 130; i++) ls.sample(now + i * 1000);
+    // The last sample is taken as the report arrives, so the report is current.
+    for (let i = 0; i < 130; i++) ls.sample(now - (129 - i) * 1000);
     const p = ls.payload();
     expect(p.ts).toHaveLength(120);
     expect(p.sites[dc.id]!.in[119]).toBe(1000);
     expect(p.sites[dc.id]!.out[119]).toBe(2000);
     expect(p.sites[office.id]!.in[119]).toBe(0);
+    // Three intervals later the report no longer describes the present.
+    ls.sample(now + 15_000);
+    expect(ls.payload().sites[dc.id]!.in[119]).toBe(1000);
+    ls.sample(now + 15_001);
+    expect(ls.payload().sites[dc.id]!.in[119]).toBe(0);
   });
 });
 

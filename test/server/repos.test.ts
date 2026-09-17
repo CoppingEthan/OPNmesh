@@ -183,9 +183,10 @@ describe("audit log", () => {
 
 describe("housekeeping", () => {
   it("prunes expired unused enrolment tokens at once and used ones after a week", () => {
+    // One token per site: a site keeps only its newest unused token.
+    createEnrolToken(createSite({ name: "Old" }).id, { ttlMs: -1 }); // already expired, never used
+    createEnrolToken(createSite({ name: "Live" }).id); // live
     const site = createSite({ name: "DC" });
-    createEnrolToken(site.id, { ttlMs: -1 }); // already expired, never used
-    createEnrolToken(site.id); // live
     const used = createEnrolToken(site.id);
     const r = enrolGateway({ token: used.token, publicKey: KEY(), hostname: "gw", os: "", arch: "", addresses: ["10.0.250.2"], agentVersion: "" });
     expect(r.ok).toBe(true);

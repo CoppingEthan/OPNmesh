@@ -9,7 +9,8 @@ export const dynamic = "force-dynamic";
  * Periodic report from a gateway. The response carries the hash of the
  * configuration the gateway should be running, so a change is fetched on the
  * very next tick without a second polling loop, plus any action the admin has
- * asked for (currently: run the health checks).
+ * asked for (currently: run the health checks). A report sent sooner than the
+ * gateway was asked gets the same answer but is not stored (see ingestTelemetry).
  */
 export const POST = withGateway(async (req, { gateway }) => {
   const report = await parseBody(req, telemetrySchema);

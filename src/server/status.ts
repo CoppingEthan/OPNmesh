@@ -7,9 +7,17 @@ import { pairCounterName, clientCounterNames } from "@/core/generate/nftables";
 import { connectivityMatrix, meshSites, type MeshSite } from "@/core/topology";
 import type { Snapshot } from "@/core/model";
 import type { Bundle } from "@/core/generate";
-import type { LiveGateway, LiveState } from "./live";
+import { HANDSHAKE_SKEW_MS, type LiveGateway, type LiveReader } from "./live";
 
 export type GatewayHealth = "online" | "stale" | "offline" | "pending" | "disabled" | "never";
+
+/** A gateway is online while its last report is at most this many intervals old. */
+const ONLINE_INTERVALS = 3;
+
+/** Reports older than this describe the past: views of current traffic ignore them. */
+export function liveMaxAgeMs(intervalS: number): number {
+  return intervalS * ONLINE_INTERVALS * 1000;
+}
 
 export interface GatewayView {
   gatewayId: string;
@@ -23,6 +31,8 @@ export interface GatewayView {
   appliedHash: string;
   desiredHash: string;
   configCurrent: boolean;
+  /** Why configuration changes are not being handed to this gateway, if they are not. */
+  held: string | null;
   lastError: string;
   load1: number | null;
   memUsedPct: number | null;
@@ -35,18 +45,19 @@ export function gatewayHealth(row: GatewayRow, live: LiveGateway | undefined, no
   const seen = live?.at ?? row.lastSeenAt;
   if (!seen) return "never";
   const age = (now - seen) / 1000;
-  if (age <= intervalS * 3) return "online";
+  if (age <= intervalS * ONLINE_INTERVALS) return "online";
   if (age <= intervalS * 12) return "stale";
   return "offline";
 }
 
-export function gatewayView(row: GatewayRow, siteSlug: string, live: LiveGateway | undefined, desiredHash: string, now: number, intervalS: number): GatewayView {
+export function gatewayView(row: GatewayRow, siteSlug: string, live: LiveGateway | undefined, desiredHash: string, now: number, intervalS: number, held: string | null = null): GatewayView {
   const health = gatewayHealth(row, live, now, intervalS);
   const applied = live?.report.appliedHash ?? row.appliedHash;
   const lastError = live?.report.lastError ?? row.lastError;
   let attention: string | null = null;
   if (health === "online" || health === "stale") {
-    if (lastError) attention = lastError;
+    if (held) attention = `configuration changes are on hold until this is fixed: ${held}`;
+    else if (lastError) attention = lastError;
     else if (desiredHash && applied !== desiredHash) attention = "configuration change not yet applied";
     else if (live && !live.report.interfaceUp) attention = "tunnel interface is down";
   }
@@ -61,6 +72,7 @@ export function gatewayView(row: GatewayRow, siteSlug: string, live: LiveGateway
     appliedHash: applied,
     desiredHash,
     configCurrent: applied === desiredHash,
+    held,
     lastError,
     load1: live?.report.host.load1 ?? null,
     memUsedPct: live?.report.host.memUsedPct ?? null,
@@ -88,8 +100,11 @@ function peerFrom(live: LiveGateway | undefined, publicKey: string) {
   return live?.report.peers.find((p) => p.publicKey === publicKey);
 }
 
-/** One entry per mesh pair. Direct pairs carry live tunnel numbers. */
-export function tunnelViews(snap: Snapshot, live: LiveState, now: number): TunnelView[] {
+/**
+ * One entry per mesh pair. Direct pairs carry live tunnel numbers. Pass
+ * `live.recent(...)` so a silent gateway's last numbers are not shown as current.
+ */
+export function tunnelViews(snap: Snapshot, live: LiveReader, now: number): TunnelView[] {
   const sites = meshSites(snap);
   const byId = new Map(sites.map((s) => [s.id, s]));
   return connectivityMatrix(snap).map((e) => {
@@ -141,9 +156,11 @@ export interface ClientView {
   rxBps: number;
   txBps: number;
   endpoint: string | null;
+  /** Why this client's configuration cannot be handed out right now, if it cannot. */
+  held: string | null;
 }
 
-export function clientViews(clientsRows: ClientRow[], snap: Snapshot, live: LiveState, now: number): ClientView[] {
+export function clientViews(clientsRows: ClientRow[], snap: Snapshot, live: LiveReader, now: number, held: Record<string, string> = {}): ClientView[] {
   const sites = meshSites(snap);
   return clientsRows.map((c) => {
     let best: { site: MeshSite; hs: number; rx: number; tx: number; endpoint: string | null } | null = null;
@@ -156,7 +173,9 @@ export function clientViews(clientsRows: ClientRow[], snap: Snapshot, live: Live
         best = { site: s, hs: p.latestHandshake, rx: r?.rxBps ?? 0, tx: r?.txBps ?? 0, endpoint: p.endpoint };
       }
     }
-    const lastHs = best && best.hs > 0 ? best.hs * 1000 : c.lastHandshakeAt;
+    // Ingest refuses future handshakes; a value stored before it did is ignored here.
+    const stored = c.lastHandshakeAt !== null && c.lastHandshakeAt <= now + HANDSHAKE_SKEW_MS ? c.lastHandshakeAt : null;
+    const lastHs = best && best.hs > 0 ? best.hs * 1000 : stored;
     return {
       id: c.id,
       name: c.name,
@@ -170,6 +189,7 @@ export function clientViews(clientsRows: ClientRow[], snap: Snapshot, live: Live
       rxBps: best?.tx ?? 0,
       txBps: best?.rx ?? 0,
       endpoint: best?.endpoint ?? null,
+      held: held[c.id] ?? null,
     };
   });
 }
@@ -183,21 +203,23 @@ export interface PairRateView {
 /**
  * Site-to-site routed traffic from nftables counters. Each ordered pair is
  * counted on both endpoint gateways (and on a relaying hub); the maximum is
- * taken so a missing report from one side does not zero the figure.
+ * taken so a missing report from one side does not zero the figure. Only
+ * this mesh's gateways count, and ingest has already kept each to the
+ * counters its own ruleset defines, so no gateway can inflate another pair.
  */
-export function pairRateViews(snap: Snapshot, live: LiveState): PairRateView[] {
+export function pairRateViews(snap: Snapshot, live: LiveReader): PairRateView[] {
   const sites = meshSites(snap);
-  const out = new Map<string, PairRateView>();
+  const best = new Map<string, number>();
+  for (const s of sites) {
+    for (const [name, bps] of live.get(s.gateway.id)?.counterRates ?? []) best.set(name, Math.max(best.get(name) ?? 0, bps));
+  }
+  const out: PairRateView[] = [];
   for (const from of sites) {
     for (const to of sites) {
-      if (from.id === to.id) continue;
-      const name = pairCounterName(from, to);
-      let bps = 0;
-      for (const l of live.all()) bps = Math.max(bps, l.counterRates.get(name) ?? 0);
-      out.set(`${from.id}|${to.id}`, { fromSiteId: from.id, toSiteId: to.id, bps });
+      if (from.id !== to.id) out.push({ fromSiteId: from.id, toSiteId: to.id, bps: best.get(pairCounterName(from, to)) ?? 0 });
     }
   }
-  return [...out.values()];
+  return out;
 }
 
 export interface ClientSiteRateView {
@@ -206,7 +228,7 @@ export interface ClientSiteRateView {
   fromSite: number;
 }
 
-export function clientSiteRates(snap: Snapshot, live: LiveState): ClientSiteRateView[] {
+export function clientSiteRates(snap: Snapshot, live: LiveReader): ClientSiteRateView[] {
   return meshSites(snap).map((s) => {
     const names = clientCounterNames(s);
     const l = live.get(s.gateway.id);

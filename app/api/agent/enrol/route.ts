@@ -21,14 +21,16 @@ export const POST = withPublic(async (req) => {
   const body = await parseBody(req, schema);
   const r = enrolGateway(body);
   if (!r.ok) {
-    const messages = {
-      "invalid-token": "enrolment token is not valid",
-      expired: "enrolment token has expired — issue a new one in the UI",
-      used: "enrolment token has already been used",
-      "bad-key": "public key is malformed",
-      "no-address": "no usable IPv4 address was reported",
-    } as const;
-    return json({ error: messages[r.reason], reason: r.reason }, r.reason === "bad-key" || r.reason === "no-address" ? 400 : 403);
+    const answers = {
+      "invalid-token": ["enrolment token is not valid", 403],
+      expired: ["enrolment token has expired — issue a new one in the UI", 403],
+      used: ["enrolment token has already been used", 403],
+      "bad-key": ["public key is malformed", 400],
+      "duplicate-key": ["this public key already belongs to another gateway or client — remove that gateway, or delete /etc/opnmesh/private.key here so a new key is made", 409],
+      "no-address": ["no usable IPv4 address was reported (loopback, link-local, multicast and reserved addresses do not count)", 400],
+    } as const satisfies Record<typeof r.reason, readonly [string, number]>;
+    const [error, status] = answers[r.reason];
+    return json({ error, reason: r.reason }, status);
   }
   return json({ gatewayId: r.gatewayId, gatewayToken: r.gatewayToken, status: r.status, siteName: r.siteName }, 201);
 });

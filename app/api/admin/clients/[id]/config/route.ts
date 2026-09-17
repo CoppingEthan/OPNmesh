@@ -1,6 +1,6 @@
 import { json, text, withAdmin } from "@/server/http";
 import { getClient } from "@/server/clients";
-import { renderClientConf } from "@/server/snapshot";
+import { clientConfHeld, renderClientConf } from "@/server/snapshot";
 
 export const dynamic = "force-dynamic";
 
@@ -8,6 +8,8 @@ export const dynamic = "force-dynamic";
 export const GET = withAdmin<{ id: string }>(async (req, { params }) => {
   const c = getClient(params.id);
   if (!c) return json({ error: "client not found" }, 404);
+  const held = clientConfHeld(params.id);
+  if (held) return json({ error: `configuration on hold until this is fixed: ${held}` }, 409);
   const conf = renderClientConf(params.id);
   if (!conf) return json({ error: c.enabled ? "no reachable site yet — add an endpoint to a gateway first" : "client is disabled" }, 409);
   const download = new URL(req.url).searchParams.get("download") === "1";
