@@ -29,7 +29,7 @@ set -eu
 # that do not change under it when main moves on. The image is pinned in
 # .env too: to upgrade, set the new version in OPNMESH_IMAGE there, then
 # docker compose pull && docker compose up -d.
-VERSION="${OPNMESH_VERSION:-2.1.0}"
+VERSION="${OPNMESH_VERSION:-2.1.1}"
 DIR=/opt/opnmesh
 DOMAIN="${OPNMESH_DOMAIN:-}"
 URL="${OPNMESH_PUBLIC_URL:-}"
