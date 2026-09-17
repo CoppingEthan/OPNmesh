@@ -22,7 +22,7 @@ RUN set -e; \
     cd /out && for f in opnmesh-gw-linux-*; do sha256sum "$f" > "$f.sha256"; done
 
 # --- web app -----------------------------------------------------------------
-FROM node:22-bookworm AS build
+FROM node:26-bookworm AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
@@ -32,7 +32,7 @@ ENV OPNMESH_STANDALONE=1 NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
 # --- runtime -----------------------------------------------------------------
-FROM node:22-bookworm-slim
+FROM node:26-bookworm-slim
 ARG VERSION
 LABEL org.opencontainers.image.title="OPNmesh" \
       org.opencontainers.image.description="WireGuard site-to-site mesh controller" \
