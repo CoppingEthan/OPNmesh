@@ -5,7 +5,11 @@ import nextVitals from "eslint-config-next/core-web-vitals";
 import nextTs from "eslint-config-next/typescript";
 
 export default defineConfig([
-  globalIgnores([".next/**", "out/**", "coverage/**", "node_modules/**", "agent/**", "sim/state/**", "public/**", "branding/**", "screenshots/**", "next-env.d.ts"]),
+  globalIgnores([
+    ".next/**", "out/**", "coverage/**", "node_modules/**", "agent/**", "sim/state/**", "public/**", "branding/**", "screenshots/**", "next-env.d.ts",
+    // Git worktrees that coding tools create inside the checkout.
+    ".kilo/**", ".claude/**",
+  ]),
   ...nextVitals,
   ...nextTs,
   {

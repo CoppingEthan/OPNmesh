@@ -812,8 +812,10 @@ with `OPNMESH_INSECURE_HTTP=1`, which exists for the simulation.
 One local admin account created on first run (a setup code is printed to the
 container log). Passwords are argon2id; sessions are server-side, hashed, with
 idle and absolute timeouts; login failures are throttled per source and
-globally; `X-Forwarded-For` is trusted only from Caddy. TOTP is planned for
-2.1. Security headers and same-site cookies throughout.
+globally. The client address comes from `X-Forwarded-For` only when
+`OPNMESH_TRUST_PROXY` says how many reverse proxies are in front, and is
+counted from the right of that header, so an address a client adds itself
+is never used. TOTP is planned for 2.1. Security headers and same-site cookies throughout.
 
 ### 12.4 Secrets at rest
 

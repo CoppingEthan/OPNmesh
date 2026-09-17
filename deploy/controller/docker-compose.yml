@@ -21,6 +21,7 @@ services:
     environment:
       OPNMESH_DATA_DIR: /data
       OPNMESH_PUBLIC_URL: ${OPNMESH_PUBLIC_URL:?set OPNMESH_PUBLIC_URL in .env}
+      # One reverse proxy (Caddy) in front: see OPNMESH_TRUST_PROXY in .env.example.
       OPNMESH_TRUST_PROXY: "1"
       # Caddy's private CA root, when Caddy issues the certificates. Served at
       # /ca.crt for gateway installers; its fingerprint goes into install commands.

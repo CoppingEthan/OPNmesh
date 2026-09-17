@@ -215,11 +215,24 @@ export function sessionCookie(token: string | null): string {
   return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(SESSION_ABSOLUTE_MS / 1000)}${secure}`;
 }
 
-/** Best-effort client identity for throttling. Only trusts proxies when told to. */
+/**
+ * Best-effort client identity for throttling and the audit log. With
+ * OPNMESH_TRUST_PROXY=N (N reverse proxies in front), the client is the Nth
+ * X-Forwarded-For address counted from the right: each proxy adds the address
+ * it received the request from, and everything further left came from the
+ * client and can be forged. A proxy that adds its own header line rather than
+ * appending is handled the same way, because repeated headers are joined in
+ * order. Without a configured proxy the header is ignored.
+ */
 export function requestSource(req: Request): string {
-  if (env().trustProxy) {
-    const xff = req.headers.get("x-forwarded-for");
-    if (xff) return xff.split(",")[0]!.trim();
+  const hops = env().trustProxy;
+  if (hops > 0) {
+    const chain = (req.headers.get("x-forwarded-for") ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const client = chain[Math.max(0, chain.length - hops)];
+    if (client) return client;
   }
   return "direct";
 }

@@ -10,7 +10,7 @@ export function freshDb(): Db {
   process.env["OPNMESH_DATA_DIR"] = process.env["OPNMESH_DATA_DIR"] ?? "./.test-data";
   const db = openDatabase(":memory:");
   installDatabaseForTests(db, `:memory:${Math.random()}`);
-  setEnvForTests({ secret: "test-secret-" + Math.random(), publicUrl: "http://controller.test", insecureHttp: true, trustProxy: false });
+  setEnvForTests({ secret: "test-secret-" + Math.random(), publicUrl: "http://controller.test", insecureHttp: true, trustProxy: 0 });
   invalidateGenerated();
   liveState().clearForTests();
   resetThrottleForTests();

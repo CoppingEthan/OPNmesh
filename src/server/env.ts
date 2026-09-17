@@ -13,7 +13,8 @@ export interface Env {
   publicUrl: string;
   secret: string;
   insecureHttp: boolean;
-  trustProxy: boolean;
+  /** How many reverse proxies sit in front of the controller (0 = none, trust no forwarding headers). */
+  trustProxy: number;
 }
 
 const g = globalThis as unknown as { __opnmeshEnv?: Env };
@@ -36,9 +37,15 @@ export function env(): Env {
     publicUrl: (process.env["OPNMESH_PUBLIC_URL"] ?? "http://localhost:3000").replace(/\/+$/, ""),
     secret,
     insecureHttp: process.env["OPNMESH_INSECURE_HTTP"] === "1",
-    trustProxy: process.env["OPNMESH_TRUST_PROXY"] === "1",
+    trustProxy: proxyHops(process.env["OPNMESH_TRUST_PROXY"]),
   };
   return g.__opnmeshEnv;
+}
+
+/** OPNMESH_TRUST_PROXY: a count of proxies; anything that is not a small whole number means none. */
+export function proxyHops(value: string | undefined): number {
+  const n = Number((value ?? "").trim());
+  return Number.isInteger(n) && n >= 0 && n <= 10 ? n : 0;
 }
 
 /** Tests: override the cached environment. */
