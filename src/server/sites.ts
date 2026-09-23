@@ -288,6 +288,20 @@ function isUniqueViolation(e: unknown, column: string): boolean {
 }
 
 /**
+ * The addresses a gateway says it holds, as they are stored and shown, at
+ * enrolment and from every report alike: only ones a host can hold, without
+ * the prefix length telemetry sends, at most 16, and never the gateway's
+ * tunnel address, which its WireGuard interface holds once configured and
+ * which is shown on its own.
+ */
+export function hostAddresses(reported: string[], tunnelIp?: string): string[] {
+  return reported
+    .map((a) => a.split("/", 1)[0]!)
+    .filter((ip) => isUsableHostIp(ip) && ip !== tunnelIp)
+    .slice(0, 16);
+}
+
+/**
  * Consume a token and create (or replace) the site's gateway. The private key
  * never leaves the gateway; only the public key arrives here. When the site
  * already has a gateway (a rebuilt VM), its addressing and endpoint settings
@@ -312,7 +326,7 @@ export function enrolGateway(req: EnrolRequest): EnrolResult {
   if (keyClient || (keyGateway && keyGateway.id !== previous?.id)) return { ok: false, reason: "duplicate-key" };
 
   // The first address becomes the router's next hop, so it must be one a host can hold.
-  const addresses = req.addresses.filter(isUsableHostIp).slice(0, 16);
+  const addresses = hostAddresses(req.addresses, previous?.tunnelIp);
   const lanIp = previous?.lanIp ?? addresses[0];
   if (!lanIp) return { ok: false, reason: "no-address" };
 
@@ -443,10 +457,10 @@ export function removeGateway(siteId: string, actor = "admin"): void {
   logEvent("gateway", `Gateway removed from "${site.name}"`, { actor, subject: siteId });
 }
 
-/** Called on every telemetry report. Cheap: one indexed update. */
+/** Called on every telemetry report. Cheap: one indexed update. Addresses are passed only when they changed. */
 export function recordGatewayReport(
   gatewayId: string,
-  r: { agentVersion: string; appliedHash: string; diskHash: string; lastError: string },
+  r: { agentVersion: string; appliedHash: string; diskHash: string; lastError: string; addresses?: string[] },
 ): void {
   getDb()
     .update(gateways)
@@ -456,6 +470,7 @@ export function recordGatewayReport(
       appliedHash: r.appliedHash.slice(0, 64),
       diskHash: r.diskHash.slice(0, 64),
       lastError: r.lastError.slice(0, 500),
+      ...(r.addresses ? { addresses: r.addresses } : {}),
     })
     .where(eq(gateways.id, gatewayId))
     .run();

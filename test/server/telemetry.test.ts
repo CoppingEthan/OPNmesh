@@ -2,13 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { freshDb } from "./helpers";
 import { addLan, createEnrolToken, createSite, enrolGateway, getSite, updateGateway } from "@/server/sites";
 import { createClient, getClient } from "@/server/clients";
-import { ingestTelemetry, pairSeries, peerSeries, runRollups, siteSeries } from "@/server/telemetry";
+import { ADDRESS_LOG_GAP_MS, ingestTelemetry, pairSeries, peerSeries, runRollups, siteSeries } from "@/server/telemetry";
 import { liveState, telemetrySchema, type TelemetryReport } from "@/server/live";
 import { liveSeries } from "@/server/live-series";
 import { getGenerated } from "@/server/snapshot";
 import { clientViews, gatewayView, pairRateViews, tunnelViews } from "@/server/status";
 import { getDb } from "@/db";
-import { telemetry1m, telemetry5s } from "@/db/schema";
+import { events, telemetry1m, telemetry5s } from "@/db/schema";
 import { generateKeyPair } from "@/core/crypto";
 
 let now = 1_800_000_000_000;
@@ -111,6 +111,66 @@ describe("ingest", () => {
     expect(telemetrySchema.safeParse({ peers: [{ publicKey: "short", rxBytes: 1, txBytes: 1 }] }).success).toBe(false);
     expect(telemetrySchema.safeParse({ peers: [{ publicKey: "x".repeat(44), rxBytes: -1, txBytes: 1 }] }).success).toBe(false);
     expect(telemetrySchema.safeParse({}).success).toBe(true);
+  });
+});
+
+describe("gateway addresses", () => {
+  const gw = (siteId: string) => getSite(siteId)!.gateway!;
+  /** A report as the agent sends it: every interface's address with its prefix length. */
+  const hostReport = (addresses?: string[]) => telemetrySchema.parse({ version: "2.0.0", ...(addresses ? { host: { addresses } } : {}) });
+  /** How many updates have written the column; SQLite fires the trigger even when the value is unchanged. */
+  const countWrites = () => {
+    getDb().$client.exec("CREATE TABLE address_writes (n INTEGER); CREATE TRIGGER count_address_writes AFTER UPDATE OF addresses ON gateways BEGIN INSERT INTO address_writes VALUES (1); END;");
+    return () => (getDb().$client.prepare("SELECT COUNT(*) AS n FROM address_writes").get() as { n: number }).n;
+  };
+  const addressEvents = () => getDb().select().from(events).all().filter((e) => e.kind === "gateway" && e.message.includes(" now holds "));
+
+  it("follow a re-addressed gateway, written only when they change", () => {
+    const { dc } = setup();
+    const { tunnelIp } = gw(dc.id);
+    const writes = countWrites();
+    const send = (addresses?: string[]) => {
+      ingestTelemetry(gw(dc.id), hostReport(addresses));
+      tick(5000);
+    };
+
+    // What it enrolled with, as the agent reports it once WireGuard is up: the tunnel address is shown on its own.
+    send(["10.0.250.2/29", `${tunnelIp}/24`]);
+    expect(gw(dc.id).addresses).toEqual(["10.0.250.2"]);
+    expect(writes()).toBe(0);
+
+    // Moved onto another network: filtered as enrolment filters.
+    send(["10.20.0.5/24", "127.0.0.1/8", "169.254.3.4/16", `${tunnelIp}/24`]);
+    expect(gw(dc.id).addresses).toEqual(["10.20.0.5"]);
+    expect(writes()).toBe(1);
+    for (let i = 0; i < 10; i++) send(["10.20.0.5/24", `${tunnelIp}/24`]);
+    expect(writes()).toBe(1);
+
+    // A report with nothing usable, or no host facts at all, does not wipe the list.
+    send([]);
+    send(["127.0.0.1/8", `${tunnelIp}/24`]);
+    send();
+    expect(gw(dc.id).addresses).toEqual(["10.20.0.5"]);
+    expect(writes()).toBe(1);
+
+    const many = Array.from({ length: 20 }, (_, i) => `10.20.${i}.5/24`);
+    send(many);
+    expect(gw(dc.id).addresses).toEqual(many.slice(0, 16).map((a) => a.split("/")[0]));
+  });
+
+  it("log a change to the audit log, at most once per few minutes", () => {
+    const { dc } = setup();
+    ingestTelemetry(gw(dc.id), hostReport(["10.20.0.5/24"]));
+    expect(addressEvents().map((e) => [e.message, e.actor, e.subject])).toEqual([['Gateway "DC gateway" now holds 10.20.0.5 (was 10.0.250.2)', "gateway", dc.id]]);
+    expect(JSON.parse(addressEvents()[0]!.detail!)).toEqual({ before: ["10.0.250.2"], after: ["10.20.0.5"] });
+    // A gateway whose addresses flap on every report for ten minutes.
+    for (let i = 1; i < 120; i++) {
+      tick(5000);
+      ingestTelemetry(gw(dc.id), hostReport([i % 2 ? "10.20.0.6/24" : "10.20.0.5/24"]));
+    }
+    expect(addressEvents().map((e) => e.ts)).toEqual([1_800_000_000_000, 1_800_000_000_000 + ADDRESS_LOG_GAP_MS]);
+    // The gateway row always has the latest.
+    expect(gw(dc.id).addresses).toEqual(["10.20.0.6"]);
   });
 });
 

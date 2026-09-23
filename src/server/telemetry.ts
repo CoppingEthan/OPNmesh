@@ -2,8 +2,9 @@
  * Telemetry ingest and time-series storage.
  *
  * Every stored report updates live state (rates), the gateway row (last
- * seen, applied hash, errors) and, when rates were computable, appends
- * 5-second samples. A scheduled rollup averages 5 s → 1 min → 1 h and prunes.
+ * seen, applied hash, errors, and the addresses when they change) and, when
+ * rates were computable, appends 5-second samples. A scheduled rollup
+ * averages 5 s → 1 min → 1 h and prunes.
  *
  * A gateway token is only trusted for the gateway's own view: a report keeps
  * only the peers and counters that gateway's generated config defines, at
@@ -17,7 +18,7 @@ import type { GatewayRow } from "@/db/schema";
 import { logEvent } from "./events";
 import { HANDSHAKE_SKEW_MS, liveState, type CounterReport, type PeerReport, type TelemetryReport } from "./live";
 import { recordClientHandshake } from "./clients";
-import { recordGatewayReport } from "./sites";
+import { hostAddresses, recordGatewayReport } from "./sites";
 import { getGenerated, type Reportable } from "./snapshot";
 import { getSettings } from "./settings";
 import { now } from "./env";
@@ -29,6 +30,9 @@ export interface IngestOutcome {
 
 /** A gateway failing the same way on every report gets one audit event per this long. */
 export const APPLY_ERROR_LOG_GAP_MS = 5 * 60_000;
+
+/** A gateway whose addresses keep changing gets one audit event per this long; its row always has the latest. */
+export const ADDRESS_LOG_GAP_MS = 5 * 60_000;
 
 /** Control and bidi-override characters, which could forge lines or reorder text in the UI and log. */
 const UNPRINTABLE_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]+/g;
@@ -71,9 +75,26 @@ export function ingestTelemetry(gw: GatewayRow, raw: TelemetryReport): IngestOut
   const report = ownReport(raw, gen.reportable[gw.id], t);
   const { live, hasRates } = state.ingest(gw.id, gw.siteId, report, t);
 
-  recordGatewayReport(gw.id, { agentVersion: report.version, appliedHash: report.appliedHash, diskHash: report.diskHash, lastError: report.lastError });
-  if (report.lastError && report.lastError !== gw.lastError && state.errorLogDue(gw.id, t, APPLY_ERROR_LOG_GAP_MS)) {
+  // A re-addressed gateway shows its new addresses. A report with none keeps
+  // the last list, and an unchanged one is not written again.
+  const addresses = hostAddresses(report.host.addresses, gw.tunnelIp);
+  const readdressed = addresses.length > 0 && addresses.join(",") !== gw.addresses.join(",");
+  recordGatewayReport(gw.id, {
+    agentVersion: report.version,
+    appliedHash: report.appliedHash,
+    diskHash: report.diskHash,
+    lastError: report.lastError,
+    ...(readdressed ? { addresses } : {}),
+  });
+  if (report.lastError && report.lastError !== gw.lastError && state.logDue(gw.id, "apply-error", t, APPLY_ERROR_LOG_GAP_MS)) {
     logEvent("apply-error", `Gateway ${gw.name} failed to apply configuration: ${report.lastError.slice(0, 300)}`, { actor: "gateway", subject: gw.siteId });
+  }
+  if (readdressed && state.logDue(gw.id, "addresses", t, ADDRESS_LOG_GAP_MS)) {
+    logEvent("gateway", `Gateway "${gw.name}" now holds ${addresses.join(", ")} (was ${gw.addresses.join(", ") || "none"})`, {
+      actor: "gateway",
+      subject: gw.siteId,
+      detail: { before: gw.addresses, after: addresses },
+    });
   }
 
   const clientKeys = new Set(gen.snapshot.clients.map((c) => c.publicKey));

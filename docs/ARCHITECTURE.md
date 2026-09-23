@@ -713,6 +713,12 @@ which is a stronger signal than a recent handshake.
   differs from desired.
 - **Status** per tunnel: `up` (handshake < 3 min and RTT answered), `handshake
   only`, `down`.
+- **Addresses seen** per gateway: the host addresses it reports (prefix length
+  dropped, the tunnel address left out, at most 16), filtered as at enrolment.
+  They are written when they change, with an audit event at most every five
+  minutes; a report with no usable address keeps the last list. The
+  gateway's address on the site network is the router's next hop and changes
+  only when an admin edits it.
 - **Client presence**: last handshake seen by any gateway.
 
 Samples are written to `telemetry_5s`; a scheduled job rolls up to 1-minute and

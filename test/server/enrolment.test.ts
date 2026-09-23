@@ -108,6 +108,15 @@ describe("the reported LAN address", () => {
     expect(() => updateGateway(s.id, { lanIp: "127.0.0.1" })).toThrow(SiteError);
     expect(updateGateway(s.id, { lanIp: "192.168.5.3" }).lanIp).toBe("192.168.5.3");
   });
+
+  it("leaves out the tunnel address a re-enrolled VM's WireGuard interface still holds", () => {
+    const s = site("Rebuilt");
+    expect(enrolGateway(request(createEnrolToken(s.id).token, { addresses: ["10.0.1.2"] })).ok).toBe(true);
+    const { tunnelIp } = getSite(s.id)!.gateway!;
+    expect(enrolGateway(request(createEnrolToken(s.id).token, { addresses: ["10.0.1.2", tunnelIp] })).ok).toBe(true);
+    expect(getSite(s.id)!.gateway!.tunnelIp).toBe(tunnelIp);
+    expect(getSite(s.id)!.gateway!.addresses).toEqual(["10.0.1.2"]);
+  });
 });
 
 describe("enrolment tokens", () => {

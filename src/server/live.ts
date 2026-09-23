@@ -89,12 +89,15 @@ export const FAST_MODE_GRACE_MS = 20_000;
  */
 export const REPORT_BURST = 3;
 
+/** Audit events a gateway's reports can cause, each limited on its own. */
+export type ReportEvent = "apply-error" | "addresses";
+
 interface Gate {
   /** Reports that may still be stored now (a token bucket). */
   tokens: number;
   at: number;
-  /** When an apply error was last written to the audit log. */
-  errorLoggedAt: number | null;
+  /** When each kind of event was last written to the audit log. */
+  loggedAt: Partial<Record<ReportEvent, number>>;
 }
 
 export class LiveState {
@@ -167,7 +170,7 @@ export class LiveState {
    * one gateway token can make the controller write.
    */
   admitReport(gatewayId: string, at: number, minGapMs: number): boolean {
-    const gate = this.gates.get(gatewayId) ?? { tokens: REPORT_BURST, at, errorLoggedAt: null };
+    const gate = this.gates.get(gatewayId) ?? { tokens: REPORT_BURST, at, loggedAt: {} };
     // A clock that stepped backwards earns nothing, and counting resumes from the new time.
     gate.tokens = Math.min(REPORT_BURST, gate.tokens + Math.max(0, at - gate.at) / Math.max(1, minGapMs));
     gate.at = at;
@@ -177,12 +180,13 @@ export class LiveState {
     return true;
   }
 
-  /** Whether an apply error may go to the audit log now; if so, the time is noted. */
-  errorLogDue(gatewayId: string, at: number, minGapMs: number): boolean {
-    const gate = this.gates.get(gatewayId) ?? { tokens: REPORT_BURST, at, errorLoggedAt: null };
+  /** Whether an event of this kind may go to the audit log now; if so, the time is noted. */
+  logDue(gatewayId: string, kind: ReportEvent, at: number, minGapMs: number): boolean {
+    const gate = this.gates.get(gatewayId) ?? { tokens: REPORT_BURST, at, loggedAt: {} };
     this.gates.set(gatewayId, gate);
-    if (gate.errorLoggedAt !== null && at - gate.errorLoggedAt < minGapMs && at >= gate.errorLoggedAt) return false;
-    gate.errorLoggedAt = at;
+    const last = gate.loggedAt[kind];
+    if (last !== undefined && at - last < minGapMs && at >= last) return false;
+    gate.loggedAt[kind] = at;
     return true;
   }
 
