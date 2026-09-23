@@ -78,6 +78,13 @@ redirects, and UniFi's zone firewall can decide which local VLANs may talk to
 which remote subnets in the normal way. This is the layout the UniFi
 automation configures by default and the one the simulation tests as "site A".
 
+**Sharing the transit network** is supported. Add it to the site's networks
+as *Shared* and the other sites route it into the mesh, so they can reach the
+gateway VM directly (SSH for management, say). Keep it to the router and the
+gateway: an ordinary host on it would get the asymmetric paths of §1. OPNmesh
+treats a shared network of /29 or smaller around a transit-layout gateway as
+a dedicated transit network, and warns when the gateway sits in a larger one.
+
 ## 3. What to type into UniFi (by hand)
 
 OPNmesh prints these values on each site's *Router setup* page with your real

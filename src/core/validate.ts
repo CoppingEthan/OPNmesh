@@ -106,6 +106,19 @@ function union(...scopes: Scope[]): Scope {
   return { sites: [...new Set(scopes.flatMap((s) => s.sites))], clients: [...new Set(scopes.flatMap((s) => s.clients))] };
 }
 
+/**
+ * A network this small (/29 or longer: six usable addresses at most) is a
+ * dedicated transit network, the size docs/ROUTERS.md recommends: room for
+ * the router and the gateway, not for ordinary hosts. Sharing one is safe
+ * and lets other sites reach the gateway itself; a larger shared network
+ * around a transit-layout gateway is where hosts get asymmetric paths.
+ */
+const TRANSIT_PREFIX = 29;
+
+function isTransitSized(cidr: string): boolean {
+  return (parseCidr(cidr)?.prefix ?? 0) >= TRANSIT_PREFIX;
+}
+
 export function validateAddressing(snap: Snapshot): Finding[] {
   const out: Finding[] = [];
   const { gatewayCidr, clientCidr } = snap.settings;
@@ -163,8 +176,15 @@ export function validateAddressing(snap: Snapshot): Finding[] {
       if (s.routerLayout === "same_lan" && !s.lans.some((l) => cidrContainsIp(l.cidr, s.gateway!.lanIp))) {
         out.push(warn("lan-ip", `${s.name}: the gateway address ${s.gateway.lanIp} is not inside any of the site's networks, but the layout is "same LAN"`, subj));
       }
-      if (s.routerLayout === "transit" && s.lans.some((l) => l.shared && cidrContainsIp(l.cidr, s.gateway!.lanIp))) {
-        out.push(warn("lan-ip", `${s.name}: the gateway address ${s.gateway.lanIp} sits inside a shared LAN, but the layout is "transit network"`, subj));
+      const hostLan = s.routerLayout === "transit" ? s.lans.find((l) => l.shared && cidrContainsIp(l.cidr, s.gateway!.lanIp) && !isTransitSized(l.cidr)) : undefined;
+      if (hostLan) {
+        out.push(
+          warn(
+            "lan-ip",
+            `${s.name}: the gateway address ${s.gateway.lanIp} sits inside the shared network ${hostLan.cidr}, but the layout is "transit network" — hosts on ${hostLan.cidr} would reach other sites through the router but get replies straight from the gateway, so the router sees half of each connection and TCP can hang. Put the gateway on a dedicated transit network (a /${TRANSIT_PREFIX} holding only the router and the gateway), or use the "same LAN" layout`,
+            subj,
+          ),
+        );
       }
       if (!WG_KEY_RE.test(s.gateway.publicKey)) out.push(err("bad-key", `${s.name}: gateway public key is malformed`, subj, siteScope(s.id)));
       const port = listenPortOf(snap, s as never);

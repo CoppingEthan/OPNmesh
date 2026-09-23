@@ -318,7 +318,10 @@ the UniFi automation follow the choice.
 
 Give the gateway VM its own small VLAN/network — e.g. `192.168.250.0/29`, VM at
 `.2`, router at `.1` — with no other hosts on it. Router static routes for each
-remote subnet point at `192.168.250.2`.
+remote subnet point at `192.168.250.2`. The transit network may itself be
+shared, so other sites can reach the gateway VM directly; the validator only
+warns when the gateway sits in a shared network larger than a /29, where
+ordinary hosts could live (see [ROUTERS.md](ROUTERS.md) §2).
 
 ```
 LAN hosts ──► router ──► (transit VLAN) ──► gateway VM ──► tunnel

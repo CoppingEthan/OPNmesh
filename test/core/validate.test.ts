@@ -39,6 +39,23 @@ describe("addressing", () => {
     expect(f.filter((x) => x.code === "lan-ip").map((x) => x.subject?.id)).toEqual(["site-a", "site-b"]);
     expect(f.every((x) => x.level === "warning")).toBe(true);
   });
+  it("lets a transit-layout site share its dedicated transit network, but not a network hosts live on", () => {
+    // Each site's gateway on its own transit network, shared so the other sites can reach the gateway itself.
+    const transit = (slug: string, tunnelIp: string, cidr: string, lanIp: string) =>
+      site(slug, { lans: [lan("10.20.0.0/24", "Staff"), lan(cidr, "Transit")], tunnelIp, lanIp, layout: "transit" });
+    const lanIpWarnings = (s: ReturnType<typeof transit>) => validateAddressing(snapshot([s])).filter((x) => x.code === "lan-ip");
+    expect(lanIpWarnings(transit("a", "10.99.0.1", "10.20.250.0/29", "10.20.250.2"))).toEqual([]);
+    expect(lanIpWarnings(transit("b", "10.99.0.2", "10.20.250.0/30", "10.20.250.2"))).toEqual([]);
+    // A /28 and larger have room for ordinary hosts, whose paths would be asymmetric.
+    const [w] = lanIpWarnings(transit("c", "10.99.0.3", "10.20.250.0/28", "10.20.250.2"));
+    expect(w?.level).toBe("warning");
+    expect(w?.message).toContain("10.20.250.0/28");
+    expect(w?.message).toContain("dedicated transit network (a /29");
+    const onStaff = lanIpWarnings(site("d", { lans: [lan("10.20.0.0/24", "Staff"), lan("10.20.250.0/29", "Transit")], tunnelIp: "10.99.0.4", lanIp: "10.20.0.2", layout: "transit" }));
+    expect(onStaff.map((x) => x.message)).toEqual([expect.stringContaining("sits inside the shared network 10.20.0.0/24")]);
+    // A local-only network is not routed into the mesh, so no path through it can be asymmetric.
+    expect(lanIpWarnings(site("e", { lans: [lan("10.20.0.0/24", "Staff", { shared: false })], tunnelIp: "10.99.0.5", lanIp: "10.20.0.2", layout: "transit" }))).toEqual([]);
+  });
   it("rejects two gateways publishing the same endpoint and port", () => {
     const snap = snapshot([
       site("a", { lans: [lan("10.1.0.0/24", "A")], tunnelIp: "10.99.0.1", lanIp: "10.1.0.2", endpoint: "vpn.example.com" }),
