@@ -16,12 +16,12 @@ const ERRORS = {
 
 const NOT_READY = "Your configuration cannot be handed out yet, so this link has not been used up. Ask your administrator, then try the link again.";
 
-/** Look, without consuming: the page shows who the config is for. */
+/** Look, without consuming: the page shows who the config is for, and nothing more. */
 export const GET = withPublic<P>(async (req, { params }) => {
   if (rateLimited(`invite:${requestSource(req)}`, 60, 15 * 60_000)) return json({ error: "too many requests" }, 429);
   const r = peekInvite(params.token);
   if ("error" in r) return json({ error: ERRORS[r.error] }, 404);
-  return json({ name: r.client.name, tunnelIp: r.client.tunnelIp });
+  return json({ name: r.client.name });
 });
 
 /**
@@ -31,13 +31,14 @@ export const GET = withPublic<P>(async (req, { params }) => {
  * can still be spent afterwards, the config built here is still the client's.
  */
 export const POST = withPublic<P>(async (req, { params }) => {
-  if (rateLimited(`invite:${requestSource(req)}`, 60, 15 * 60_000)) return json({ error: "too many requests" }, 429);
+  const source = requestSource(req);
+  if (rateLimited(`invite:${source}`, 60, 15 * 60_000)) return json({ error: "too many requests" }, 429);
   const r = peekInvite(params.token);
   if ("error" in r) return json({ error: ERRORS[r.error] }, 404);
   const conf = clientConfHeld(r.client.id) === null ? renderClientConf(r.client.id) : null;
   if (!conf) return json({ error: NOT_READY }, 409);
   const qrSvg = await QRCode.toString(conf, { type: "svg", margin: 1, errorCorrectionLevel: "M" });
-  const spent = consumeInvite(params.token);
+  const spent = consumeInvite(params.token, source);
   if ("error" in spent) return json({ error: ERRORS[spent.error] }, 404);
   return json({ name: r.client.name, slug: r.client.slug, conf, qrSvg });
 });
