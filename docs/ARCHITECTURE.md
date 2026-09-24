@@ -447,7 +447,7 @@ telemetry_1m      ts, gateway_id, peer_key, rx_bps, tx_bps, rtt_ms  (kept 30 day
 telemetry_1h      ts, gateway_id, peer_key, rx_bps, tx_bps, rtt_ms  (kept 2 years)
 pair_5s/1m/1h     ts, gateway_id, from_slug, to_slug, bps (+ bytes on pair_5s): routed
                   site-to-site traffic from the nftables counters, same retention
-                  as the telemetry tables
+                  as the telemetry tables; slugs in the counters' form (`-` as `_`)
 events            ts, actor, kind, subject, message, detail (json)
 ```
 
@@ -545,8 +545,10 @@ table inet opnmesh {
   set clients    { … 10.99.1.0/24 … }
   set clients_restricted_x { … }   # only when a client has a site restriction
 
-  counter c_site_b_to_site_a {}   # one per ordered site pair this gateway sees
-  counter c_site_a_to_site_b {}
+  counter c6_site_b_to_site_a {}  # one per ordered site pair this gateway sees
+  counter c6_site_a_to_site_b {}
+  counter clients_to_site_b {}    # roaming clients into and out of this site
+  counter clients_from_site_b {}
 
   chain forward {
     type filter hook forward priority filter; policy drop;
@@ -563,8 +565,8 @@ table inet opnmesh {
     # restricted clients: drop anything outside their allowed sites
     iifname "opnmesh0" ip saddr @clients_restricted_x ip daddr != @lan_site_a drop
     # per-pair counters and accepts
-    ip saddr @lan_self ip daddr @lan_site_a counter name "c_site_b_to_site_a" accept
-    ip saddr @lan_site_a ip daddr @lan_self counter name "c_site_a_to_site_b" accept
+    ip saddr @lan_self ip daddr @lan_site_a counter name "c6_site_b_to_site_a" accept
+    ip saddr @lan_site_a ip daddr @lan_self counter name "c6_site_a_to_site_b" accept
     # clients into this site
     iifname "opnmesh0" ip saddr @clients ip daddr @lan_self accept
     # transit pairs (hubs only)
@@ -576,6 +578,14 @@ table inet opnmesh {
   }
 }
 ```
+
+Counter names must read back one way only, because the controller turns
+each site-pair counter into a row of traffic history. A slug may itself
+contain `-to-`, and a site may be called "clients", so a site pair's name
+leads with the length of the first slug (`c6_site_b_to_site_a`: the six
+characters after `c6_` are the source) and the clients' counters start
+`clients_`, which no pair's name can. Slugs appear with `-` written as `_`,
+which is also how the history tables store them.
 
 ### 9.3 Router instructions
 
@@ -591,10 +601,10 @@ HTTPS, JSON, gateway always initiates. The controller never dials a gateway.
 |---|---|---|
 | `GET /install.sh` | none | Installer script. The UI shows its SHA-256 next to the one-liner. |
 | `GET /dl/opnmesh-gw-linux-{amd64,arm64}` | none | Agent binary (+ `.sha256`). |
-| `POST /api/agent/enrol` | one-time token | `{token, publicKey, hostname, os, arch, addresses}` → `{gatewayId, gatewayToken, status}`. The token is single-use, bound to a site and valid for 30 minutes. Issuing a new token, or enrolling with one, revokes the site's other tokens. The public key must be unused by any gateway or client (409 otherwise), and the reported LAN address must be a usable host address. |
-| `GET /api/agent/config` | gateway token | `If-None-Match: <version>` → `304`, or `200 {version, files, meta}`, or `202 {status:"pending"}` before approval, or `409` while the configuration is on hold (§9). |
-| `POST /api/agent/telemetry` | gateway token | Body §11.1. Response `{configHash, intervalSeconds, actions}`: a changed config is fetched on the very next tick without a second poll loop, and `actions` carries anything the admin asked for (§11.4). `configHash` is empty while the configuration is on hold. |
-| `POST /api/agent/diagnostics` | gateway token | The gateway's answer to a `diagnose` action: `{id, ranAt, checks[]}` (§11.4). A disabled gateway gets 403. An answer to a request that was never made, is out of date or was already answered gets 409. |
+| `POST /api/agent/enrol` | one-time token | `{token, publicKey, hostname, os, arch, addresses}` → `{gatewayId, gatewayToken, status}`. The token is single-use, bound to a site and valid for 30 minutes. Issuing a new token, or enrolling with one, revokes the site's other tokens. The public key must be a canonical WireGuard key (the form `wg` itself accepts) unused by any gateway or client (409 otherwise), and the reported LAN address must be a usable host address. A token that needs approval cannot replace a site's active gateway (409, token left unspent): the working gateway would go at once and the site would leave the mesh until someone approved the newcomer. Attempts that cannot succeed count against their source (20 per 15 minutes); attempts with a usable token count against that token (10), so junk sent from anywhere cannot lock out a real gateway. Bodies over 32 KiB are refused. |
+| `GET /api/agent/config` | gateway token | `If-None-Match: <version>` → `304`, or `200 {version, files, meta}`, or `202 {status:"pending"}` before approval, or `409` while the configuration is on hold (§9). The 409 names only the kind of error and whether it is at this site; the full message, which can name other sites and their networks, is for the admin. |
+| `POST /api/agent/telemetry` | gateway token | Body §11.1, at most 512 KiB. Response `{configHash, intervalSeconds, actions}`: a changed config is fetched on the very next tick without a second poll loop, and `actions` carries anything the admin asked for (§11.4). `configHash` is empty while the configuration is on hold. The answer never depends on the report, so a report that comes sooner than the gateway was asked is answered without being read, and a pending or disabled gateway's report is never read. |
+| `POST /api/agent/diagnostics` | gateway token | The gateway's answer to a `diagnose` action: `{id, ranAt, checks[]}` (§11.4), at most 256 KiB. A disabled gateway gets 403. Nothing is read unless a request is waiting for an answer: one that was never made, was already answered or is over ten minutes old gets 409 before the body is looked at, and a gateway gets ten tries a minute (429). |
 
 Agent loop, every `intervalSeconds` (default 5, jittered ±20%):
 
@@ -669,7 +679,8 @@ command when a gateway reports an older agent than the controller.
 Enrolling with `--token` runs the new binary's `enrol` before installing it,
 so a refused token (used, expired, wrong) changes nothing on the machine.
 With a fresh token it replaces the site's gateway, which is how a VM is
-rebuilt or moved.
+rebuilt or moved. (A token that needs approval cannot replace an active
+gateway; remove the gateway first, or use a token that approves itself.)
 
 The install and upgrade one-liners depend on how the controller is reached:
 
@@ -700,6 +711,11 @@ The install and upgrade one-liners depend on how the controller is reached:
 `rttMs` comes from an ICMP echo to each peer's tunnel address, sent by the
 agent between reports; a peer that answers is *proven* reachable end to end,
 which is a stronger signal than a recent handshake.
+
+The controller keeps only what the gateway may speak for (§12) and cleans
+its words: hashes must be SHA-256 hex, the version and error text lose
+control and bidi characters, and a peer endpoint that is not `ip:port` or
+`[ipv6]:port` is dropped.
 
 ### 11.2 What the controller derives
 
@@ -864,6 +880,14 @@ The router probe catches the classic "I added the VLAN but forgot the route"
 and "the route points at the old VM" mistakes in one click, without touching
 the router. Results are stored per gateway (last run only) and shown
 problems-first, with passed checks folded away.
+
+What the gateway sends is its own words, so it is treated like any other
+text from a gateway: control and bidi characters are replaced, long text
+is cut rather than refused (a check about a peer with a long host name
+must not cost the whole report), and each check's id gets an `agent:`
+prefix, and a suffix if repeated, so it can never be mistaken for one of
+the controller's checks. The page labels the gateway's advice as the
+gateway's ("The gateway suggests:"), apart from the controller's own ("Try:").
 
 ## 12. Security model
 

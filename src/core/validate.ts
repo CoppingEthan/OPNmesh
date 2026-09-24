@@ -472,6 +472,27 @@ export interface Held {
 }
 
 /**
+ * What a held gateway itself is told: which kind of error holds it and
+ * where, never the finding's message, which names other sites, their
+ * networks and their endpoints. The first error that holds the site is the
+ * one heldConfigs reports to the admin. Null when nothing holds it.
+ */
+export function heldNotice(findings: Finding[], siteId: string): string | null {
+  const f = findings.find((x) => x.level === "error" && (!x.affects || x.affects.sites.includes(siteId)));
+  if (!f) return null;
+  const where = !f.subject
+    ? ""
+    : f.subject.kind === "settings"
+      ? " in the network settings"
+      : f.subject.kind === "client"
+        ? " in a roaming client"
+        : f.subject.id === siteId
+          ? " at this site"
+          : " at another site";
+  return `configuration on hold until an error is fixed in the OPNmesh UI (${f.code}${where})`;
+}
+
+/**
  * What the error findings hold back. A held gateway keeps running its last
  * good configuration; a held client's config is not rendered at all. An
  * error without a scope (a broken address range, say) holds everything.

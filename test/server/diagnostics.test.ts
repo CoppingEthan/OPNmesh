@@ -1,6 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
 import { freshDb } from "./helpers";
-import { buildAgentRequest, controllerChecks, pendingAgentRequest, probeIpFor, requestDiagnostics, siteDiagnostics, storeAgentReport } from "@/server/diagnostics";
+import { bearer, gatewayOf, meshSite } from "./route-helpers";
+import { getDb } from "@/db";
+import { gateways } from "@/db/schema";
+import { resetRateLimitsForTests } from "@/server/http";
+import {
+  agentChecks,
+  awaitingAgentReport,
+  buildAgentRequest,
+  controllerChecks,
+  pendingAgentRequest,
+  probeIpFor,
+  requestDiagnostics,
+  siteDiagnostics,
+  storeAgentReport,
+  type CheckResult,
+} from "@/server/diagnostics";
+import { POST as diagPost } from "../../app/api/agent/diagnostics/route";
 import { addLan, createEnrolToken, createSite, enrolGateway, getSite, updateGateway } from "@/server/sites";
 import { ingestTelemetry } from "@/server/telemetry";
 import { liveState, telemetrySchema } from "@/server/live";
@@ -197,5 +214,97 @@ describe("controller checks", () => {
     expect(a.find((c) => c.id === "reporting")?.status).toBe("fail");
     const untouched = createSite({ name: "Empty", routerLayout: "transit", hubPriority: 9 }, "t");
     expect((await controllerChecks(untouched.id))[0]?.status).toBe("skip");
+  });
+});
+
+describe("the gateway's answer", () => {
+  const post = (token: string, body: unknown) =>
+    diagPost(new Request("http://controller.test/api/agent/diagnostics", { method: "POST", headers: { host: "controller.test", ...bearer(token) }, body: typeof body === "string" ? body : JSON.stringify(body) }));
+  const check = (over: Partial<CheckResult> = {}): CheckResult => ({ id: "forwarding", status: "pass", title: "IP forwarding is on", detail: "", ...over });
+  const answer = (gw: { diagRequestedAt: number | null }, checks: CheckResult[]) => ({ id: String(gw.diagRequestedAt), ranAt: now, checks });
+
+  beforeEach(() => resetRateLimitsForTests());
+
+  it("is not read unless a request is waiting for it", async () => {
+    const dc = meshSite("DC", "10.0.1.0/24", "10.0.250.2", "dc.example.com");
+    // Never asked: refused before the body is looked at, so junk gets the same answer.
+    expect((await post(dc.token, "{not json")).status).toBe(409);
+    requestDiagnostics(dc.site.id, "admin@example.com");
+    expect((await post(dc.token, "{not json")).status).toBe(400);
+    expect((await post(dc.token, answer(gatewayOf(dc), [check()]))).status).toBe(200);
+    // Answered: nothing more is read.
+    expect((await post(dc.token, "{not json")).status).toBe(409);
+    expect((await post(dc.token, answer(gatewayOf(dc), [check()]))).status).toBe(409);
+  });
+
+  it("is taken for a while after the request, then no longer", async () => {
+    const dc = meshSite("DC", "10.0.1.0/24", "10.0.250.2", "dc.example.com");
+    requestDiagnostics(dc.site.id, "admin@example.com");
+    const gw = gatewayOf(dc);
+    now += 5 * 60_000; // later than the two minutes it is handed out for, as a slow run may be
+    expect(awaitingAgentReport(gw)).toBe(true);
+    now += 5 * 60_000;
+    expect(awaitingAgentReport(gw)).toBe(false);
+    expect((await post(dc.token, answer(gw, [check()]))).status).toBe(409);
+    expect(storeAgentReport(gw, answer(gw, [check()]))).toBe(false);
+  });
+
+  it("gets a few tries a minute, and no more than a report's worth of bytes", async () => {
+    const dc = meshSite("DC", "10.0.1.0/24", "10.0.250.2", "dc.example.com");
+    requestDiagnostics(dc.site.id, "admin@example.com");
+    const statuses: number[] = [];
+    for (let i = 0; i < 11; i++) statuses.push((await post(dc.token, "{not json")).status);
+    expect(statuses).toEqual([...Array(10).fill(400), 429]);
+    resetRateLimitsForTests();
+    const huge = answer(gatewayOf(dc), [check({ detail: "x".repeat(300 * 1024) })]);
+    expect((await post(dc.token, huge)).status).toBe(413);
+  });
+
+  it("keeps a check about a long host name instead of refusing the whole report", async () => {
+    const dc = meshSite("DC", "10.0.1.0/24", "10.0.250.2", "dc.example.com");
+    requestDiagnostics(dc.site.id, "admin@example.com");
+    const host = `${"a".repeat(63)}.${"b".repeat(63)}.${"c".repeat(63)}.example.com`; // 203 characters
+    const res = await post(dc.token, answer(gatewayOf(dc), [check({ id: `dns:${host}`, status: "fail", title: `Cannot resolve ${host}`, detail: `${host} has no address.` }), check()]));
+    expect(res.status).toBe(200);
+    const d = await siteDiagnostics(dc.site.id);
+    expect(d.agent).toHaveLength(2);
+    expect(d.agent[0]!.id).toBe(`agent:dns:${host}`.slice(0, 300));
+    expect(d.agent[0]!.title.startsWith("Cannot resolve aaaa")).toBe(true);
+    expect(d.agent[0]!.title.length).toBeLessThanOrEqual(300);
+  });
+
+  it("is cleaned, and its ids kept apart from the controller's and from each other", async () => {
+    const dc = meshSite("DC", "10.0.1.0/24", "10.0.250.2", "dc.example.com");
+    requestDiagnostics(dc.site.id, "admin@example.com");
+    const checks = [
+      check({ id: "reporting", status: "fail", title: "Gateway\nis reporting\u202e", detail: "line\r\nFORGED", hint: "\u0000run\u2066this" }),
+      check({ id: "reporting", status: "warn", title: "Again" }),
+      check({ id: "agent:reporting", title: "Prefixed already" }),
+      check({ id: "\u0000", title: "\u202e" }),
+    ];
+    expect((await post(dc.token, answer(gatewayOf(dc), checks))).status).toBe(200);
+    const d = await siteDiagnostics(dc.site.id);
+    expect(d.agent.map((c) => c.id)).toEqual(["agent:reporting", "agent:reporting#2", "agent:reporting#3", "agent:check"]);
+    expect(d.agent[0]).toMatchObject({ title: "Gateway is reporting", detail: "line FORGED", hint: "run this" });
+    expect(d.agent[3]!.title).toBe("Check from the gateway");
+    const controllerIds = new Set(d.controller.map((c) => c.id));
+    expect(d.agent.some((c) => controllerIds.has(c.id))).toBe(false);
+    // Stored cleaned too, and cleaning again changes nothing.
+    const stored = JSON.parse(gatewayOf(dc).diagJson!).checks as CheckResult[];
+    expect(stored).toEqual(d.agent);
+    expect(agentChecks(stored)).toEqual(stored);
+  });
+
+  it("stored before these rules is brought into line when shown", async () => {
+    const dc = meshSite("DC", "10.0.1.0/24", "10.0.250.2", "dc.example.com");
+    requestDiagnostics(dc.site.id, "admin@example.com");
+    const gw = gatewayOf(dc);
+    getDb()
+      .update(gateways)
+      .set({ diagAt: now, diagJson: JSON.stringify(answer(gw, [check({ id: "inbound", title: "Old\u202etitle" })])) })
+      .where(eq(gateways.id, gw.id))
+      .run();
+    const d = await siteDiagnostics(dc.site.id);
+    expect(d.agent).toEqual([{ id: "agent:inbound", status: "pass", title: "Old title", detail: "" }]);
   });
 });

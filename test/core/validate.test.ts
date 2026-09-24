@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { generateAll } from "@/core/generate";
-import { validateAddressing, validateAll, validateAllowedIps, validateNat, validateTopology } from "@/core/validate";
+import { heldConfigs, validateAddressing, validateAll, validateAllowedIps, validateNat, validateTopology } from "@/core/validate";
 import { client, lan, scenarios, site, snapshot } from "../fixtures/snapshots";
 
 const codes = (f: Array<{ code: string }>) => f.map((x) => x.code);
@@ -29,6 +29,20 @@ describe("addressing", () => {
     expect(c).toContain("overlap");
     expect(c).toContain("host-bits");
     expect(c).toContain("dup-ip");
+  });
+  it("rejects a key a strict decoder refuses, and holds every config it would reach", () => {
+    const snap = scenarios["two-sites"]!();
+    const key = snap.sites[1]!.gateway!.publicKey;
+    // Same 32 bytes to a lenient decoder; `wg` and the agent refuse it.
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const sloppy = `${key.slice(0, 42)}${alphabet[alphabet.indexOf(key[42]!) + 1]}=`;
+    expect(Buffer.from(sloppy, "base64").equals(Buffer.from(key, "base64"))).toBe(true);
+    snap.sites[1]!.gateway!.publicKey = sloppy;
+    snap.clients[0]!.publicKey = `${snap.clients[0]!.publicKey.slice(0, 42)}B=`;
+    const bad = validateAddressing(snap).filter((f) => f.code === "bad-key");
+    expect(bad.map((f) => f.subject?.id)).toEqual(["site-office", snap.clients[0]!.id]);
+    const held = heldConfigs(snap, validateAll(snap, generateAll(snap)));
+    expect(Object.keys(held.gateways).sort()).toEqual(["gw-dc", "gw-office"]);
   });
   it("warns about layout / address mismatches", () => {
     const snap = snapshot([

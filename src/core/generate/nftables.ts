@@ -44,6 +44,10 @@ import {
  */
 export const HOST_BRIDGE_PATTERNS = ["docker0", "br-*", "podman*", "cni-*", "lxdbr*", "virbr*"] as const;
 
+/**
+ * A slug as an nftables name part. Slugs never contain "_", so this is
+ * one-to-one: a site's traffic history is stored under this form too.
+ */
 export function nftIdent(slug: string): string {
   return slug.replace(/[^a-z0-9]/g, "_");
 }
@@ -52,12 +56,40 @@ export function lanSetName(site: { slug: string }): string {
   return `lan_${nftIdent(site.slug)}`;
 }
 
+/**
+ * The counter for traffic from one site's networks to another's, e.g.
+ * `c2_dc_to_office`. A slug may itself contain "-to-", so "c_a_to_b_to_c"
+ * would name two different pairs; the length of the first slug up front
+ * makes every name read back one way only (see parsePairCounter).
+ */
 export function pairCounterName(from: { slug: string }, to: { slug: string }): string {
-  return `c_${nftIdent(from.slug)}_to_${nftIdent(to.slug)}`;
+  const f = nftIdent(from.slug);
+  return `c${f.length}_${f}_to_${nftIdent(to.slug)}`;
 }
 
+/**
+ * Counters for roaming clients into and out of a site. They start
+ * "clients_", which no site pair's name can (those start "c" and a digit),
+ * so a site called "clients" cannot share a name with them.
+ */
 export function clientCounterNames(site: { slug: string }): { toSite: string; fromSite: string } {
-  return { toSite: `c_clients_to_${nftIdent(site.slug)}`, fromSite: `c_${nftIdent(site.slug)}_to_clients` };
+  const s = nftIdent(site.slug);
+  return { toSite: `clients_to_${s}`, fromSite: `clients_from_${s}` };
+}
+
+const PAIR_COUNTER_RE = /^c([1-9][0-9]?)_/;
+const IDENT_RE = /^[a-z0-9][a-z0-9_]*$/;
+
+/** The two sites (in nftIdent form) a site-pair counter counts; null for any other name. */
+export function parsePairCounter(name: string): { from: string; to: string } | null {
+  const m = PAIR_COUNTER_RE.exec(name);
+  if (!m) return null;
+  const len = Number(m[1]);
+  const rest = name.slice(m[0].length);
+  const from = rest.slice(0, len);
+  const to = rest.slice(len + "_to_".length);
+  if (rest.slice(len, len + "_to_".length) !== "_to_" || !IDENT_RE.test(from) || from.length !== len || !IDENT_RE.test(to)) return null;
+  return { from, to };
 }
 
 function setBlock(name: string, elements: string[]): string[] {

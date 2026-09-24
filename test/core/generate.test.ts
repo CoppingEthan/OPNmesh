@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { generateAll } from "@/core/generate";
 import { generateClientConf, generateGatewayConf, CLIENT_PRIVATE_KEY_PLACEHOLDER } from "@/core/generate/wireguard";
-import { generateNftables } from "@/core/generate/nftables";
+import { clientCounterNames, generateNftables, nftIdent, pairCounterName, parsePairCounter } from "@/core/generate/nftables";
 import { generateRouterPlan } from "@/core/generate/router";
 import { parsePeers, validateAll } from "@/core/validate";
-import { scenarios } from "../fixtures/snapshots";
+import { lan, scenarios, site, snapshot } from "../fixtures/snapshots";
 
 function peer(conf: string, label: string) {
   const p = parsePeers(conf).find((x) => x.comment === label);
@@ -131,17 +131,60 @@ describe("nftables", () => {
   it("counts every pair in both directions and accepts exactly the routed traffic", () => {
     const snap = scenarios["two-spokes"]!();
     const dc = generateNftables(snap, "site-dc");
-    expect(dc).toContain("counter c_dc_to_office {}");
-    expect(dc).toContain("counter c_shop_north_to_shop_south {}");
-    expect(dc).toContain('ip saddr @lan_shop_north ip daddr @lan_shop_south counter name "c_shop_north_to_shop_south"');
+    expect(dc).toContain("counter c2_dc_to_office {}");
+    expect(dc).toContain("counter c10_shop_north_to_shop_south {}");
+    expect(dc).toContain('ip saddr @lan_shop_north ip daddr @lan_shop_south counter name "c10_shop_north_to_shop_south"');
     // Counters must precede the established/related accept or they only see the first packet.
-    expect(dc.indexOf('counter name "c_dc_to_office"')).toBeLessThan(dc.indexOf("ct state established,related accept"));
+    expect(dc.indexOf('counter name "c2_dc_to_office"')).toBeLessThan(dc.indexOf("ct state established,related accept"));
     expect(dc).toContain('iifname "opnmesh0" oifname "opnmesh0" ip saddr @lan_shop_north ip daddr @lan_shop_south accept');
     expect(dc).toContain("policy drop");
     expect(dc).not.toContain("masquerade");
     const office = generateNftables(snap, "site-office");
-    expect(office).not.toContain("c_shop_north_to_shop_south");
+    expect(office).not.toContain("c10_shop_north_to_shop_south");
     expect(office).not.toContain('oifname "opnmesh0" ip saddr @lan_shop_north');
+  });
+  it("names every counter so that it reads back one way only, whatever the slugs", () => {
+    // Slugs the old "c_<from>_to_<to>" names confused: "-to-" inside a slug,
+    // a site called "clients", and names that look like the new format.
+    const slugs = ["a", "b", "c", "a-to-b", "b-to-c", "to", "clients", "c1-a", "c2-x", "x-", "x--y", "0"];
+    const seen = new Map<string, string>();
+    const once = (name: string, what: string) => {
+      expect(seen.get(name), `${name} names both ${seen.get(name)} and ${what}`).toBeUndefined();
+      seen.set(name, what);
+      expect(name).toMatch(/^[a-z][a-z0-9_]*$/);
+    };
+    for (const f of slugs) {
+      for (const t of slugs) {
+        if (f === t) continue;
+        const name = pairCounterName({ slug: f }, { slug: t });
+        once(name, `${f} → ${t}`);
+        expect(parsePairCounter(name)).toEqual({ from: nftIdent(f), to: nftIdent(t) });
+      }
+    }
+    for (const s of slugs) {
+      const { toSite, fromSite } = clientCounterNames({ slug: s });
+      once(toSite, `clients → ${s}`);
+      once(fromSite, `${s} → clients`);
+      expect(parsePairCounter(toSite)).toBeNull();
+      expect(parsePairCounter(fromSite)).toBeNull();
+    }
+    for (const junk of ["c_a_to_b", "c0__to_b", "c02_ab_to_c", "c3_ab_to_c", "c2_ab_to_", "c2_ab_from_c", "c2_AB_to_c", "c2_ab_to_c d", "c2__b_to_c"]) {
+      expect(parsePairCounter(junk), junk).toBeNull();
+    }
+  });
+  it("declares each counter once even when sites are called 'clients' or contain '-to-'", () => {
+    const at = (slug: string, n: number) => site(slug, { lans: [lan(`10.${n}.0.0/24`, "LAN")], tunnelIp: `10.99.0.${n}`, lanIp: `10.${n}.0.2`, hubPriority: n });
+    const snap = snapshot([at("a", 1), at("a-to-b", 2), at("b-to-c", 3), at("c", 4), at("clients", 5)]);
+    // "a" and "c" dial out only, so a reachable site relays between them and
+    // its table holds its own pairs, relayed pairs and the clients' counters.
+    snap.sites[0]!.gateway!.endpointHost = null;
+    snap.sites[3]!.gateway!.endpointHost = null;
+    expect(validateAll(snap, generateAll(snap)).filter((f) => f.level === "error")).toEqual([]);
+    for (const s of snap.sites) {
+      const declared = [...generateNftables(snap, s.id).matchAll(/^\s*counter (\S+) \{\}$/gm)].map((m) => m[1]!);
+      expect(declared.length, s.slug).toBeGreaterThan(2);
+      expect(new Set(declared).size, s.slug).toBe(declared.length);
+    }
   });
   it("leaves container bridges to their own rules without letting them into the mesh", () => {
     const snap = scenarios["two-spokes"]!();

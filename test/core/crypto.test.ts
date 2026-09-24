@@ -19,6 +19,24 @@ describe("wireguard keys", () => {
     expect(generateKeyPair().privateKey).not.toBe(generateKeyPair().privateKey);
     expect(generatePresharedKey()).toMatch(WG_KEY_RE);
   });
+  it("accepts exactly the keys a strict base64 decoder takes back to the same 32 bytes", () => {
+    // Every last character before the padding, on an otherwise fixed key.
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (const last of alphabet) {
+      const key = `${"A".repeat(42)}${last}=`;
+      const canonical = Buffer.from(key, "base64").toString("base64") === key;
+      expect(WG_KEY_RE.test(key), key).toBe(canonical);
+    }
+    const good = generateKeyPair().publicKey;
+    const bytes = Buffer.from(good, "base64");
+    expect(bytes).toHaveLength(32);
+    // The same bytes with a spare bit set: lenient decoders agree, `wg` does not.
+    const idx = alphabet.indexOf(good[42]!);
+    const sloppy = `${good.slice(0, 42)}${alphabet[idx + 1]}=`;
+    expect(Buffer.from(sloppy, "base64").equals(bytes)).toBe(true);
+    expect(WG_KEY_RE.test(sloppy)).toBe(false);
+    for (const bad of [good.slice(0, 43), `${good.slice(0, 43)}==`, `${good.slice(0, 42)}-=`, ` ${good}`, `${good}\n`]) expect(WG_KEY_RE.test(bad), bad).toBe(false);
+  });
 });
 
 describe("tokens and digests", () => {
