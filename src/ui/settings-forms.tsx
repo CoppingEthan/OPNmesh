@@ -155,7 +155,7 @@ function AlertsForm({ smtp }: { smtp: SmtpFormView }) {
     setBusy("save");
     setMsg(null);
     try {
-      await apiFetch("PUT", "/api/admin/settings", {
+      const saved = await apiFetch<{ smtpPasswordSet: boolean }>("PUT", "/api/admin/settings", {
         smtpHost: v.smtpHost,
         smtpPort: Number(v.smtpPort),
         smtpSecure: v.smtpSecure,
@@ -164,8 +164,10 @@ function AlertsForm({ smtp }: { smtp: SmtpFormView }) {
         smtpFrom: v.smtpFrom,
         alertTo: v.alertTo,
       });
-      setMsg({ tone: "success", text: "Saved." });
-      setV((s) => ({ ...s, smtpPassword: "", smtpPasswordSet: s.smtpPasswordSet || !!s.smtpPassword }));
+      // A new server, port or username clears the saved password on the server.
+      const cleared = v.smtpPasswordSet && !saved.smtpPasswordSet;
+      setMsg(cleared ? { tone: "info", text: "Saved. The server or username changed, so the saved password was cleared: enter it again if the server needs one." } : { tone: "success", text: "Saved." });
+      setV((s) => ({ ...s, smtpPassword: "", smtpPasswordSet: saved.smtpPasswordSet }));
       router.refresh();
     } catch (e2) {
       setMsg({ tone: "error", text: e2 instanceof Error ? e2.message : String(e2) });

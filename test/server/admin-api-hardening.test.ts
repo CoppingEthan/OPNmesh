@@ -6,7 +6,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { freshDb } from "./helpers";
 import { adminHeaders, bearer, meshSite, params, req } from "./route-helpers";
-import { logEvent } from "@/server/events";
+import { listEvents, logEvent } from "@/server/events";
+import { resetRateLimitsForTests } from "@/server/http";
+import { eventHref } from "@/ui/event-link";
 import { requestDiagnostics } from "@/server/diagnostics";
 import { createEnrolToken, getSite } from "@/server/sites";
 import { createInvite, createClient } from "@/server/clients";
@@ -17,9 +19,13 @@ import { GET as stateGet } from "../../app/api/admin/state/route";
 import { GET as clientsGet } from "../../app/api/admin/clients/route";
 import { GET as eventsGet } from "../../app/api/admin/events/route";
 import { POST as diagPost } from "../../app/api/agent/diagnostics/route";
+import { GET as confGet } from "../../app/api/admin/clients/[id]/config/route";
+import { GET as qrGet } from "../../app/api/admin/clients/[id]/qr/route";
+import { PUT as settingsPut } from "../../app/api/admin/settings/route";
 
 beforeEach(() => {
   freshDb();
+  resetRateLimitsForTests();
 });
 
 /** Every key anywhere in a JSON value. */
@@ -81,6 +87,52 @@ describe("event pages", () => {
     for (const bad of ["?limit=abc", "?limit=1.5", "?limit=1e3", "?before=0", "?before=-4", "?before=x", "?before=1e3"]) {
       expect((await get(bad)).status, bad).toBe(400);
     }
+  });
+
+  it("link each entry to the page it is about", () => {
+    expect(eventHref({ kind: "alert", subject: "site1" })).toBe("/sites/site1");
+    for (const kind of ["site", "lan", "gateway", "enrol", "unifi", "apply-error"]) expect(eventHref({ kind, subject: "s" }), kind).toBe("/sites/s");
+    for (const kind of ["client", "invite"]) expect(eventHref({ kind, subject: "c" }), kind).toBe("/clients/c");
+    expect(eventHref({ kind: "alert", subject: "" })).toBeNull(); // the test email is about no site
+    expect(eventHref({ kind: "login", subject: "x" })).toBeNull();
+    expect(eventHref({ kind: "system", subject: "x" })).toBeNull();
+  });
+});
+
+describe("private key downloads", () => {
+  it("are written to the audit log, once per client, session and kind every ten minutes", async () => {
+    meshSite("DC", "10.0.1.0/24", "10.0.250.2", "dc.example.com", 1);
+    const c = createClient({ name: "Laptop" });
+    const admin = adminHeaders();
+    const views = () => listEvents().filter((e) => e.kind === "client" && e.subject === c.id && e.message.includes("private key"));
+    const get = async (path: string, route: typeof confGet, headers = admin) => expect((await route(req("GET", path, undefined, headers), params({ id: c.id }))).status).toBe(200);
+    await get(`/api/admin/clients/${c.id}/config`, confGet);
+    await get(`/api/admin/clients/${c.id}/config`, confGet);
+    await get(`/api/admin/clients/${c.id}/config?download=1`, confGet);
+    await get(`/api/admin/clients/${c.id}/qr`, qrGet);
+    await get(`/api/admin/clients/${c.id}/qr`, qrGet);
+    await get(`/api/admin/clients/${c.id}/qr?format=png`, qrGet);
+    expect(views().map((e) => e.message).sort()).toEqual([
+      'Configuration for "Laptop" downloaded (includes the private key)',
+      'Configuration for "Laptop" shown as text (includes the private key)',
+      'QR code for "Laptop" downloaded as an image (includes the private key)',
+      'QR code for "Laptop" shown (includes the private key)',
+    ]);
+    expect(views().every((e) => e.actor.startsWith("admin-"))).toBe(true);
+    // Another session is recorded on its own.
+    await get(`/api/admin/clients/${c.id}/qr`, qrGet, adminHeaders());
+    expect(views()).toHaveLength(5);
+  });
+});
+
+describe("network name", () => {
+  it("refuses control characters, like site and client names", async () => {
+    const admin = adminHeaders();
+    for (const networkName of ["Mesh\nForged line", "Mesh\u001b[31m", " "]) {
+      const r = await settingsPut(req("PUT", "/api/admin/settings", { networkName }, admin));
+      expect(r.status, JSON.stringify(networkName)).toBe(400);
+    }
+    expect((await settingsPut(req("PUT", "/api/admin/settings", { networkName: "Example Mesh" }, admin))).status).toBe(200);
   });
 });
 

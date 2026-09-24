@@ -1,6 +1,7 @@
 import { sessionFromToken, tokenFromRequest } from "@/server/auth";
 import { json, withAdmin } from "@/server/http";
 import { liveState } from "@/server/live";
+import { onShutdown, stopping } from "@/server/shutdown";
 import { buildState } from "@/server/state";
 
 export const dynamic = "force-dynamic";
@@ -23,10 +24,11 @@ const totalOpen = () => [...open.values()].reduce((a, b) => a + b, 0);
  * when a gateway has just reported. One connection per open dashboard.
  *
  * A stream stops when its session ends (sign-out, password change, expiry),
- * after MAX_STREAM_MS, or when the client disconnects. A client that stops
- * reading is skipped rather than buffered for.
+ * after MAX_STREAM_MS, when the client disconnects, or when the controller
+ * stops. A client that stops reading is skipped rather than buffered for.
  */
 export const GET = withAdmin(async (req, { admin }) => {
+  if (stopping()) return json({ error: "the controller is stopping" }, 503);
   if ((open.get(admin.sessionId) ?? 0) >= MAX_STREAMS_PER_SESSION || totalOpen() >= MAX_STREAMS) {
     return json({ error: "too many live connections" }, 429);
   }
@@ -40,12 +42,14 @@ export const GET = withAdmin(async (req, { admin }) => {
   let unsubscribe: (() => void) | null = null;
   let stopped = false;
   let close: () => void = () => undefined;
+  let offShutdown: () => void = () => undefined;
 
   const stop = () => {
     if (stopped) return;
     stopped = true;
     if (timer) clearInterval(timer);
     if (unsubscribe) unsubscribe();
+    offShutdown();
     if (fast) liveState().removeFastViewer();
     const n = (open.get(admin.sessionId) ?? 1) - 1;
     if (n > 0) open.set(admin.sessionId, n);
@@ -97,11 +101,15 @@ export const GET = withAdmin(async (req, { admin }) => {
     },
   });
   req.signal.addEventListener("abort", stop);
+  // An open stream would otherwise hold the server open through a restart.
+  offShutdown = onShutdown(stop);
   return new Response(stream, {
     headers: {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
+      // The connection ends with the stream, rather than idling for the
+      // keep-alive timeout: a stopping server waits for idle connections too.
+      Connection: "close",
       "X-Accel-Buffering": "no",
     },
   });

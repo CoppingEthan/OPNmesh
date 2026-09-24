@@ -40,6 +40,8 @@ export function ClientDetail({ initial, row }: { initial: StatePayload; row: Cli
   const [invite, setInvite] = useState<{ url: string; expiresAt: number } | null>(null);
   // A link created earlier and not yet collected; its URL cannot be shown again, only cancelled.
   const [pending, setPending] = useState<{ expiresAt: number } | null>(null);
+  // The QR code holds the private key: fetched only when asked for, and each fetch is audited.
+  const [showQr, setShowQr] = useState(false);
   const [qrKey, setQrKey] = useState(0);
   const siteName = (id: string | null) => (id ? state.sites.find((s) => s.id === id)?.name ?? "?" : null);
   const held = live?.held ?? null;
@@ -129,13 +131,31 @@ export function ClientDetail({ initial, row }: { initial: StatePayload; row: Cli
                 <h3 className="mb-2 flex items-center gap-1.5 text-sm font-semibold text-ink">
                   <QrCode className="h-4 w-4" /> Scan on a phone
                 </h3>
-                {canConnect ? (
+                {!canConnect ? (
+                  <div className="flex aspect-square items-center justify-center rounded-lg border border-dashed border-line-strong text-xs text-ink-3">unavailable</div>
+                ) : showQr ? (
                   // eslint-disable-next-line @next/next/no-img-element
                   <img key={qrKey} src={`/api/admin/clients/${row.id}/qr?v=${qrKey}`} alt="QR code with the WireGuard configuration" className="w-full rounded-lg border border-line bg-white p-2" />
                 ) : (
-                  <div className="flex aspect-square items-center justify-center rounded-lg border border-dashed border-line-strong text-xs text-ink-3">unavailable</div>
+                  <button
+                    type="button"
+                    onClick={() => setShowQr(true)}
+                    className="flex aspect-square w-full flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-line-strong text-xs font-medium text-ink-2 hover:bg-surface-2 hover:text-ink"
+                  >
+                    <QrCode className="h-6 w-6" /> Show QR code
+                  </button>
                 )}
-                <p className="mt-1 text-xs text-ink-3">WireGuard app → Add tunnel → Scan QR code.</p>
+                <p className="mt-1 text-xs text-ink-3">
+                  WireGuard app → Add tunnel → Scan QR code.
+                  {showQr && canConnect && (
+                    <>
+                      {" "}
+                      <button type="button" onClick={() => setShowQr(false)} className="text-ink-2 underline hover:text-ink">
+                        Hide
+                      </button>
+                    </>
+                  )}
+                </p>
               </div>
               <div className="space-y-5">
                 <div>
@@ -272,6 +292,7 @@ export function ClientDetail({ initial, row }: { initial: StatePayload; row: Cli
                   setShowConf(false);
                   setInvite(null);
                   setPending(null);
+                  setShowQr(false);
                   setQrKey((k) => k + 1);
                   router.refresh();
                 }}

@@ -63,7 +63,10 @@ export interface SmtpPatch {
   smtpPort?: number;
   smtpSecure?: boolean;
   smtpUser?: string;
-  /** Empty string keeps the stored password; a value replaces it. */
+  /**
+   * Empty string keeps the stored password; a value replaces it. A change of
+   * server, port or username clears it unless a new one comes with it.
+   */
   smtpPassword?: string;
   smtpFrom?: string;
   alertTo?: string;
@@ -80,12 +83,19 @@ export function recipients(list: string): string[] {
 
 export function updateSmtp(patch: SmtpPatch, actor = "admin"): SmtpView {
   const s = getSettings();
+  const smtpHost = (patch.smtpHost ?? s.smtpHost).trim();
+  const smtpPort = patch.smtpPort ?? s.smtpPort;
+  const smtpUser = (patch.smtpUser ?? s.smtpUser).trim();
+  // The saved password belongs to one account on one server: pointing the
+  // settings elsewhere must not send it there.
+  const moved = smtpHost.toLowerCase() !== s.smtpHost.toLowerCase() || smtpPort !== s.smtpPort || smtpUser !== s.smtpUser;
+  const cleared = moved && !patch.smtpPassword && s.smtpPassEnc !== "";
   const next = {
-    smtpHost: (patch.smtpHost ?? s.smtpHost).trim(),
-    smtpPort: patch.smtpPort ?? s.smtpPort,
+    smtpHost,
+    smtpPort,
     smtpSecure: patch.smtpSecure ?? s.smtpSecure,
-    smtpUser: (patch.smtpUser ?? s.smtpUser).trim(),
-    smtpPassEnc: patch.smtpPassword ? seal(patch.smtpPassword, env().secret, "smtp") : s.smtpPassEnc,
+    smtpUser,
+    smtpPassEnc: patch.smtpPassword ? seal(patch.smtpPassword, env().secret, "smtp") : moved ? "" : s.smtpPassEnc,
     smtpFrom: (patch.smtpFrom ?? s.smtpFrom).trim(),
     alertTo: recipients(patch.alertTo ?? s.alertTo).join(", "),
   };
@@ -94,7 +104,7 @@ export function updateSmtp(patch: SmtpPatch, actor = "admin"): SmtpView {
   if (next.smtpFrom && !EMAIL_RE.test(next.smtpFrom.replace(/^.*<([^>]+)>$/, "$1"))) throw new AlertError("the from address is not a valid email address");
   for (const r of recipients(next.alertTo)) if (!EMAIL_RE.test(r)) throw new AlertError(`"${r}" is not a valid email address`);
   getDb().update(settings).set(next).where(eq(settings.id, 1)).run();
-  logEvent("settings", "Email alert settings updated", { actor });
+  logEvent("settings", cleared ? "Email alert settings updated; the saved SMTP password was cleared because the server, port or username changed" : "Email alert settings updated", { actor });
   return smtpView();
 }
 

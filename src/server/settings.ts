@@ -39,8 +39,9 @@ export class SettingsError extends Error {}
 /**
  * The address gateways and people are given for this controller: the
  * Settings override when one is set, otherwise OPNMESH_PUBLIC_URL. Used for
- * install commands, invite links and alert emails. The session cookie's
- * Secure flag follows the environment only, since that is what is served.
+ * install commands, invite links and alert emails. The cookies' Secure
+ * flag and __Host- prefix follow the environment only, since that is what
+ * is served.
  */
 export function publicUrl(): string {
   return getSettings().publicUrl || env().publicUrl;
@@ -78,6 +79,11 @@ export function normalisePublicUrl(value: string | null): string | null {
 
 export function updateSettings(patch: SettingsPatch, actor = "admin"): SettingsRow {
   const current = getSettings();
+  // Shown in the dashboard and put into alert email subjects, like a site's name.
+  if (patch.networkName !== undefined) {
+    if (patch.networkName.trim().length === 0 || patch.networkName.length > 80) throw new SettingsError("network name is required (max 80 chars)");
+    if (/[\u0000-\u001f\u007f]/.test(patch.networkName)) throw new SettingsError("network name may not contain control characters");
+  }
   const next = { ...current, ...patch, publicUrl: patch.publicUrl === undefined ? current.publicUrl : normalisePublicUrl(patch.publicUrl) };
   for (const [label, cidr] of [
     ["gateway range", next.gatewayCidr],

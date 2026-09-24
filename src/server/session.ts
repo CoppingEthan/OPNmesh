@@ -1,11 +1,11 @@
 /** Session access for server components and layouts. */
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import { SESSION_COOKIE, needsSetup, sessionFromToken, type AdminSession } from "./auth";
+import { needsSetup, sessionCookieName, sessionFromToken, type AdminSession } from "./auth";
 
 export async function currentAdmin(): Promise<AdminSession | null> {
   const jar = await cookies();
-  return sessionFromToken(jar.get(SESSION_COOKIE)?.value);
+  return sessionFromToken(jar.get(sessionCookieName())?.value);
 }
 
 /** Redirects to /setup on a fresh install, or /login without a session. */

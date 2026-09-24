@@ -10,6 +10,7 @@ import { getDb } from "@/db";
 import { invites } from "@/db/schema";
 import { consumeInvite, createClient, createInvite, deleteClient, expireClients, getClient, peekInvite, pendingInvite, revokeInvites, updateClient, ClientError, clientPrivateKey } from "@/server/clients";
 import { resetRateLimitsForTests } from "@/server/http";
+import { setEnvForTests } from "@/server/env";
 import { updateGateway } from "@/server/sites";
 import { listEvents } from "@/server/events";
 import { DELETE as inviteDelete, GET as inviteStatus, POST as invitePost } from "../../app/api/admin/clients/[id]/invite/route";
@@ -137,6 +138,18 @@ describe("collecting a link", () => {
     const { token } = createInvite(c.id);
     const results = await Promise.all([pickup(token), pickup(token), pickup(token)]);
     expect(results.map((r) => r.status).sort()).toEqual([200, 404, 404]);
+  });
+
+  it("shows only the name before collection, and records who collected it", async () => {
+    const c = readyClient();
+    const { token } = createInvite(c.id);
+    const look = await peek(token);
+    expect(await look.json()).toEqual({ name: "Laptop" });
+    setEnvForTests({ trustProxy: 1 });
+    const ok = await invitePickup(req("POST", `/api/invite/${token}`, undefined, { "x-forwarded-for": "203.0.113.5, 198.51.100.44" }), params({ token }));
+    expect(ok.status).toBe(200);
+    const used = listEvents().find((e) => e.kind === "invite" && e.message.startsWith("Invite link used"));
+    expect(used?.message).toBe('Invite link used for "Laptop" from 198.51.100.44');
   });
 
   it("does not open an expired link", async () => {

@@ -6,7 +6,7 @@ import argon2 from "argon2";
 import { eq, lt } from "drizzle-orm";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { isIPv6 } from "node:net";
+import { isIP, isIPv4, isIPv6 } from "node:net";
 import { join } from "node:path";
 import { getDb } from "@/db";
 import { sessions, users } from "@/db/schema";
@@ -48,17 +48,30 @@ const PER_SOURCE_MAX = 10;
 const GLOBAL_MAX = 100;
 const MAX_TRACKED = 50_000;
 
+/** The source of a request that did not come through a configured proxy. */
+export const DIRECT = "direct";
+/** The source of a request whose forwarded address is not an IP address. */
+export const INVALID_SOURCE = "invalid";
+/** Whether a forwarded value that is not an address has been logged (once per process). */
+const logged = globalThis as unknown as { __opnmeshBadForwardLogged?: boolean };
+
 /** Who an attempt is charged to, and whether it also counts towards the global cap. */
 export interface Attempt {
   key: string;
   global: boolean;
 }
 
-/** The throttling identity of a client address: an IPv6 address by its /64, since one host usually holds the whole prefix. */
+/**
+ * The throttling identity of a client address: an IPv6 address by its /64,
+ * since one host usually holds the whole prefix. Anything that is not an
+ * address shares one bucket, so varying text cannot buy fresh allowances.
+ */
 export function throttleKey(source: string): string {
   const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(source);
   if (mapped) return mapped[1]!;
-  if (!isIPv6(source)) return source;
+  if (source === DIRECT) return DIRECT;
+  if (isIPv4(source)) return source;
+  if (!isIPv6(source)) return INVALID_SOURCE;
   const lower = source.toLowerCase();
   const [head = "", tail = ""] = lower.split("::");
   const left = head ? head.split(":") : [];
@@ -119,6 +132,7 @@ export function loginThrottled(source: string, device: string | null = null): bo
 export function resetThrottleForTests(): void {
   buckets.clear();
   globalBucket = { failures: 0, windowStart: 0 };
+  logged.__opnmeshBadForwardLogged = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,15 +143,37 @@ export function resetThrottleForTests(): void {
 export const DEVICE_COOKIE = "opnmesh_device";
 const DEVICE_MAX_AGE_S = 400 * 24 * 60 * 60; // the longest browsers keep a cookie
 
+/**
+ * Over https both cookies carry the __Host- prefix: a browser then accepts
+ * them only when Secure, for the whole host (Path=/) and without a Domain,
+ * so a neighbouring subdomain or a plain-http page cannot plant or shadow
+ * one. Cookies set under the old names are simply no longer read; the admin
+ * signs in once more. The prefix follows the environment's public URL, since
+ * that is what is served.
+ */
+function hostCookies(): boolean {
+  return env().publicUrl.startsWith("https://");
+}
+
+export function sessionCookieName(): string {
+  return hostCookies() ? `__Host-${SESSION_COOKIE}` : SESSION_COOKIE;
+}
+
+export function deviceCookieName(): string {
+  return hostCookies() ? `__Host-${DEVICE_COOKIE}` : DEVICE_COOKIE;
+}
+
 export function deviceCookie(existing: string | null): string {
   const id = existing ?? randomToken().slice(0, 22);
-  const secure = env().publicUrl.startsWith("https://") ? "; Secure" : "";
-  return `${DEVICE_COOKIE}=${id}.${macTag(id, env().secret, "device")}; Path=/api/admin/login; HttpOnly; SameSite=Strict; Max-Age=${DEVICE_MAX_AGE_S}${secure}`;
+  // A __Host- cookie must be scoped to the whole host; over http it stays with the sign-in endpoint.
+  const scope = hostCookies() ? "Path=/" : "Path=/api/admin/login";
+  const secure = hostCookies() ? "; Secure" : "";
+  return `${deviceCookieName()}=${id}.${macTag(id, env().secret, "device")}; ${scope}; HttpOnly; SameSite=Strict; Max-Age=${DEVICE_MAX_AGE_S}${secure}`;
 }
 
 /** The device id from a valid device cookie, or null. */
 export function deviceFromRequest(req: Request): string | null {
-  const m = /^([A-Za-z0-9_-]{16,64})\.([A-Za-z0-9_-]{32})$/.exec(cookieValue(req, DEVICE_COOKIE) ?? "");
+  const m = /^([A-Za-z0-9_-]{16,64})\.([A-Za-z0-9_-]{32})$/.exec(cookieValue(req, deviceCookieName()) ?? "");
   if (!m) return null;
   const expected = Buffer.from(macTag(m[1]!, env().secret, "device"));
   const given = Buffer.from(m[2]!);
@@ -317,13 +353,28 @@ function cookieValue(req: Request, name: string): string | null {
 
 /** Read the session cookie from a Request. */
 export function tokenFromRequest(req: Request): string | null {
-  return cookieValue(req, SESSION_COOKIE);
+  return cookieValue(req, sessionCookieName());
 }
 
 export function sessionCookie(token: string | null): string {
-  const secure = env().publicUrl.startsWith("https://") ? "; Secure" : "";
-  if (token === null) return `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`;
-  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(SESSION_ABSOLUTE_MS / 1000)}${secure}`;
+  const name = sessionCookieName();
+  const secure = hostCookies() ? "; Secure" : "";
+  if (token === null) return `${name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`;
+  return `${name}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(SESSION_ABSOLUTE_MS / 1000)}${secure}`;
+}
+
+/**
+ * An X-Forwarded-For entry as a bare IP address: a port or IPv6 brackets are
+ * dropped (some proxies add them), and anything else is refused, so the value
+ * is safe to count by and to write into the audit log.
+ */
+export function forwardedAddress(value: string): string | null {
+  let v = value.trim();
+  const bracketed = /^\[([^\]]+)\](?::\d{1,5})?$/.exec(v);
+  const v4WithPort = /^(\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}$/.exec(v);
+  if (bracketed) v = bracketed[1]!;
+  else if (v4WithPort) v = v4WithPort[1]!;
+  return isIP(v) ? v.toLowerCase() : null;
 }
 
 /**
@@ -333,7 +384,9 @@ export function sessionCookie(token: string | null): string {
  * it received the request from, and everything further left came from the
  * client and can be forged. A proxy that adds its own header line rather than
  * appending is handled the same way, because repeated headers are joined in
- * order. Without a configured proxy the header is ignored.
+ * order. Without a configured proxy the header is ignored. An entry that is
+ * not an address (a misconfigured proxy, or a forged value when fewer proxies
+ * are in front than configured) counts as one shared source, "invalid".
  */
 export function requestSource(req: Request): string {
   const hops = env().trustProxy;
@@ -343,7 +396,16 @@ export function requestSource(req: Request): string {
       .map((s) => s.trim())
       .filter(Boolean);
     const client = chain[Math.max(0, chain.length - hops)];
-    if (client) return client;
+    if (client) {
+      const address = forwardedAddress(client);
+      if (address) return address;
+      if (!logged.__opnmeshBadForwardLogged) {
+        logged.__opnmeshBadForwardLogged = true;
+        const shown = JSON.stringify(client.slice(0, 64)).replace(/\p{Cc}+/gu, " ");
+        console.warn(`[opnmesh] X-Forwarded-For held ${shown}, which is not an IP address; such requests share one throttling bucket. Check OPNMESH_TRUST_PROXY against the proxies in front (logged once).`);
+      }
+      return INVALID_SOURCE;
+    }
   }
-  return "direct";
+  return DIRECT;
 }

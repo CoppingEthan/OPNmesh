@@ -53,6 +53,26 @@ describe("smtp settings", () => {
     expect(() => updateSmtp({ smtpHost: "bad host" })).toThrow(AlertError);
     expect(recipients(" x@y.z ,, a@b.c\n")).toEqual(["x@y.z", "a@b.c"]);
   });
+  it("forgets the saved password when the server, port or username changes, unless a new one comes with it", () => {
+    const base = { smtpHost: "smtp.example.com", smtpPort: 587, smtpUser: "u", smtpFrom: "m@example.com", alertTo: "a@example.com" };
+    const saved = () => smtpView().smtpPasswordSet;
+    updateSmtp({ ...base, smtpPassword: "p" });
+    // Saving the form unchanged, or changing only the rest, keeps it.
+    updateSmtp({ ...base, smtpHost: " SMTP.example.com ", smtpSecure: true, alertTo: "b@example.com" });
+    expect(saved()).toBe(true);
+    for (const change of [{ smtpHost: "mail.example.net" }, { smtpPort: 2525 }, { smtpUser: "someone-else" }]) {
+      updateSmtp({ ...base, smtpPassword: "p" });
+      updateSmtp({ ...base, ...change });
+      expect(saved(), JSON.stringify(change)).toBe(false);
+      expect(getSettings().smtpPassEnc).toBe("");
+    }
+    expect(listEvents()[0]!.message).toContain("password was cleared");
+    // A new password in the same save is kept.
+    updateSmtp({ ...base, smtpPassword: "p" });
+    updateSmtp({ ...base, smtpHost: "mail.example.net", smtpPassword: "new" });
+    expect(saved()).toBe(true);
+  });
+
   it("sends a test email to every recipient", async () => {
     await expect(sendTestEmail()).rejects.toThrow(/not configured|no alert recipients/);
     updateSmtp({ smtpHost: "smtp.example.com", smtpFrom: "m@example.com", alertTo: "a@example.com, b@example.com" });

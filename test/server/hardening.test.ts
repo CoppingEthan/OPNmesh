@@ -4,7 +4,7 @@
  * race, CSRF checks, the request-body cap, the live stream's limits and the
  * sealing secret's safety checks.
  */
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -12,7 +12,7 @@ import { z } from "zod";
 import { freshDb } from "./helpers";
 import { changePassword, completeSetup, deviceFromRequest, login, logout, sessionFromToken, setupCode, throttleKey } from "@/server/auth";
 import { env, setEnvForTests, type Env } from "@/server/env";
-import { MAX_BODY, parseBody, rateLimited, resetRateLimitsForTests, sameOrigin } from "@/server/http";
+import { MAX_BODY, parseBody, rateLimited, resetRateLimitsForTests, sameOrigin, withAdmin } from "@/server/http";
 import { updateSettings } from "@/server/settings";
 import { POST as loginPost } from "../../app/api/admin/login/route";
 import { GET as liveGet } from "../../app/api/admin/live/route";
@@ -77,6 +77,23 @@ describe("login throttling", () => {
     expect((await loginPost(loginReq(PASSWORD, { cookie: forged }))).status).toBe(429);
   }, 120_000);
 
+  it("names both cookies __Host- over https, and reads only those names there", async () => {
+    await admin();
+    setEnvForTests({ publicUrl: "https://mesh.example.com" });
+    const ok = await loginPost(loginReq(PASSWORD));
+    expect(ok.status).toBe(200);
+    const [session, device] = ok.headers.getSetCookie();
+    expect(session).toMatch(/^__Host-opnmesh_session=[^;]+; Path=\/; HttpOnly; SameSite=Lax; Max-Age=\d+; Secure$/);
+    expect(device).toMatch(/^__Host-opnmesh_device=[^;]+; Path=\/; HttpOnly; SameSite=Strict; Max-Age=\d+; Secure$/);
+    expect(`${session} ${device}`).not.toMatch(/Domain=/i);
+    const value = (c: string) => c.split(";")[0]!.split("=").slice(1).join("=");
+    expect(deviceFromRequest(new Request("http://x/", { headers: { cookie: device!.split(";")[0]! } }))).not.toBeNull();
+    // A cookie under the old name, set before the upgrade, is simply not read.
+    expect(deviceFromRequest(new Request("http://x/", { headers: { cookie: `opnmesh_device=${value(device!)}` } }))).toBeNull();
+    const liveOld = await liveGet(new Request("http://controller.test/api/admin/live", { headers: { cookie: `opnmesh_session=${value(session!)}` } }));
+    expect(liveOld.status).toBe(401);
+  }, 60_000);
+
   it("groups addresses for throttling", () => {
     expect(throttleKey("2001:db8:0:1::5")).toBe("2001:db8:0:1::/64");
     expect(throttleKey("2001:0db8:0000:0001:aaaa:bbbb:cccc:dddd")).toBe("2001:db8:0:1::/64");
@@ -84,7 +101,19 @@ describe("login throttling", () => {
     expect(throttleKey("::ffff:192.0.2.1")).toBe("192.0.2.1");
     expect(throttleKey("192.0.2.1")).toBe("192.0.2.1");
     expect(throttleKey("direct")).toBe("direct");
+    // Text that is not an address shares one bucket, so varying it buys nothing.
+    for (const junk of ["unknown", "evil-1", "evil-2", "198.51.100.1:80", "[2001:db8::1]", "", "1.2.3.4\nforged"]) expect(throttleKey(junk), junk).toBe("invalid");
   });
+
+  it("does not let forwarded junk mint fresh allowances behind a proxy", async () => {
+    await admin();
+    setEnvForTests({ trustProxy: 1 });
+    for (let i = 0; i < 10; i++) {
+      expect((await loginPost(loginReq("wrong password", { "x-forwarded-for": `not-an-ip-${i}` }))).status).toBe(401);
+    }
+    expect((await loginPost(loginReq(PASSWORD, { "x-forwarded-for": "not-an-ip-99" }))).status).toBe(429);
+    expect((await loginPost(loginReq(PASSWORD, { "x-forwarded-for": "198.51.100.20" }))).status).toBe(200);
+  }, 60_000);
 
   it("limits current-password guesses on a stolen session", async () => {
     await admin();
@@ -148,6 +177,43 @@ describe("same-origin check", () => {
     expect(sameOrigin(post({ "sec-fetch-site": "cross-site" }))).toBe(false);
     expect(sameOrigin(post({ "sec-fetch-site": "same-site" }))).toBe(false);
   });
+});
+
+describe("admin wrapper", () => {
+  const handler = vi.fn(() => new Response("ran"));
+  const wrapped = withAdmin(handler);
+  const call = (method: string, headers: Record<string, string>) => wrapped(new Request("http://controller.test/api/admin/anything", { method, headers: { host: "controller.test", ...headers } }));
+  beforeEach(() => handler.mockClear());
+
+  it("answers HEAD without running the handler", async () => {
+    await admin();
+    const cookie = `opnmesh_session=${await login("admin@example.com", PASSWORD)}`;
+    const r = await call("HEAD", { cookie });
+    expect(r.status).toBe(405);
+    expect(r.headers.get("allow")).toBe("GET");
+    expect((await call("HEAD", {})).status).toBe(405);
+    expect(handler).not.toHaveBeenCalled();
+    expect((await call("GET", { cookie })).status).toBe(200);
+    expect(handler).toHaveBeenCalledTimes(1);
+  }, 30_000);
+
+  it("refuses every method a browser marks as started by another site, and allows tools without the header", async () => {
+    await admin();
+    const cookie = `opnmesh_session=${await login("admin@example.com", PASSWORD)}`;
+    for (const site of ["cross-site", "same-site"]) {
+      for (const method of ["GET", "POST", "DELETE"]) {
+        const r = await call(method, { cookie, "sec-fetch-site": site });
+        expect(r.status, `${method} ${site}`).toBe(403);
+      }
+    }
+    expect(handler).not.toHaveBeenCalled();
+    // The dashboard itself, the address bar, and tools that send no such header.
+    expect((await call("GET", { cookie, "sec-fetch-site": "same-origin" })).status).toBe(200);
+    expect((await call("GET", { cookie, "sec-fetch-site": "none" })).status).toBe(200);
+    expect((await call("GET", { cookie })).status).toBe(200);
+    expect((await call("POST", { cookie })).status).toBe(200);
+    expect(handler).toHaveBeenCalledTimes(4);
+  }, 30_000);
 });
 
 describe("request bodies", () => {
@@ -262,6 +328,16 @@ describe("sealing secret", () => {
   it("is created on a fresh install", () => {
     expect(env().secret).toMatch(/^[0-9a-f]{64}$/);
     expect(existsSync(join(dir, "secret.key"))).toBe(true);
+    expect(readdirSync(dir).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("is created even when an earlier attempt crashed and left its temporary file", () => {
+    // The old name was built from the process id, which is always 1 in the container.
+    const stale = join(dir, `secret.key.${process.pid}.tmp`);
+    writeFileSync(stale, "half-written");
+    expect(env().secret).toMatch(/^[0-9a-f]{64}$/);
+    expect(readFileSync(join(dir, "secret.key"), "utf8").trim()).toBe(env().secret);
+    expect(readdirSync(dir).filter((f) => f.endsWith(".tmp"))).toEqual([`secret.key.${process.pid}.tmp`]);
   });
 
   it("is never silently replaced next to an existing database", () => {

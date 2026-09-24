@@ -272,9 +272,11 @@ export function peekInvite(token: string): { client: ClientRow } | { error: "inv
 /**
  * Consume an invite: marks it used so the link cannot be replayed. The
  * caller builds the config first; since rotating or disabling deletes the
- * link, a successful consume means that config is still the client's.
+ * link, a successful consume means that config is still the client's. The
+ * address that collected it goes into the audit log, so a link that leaked
+ * and was collected by someone else can be told apart.
  */
-export function consumeInvite(token: string): { client: ClientRow } | { error: "invalid" | "expired" | "used" } {
+export function consumeInvite(token: string, source = "unknown"): { client: ClientRow } | { error: "invalid" | "expired" | "used" } {
   const r = peekInvite(token);
   if ("error" in r) return r;
   const changed = getDb()
@@ -283,7 +285,7 @@ export function consumeInvite(token: string): { client: ClientRow } | { error: "
     .where(and(eq(invites.tokenHash, sha256Hex(token)), eq(invites.clientId, r.client.id), isNull(invites.usedAt), gte(invites.expiresAt, now())))
     .run().changes;
   if (changed !== 1) return { error: "used" };
-  logEvent("invite", `Invite link used for "${r.client.name}"`, { actor: "invite", subject: r.client.id });
+  logEvent("invite", `Invite link used for "${r.client.name}" from ${source}`, { actor: "invite", subject: r.client.id });
   return r;
 }
 

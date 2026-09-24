@@ -113,15 +113,34 @@ export function sameOrigin(req: Request): boolean {
   return o.protocol === pub.protocol && o.host === host.toLowerCase();
 }
 
+/**
+ * The admin API is only ever called by the dashboard itself. A browser marks
+ * a request that another site started (a link, a form, an image) as
+ * cross-site or same-site, and those are refused whatever the method, so a
+ * page elsewhere cannot make a signed-in browser download a backup or a
+ * client's config. Tools that send no Sec-Fetch-Site header are unaffected.
+ */
+function fromAnotherSite(req: Request): boolean {
+  const site = req.headers.get("sec-fetch-site");
+  return site === "cross-site" || site === "same-site";
+}
+
 type AdminHandler<P> = (req: Request, ctx: { params: P; admin: AdminSession }) => Promise<Response> | Response;
 
-/** Admin session required. Mutating requests must come from the same origin. */
+/**
+ * Admin session required. Mutating requests must come from the same origin.
+ * Next answers HEAD by running GET and dropping the body unread, which would
+ * leave a backup copy or a live-stream slot behind, so HEAD is refused
+ * without running anything.
+ */
 export function withAdmin<P = Record<string, never>>(fn: AdminHandler<P>) {
   return async (req: Request, ctx?: { params: Promise<P> }): Promise<Response> => {
     try {
+      if (req.method === "HEAD") return new Response(null, { status: 405, headers: { Allow: "GET", "Cache-Control": "no-store" } });
+      if (fromAnotherSite(req)) return json({ error: "cross-site request refused" }, 403);
       const admin = sessionFromToken(tokenFromRequest(req));
       if (!admin) return json({ error: "sign in required" }, 401);
-      if (req.method !== "GET" && req.method !== "HEAD" && !sameOrigin(req)) return json({ error: "cross-origin request refused" }, 403);
+      if (req.method !== "GET" && !sameOrigin(req)) return json({ error: "cross-origin request refused" }, 403);
       const params = (ctx ? await ctx.params : {}) as P;
       return await fn(req, { params, admin });
     } catch (e) {
@@ -195,6 +214,11 @@ function evictBuckets(t: number): void {
     if (buckets.size <= MAX_BUCKETS * 0.9) break;
     buckets.delete(k);
   }
+}
+
+/** True the first time `key` is seen in each window: for audit entries that would otherwise repeat on every request. */
+export function firstInWindow(key: string, windowMs: number): boolean {
+  return !rateLimited(key, 1, windowMs);
 }
 
 export function resetRateLimitsForTests(): void {

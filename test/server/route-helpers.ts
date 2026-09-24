@@ -5,7 +5,7 @@
 import { getDb } from "@/db";
 import { sessions, users } from "@/db/schema";
 import { generateKeyPair, randomId, randomToken, sha256Hex } from "@/core/crypto";
-import { SESSION_COOKIE } from "@/server/auth";
+import { sessionCookieName } from "@/server/auth";
 import { now } from "@/server/env";
 import { addLan, createEnrolToken, createSite, enrolGateway, getSite, updateGateway, type SiteWithRelations } from "@/server/sites";
 
@@ -30,7 +30,7 @@ export function adminHeaders(): Record<string, string> {
     .insert(sessions)
     .values({ id: sha256Hex(token), userId, createdAt: t, lastSeenAt: t, expiresAt: t + 3_600_000 })
     .run();
-  return { cookie: `${SESSION_COOKIE}=${token}` };
+  return { cookie: `${sessionCookieName()}=${token}` };
 }
 
 export const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
