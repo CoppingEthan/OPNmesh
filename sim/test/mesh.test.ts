@@ -179,6 +179,10 @@ describe("OPNmesh four-site simulation", () => {
     expect(logC).not.toContain("10.0.1.20 - -");
   }, T);
 
+  // The controller prefixes gateway-reported check ids with "agent:"; the
+  // assertions below use the ids the agent itself sends.
+  const agentIds = (d: any) => ({ ...d, agent: d.agent.map((c: any) => ({ ...c, id: String(c.id).replace(/^agent:/, "") })) });
+
   it("health checks pass at every site and catch a missing router route", async () => {
     const run = async (id: string) => {
       await must("POST", `/api/admin/sites/${id}/diagnostics`, {});
@@ -186,7 +190,7 @@ describe("OPNmesh four-site simulation", () => {
         "gateway answered the health checks",
         async () => {
           const d = await must<any>("GET", `/api/admin/sites/${id}/diagnostics`);
-          return d.pending ? null : d;
+          return d.pending ? null : agentIds(d);
         },
         { timeoutMs: 90_000, intervalMs: 2000 },
       );
@@ -388,7 +392,7 @@ describe("OPNmesh four-site simulation", () => {
         `gateway ${key} answered the health checks`,
         async () => {
           const r = await must<any>("GET", `/api/admin/sites/${sites[key].id}/diagnostics`);
-          return r.pending ? null : r;
+          return r.pending ? null : agentIds(r);
         },
         { timeoutMs: 90_000, intervalMs: 2000 },
       );
