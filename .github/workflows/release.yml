@@ -134,6 +134,9 @@ jobs:
             docker run --rm --platform "$platform" -w /app/public/dl "$IMAGE" \
               sha256sum opnmesh-gw-linux-amd64 opnmesh-gw-linux-arm64 | diff -u "$SUMS" -
             echo "$platform: /dl matches SHA256SUMS"
+            # Docker cannot pull another platform under a digest it already
+            # holds ("cannot overwrite digest"), so drop it before the next.
+            docker image rm "$IMAGE" >/dev/null
           done
 
   attest:
