@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { freshDb } from "./helpers";
 import { AuthError, changePassword, completeSetup, login, logout, needsSetup, requestSource, sessionCookie, sessionFromToken, setupCode, tokenFromRequest } from "@/server/auth";
 import { proxyHops, setEnvForTests } from "@/server/env";
@@ -76,6 +76,26 @@ describe("client address behind reverse proxies", () => {
     expect(requestSource(withXff("203.0.113.99, 198.51.100.7, 192.0.2.10"))).toBe("198.51.100.7");
     // Fewer entries than proxies: the leftmost is the best there is.
     expect(requestSource(withXff("198.51.100.7"))).toBe("198.51.100.7");
+  });
+
+  it("keeps only a valid address: ports and brackets dropped, anything else one shared source", () => {
+    setEnvForTests({ trustProxy: 1 });
+    expect(requestSource(withXff("198.51.100.7:51234"))).toBe("198.51.100.7");
+    expect(requestSource(withXff("[2001:DB8::7]:443"))).toBe("2001:db8::7");
+    expect(requestSource(withXff("[2001:db8::7]"))).toBe("2001:db8::7");
+    expect(requestSource(withXff("2001:db8::7"))).toBe("2001:db8::7");
+    expect(requestSource(withXff("::ffff:198.51.100.7"))).toBe("::ffff:198.51.100.7");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      for (const junk of ["a\u001b[31mb\u0085", "unknown", "_hidden", "evil.example", "198.51.100.7:http", "999.1.1.1", "[198.51.100.7]x", "1.2.3.4 5.6.7.8"]) {
+        expect(requestSource(withXff(junk)), junk).toBe("invalid");
+      }
+      // Logged once per process, not once per request.
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]![0])).not.toMatch(/\p{Cc}/u);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("reads the proxy count leniently", () => {
