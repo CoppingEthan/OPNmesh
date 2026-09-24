@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strconv"
@@ -23,7 +24,11 @@ func isManagedFile(name string) bool {
 	return false
 }
 
-func runCmd(name string, args ...string) (string, error) {
+// runCmd runs a command and returns its combined output. It is a variable so
+// the tests can stand in for the host's tools.
+var runCmd = runCommand
+
+func runCommand(name string, args ...string) (string, error) {
 	out, err := exec.Command(name, args...).CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
@@ -31,63 +36,132 @@ func runCmd(name string, args ...string) (string, error) {
 	return string(out), nil
 }
 
+// wgEntry is one line of a WireGuard config that matters, read the way
+// wg-quick and validateWireGuard read it: everything from '#' is a comment,
+// and section names and keys are compared without regard to case.
+type wgEntry struct {
+	section string // "interface", "peer", or "" before any section or in an unknown one
+	start   bool   // the line opens a section; key and value are empty
+	line    string // the line without its comment, trimmed
+	key     string // lower case
+	value   string
+}
+
+func wgEntries(conf string) []wgEntry {
+	var out []wgEntry
+	section := ""
+	for _, raw := range strings.Split(conf, "\n") {
+		line, key, value, hasEq := splitWgLine(raw)
+		switch {
+		case line == "":
+		case strings.HasPrefix(line, "["):
+			switch asciiLower(line) {
+			case "[interface]":
+				section = "interface"
+			case "[peer]":
+				section = "peer"
+			default:
+				section = ""
+			}
+			out = append(out, wgEntry{section: section, start: true, line: line})
+		case hasEq:
+			out = append(out, wgEntry{section: section, line: line, key: asciiLower(key), value: value})
+		}
+	}
+	return out
+}
+
+// wgPeer is one [Peer] section: its key, endpoint and every AllowedIPs item
+// in order.
+type wgPeer struct {
+	PublicKey  string
+	Endpoint   string
+	AllowedIPs []string
+}
+
+func wgPeers(conf string) []wgPeer {
+	var peers []wgPeer
+	var cur *wgPeer
+	for _, e := range wgEntries(conf) {
+		if e.start {
+			cur = nil
+			if e.section == "peer" {
+				peers = append(peers, wgPeer{})
+				cur = &peers[len(peers)-1]
+			}
+			continue
+		}
+		if cur == nil {
+			continue
+		}
+		switch e.key {
+		case "publickey":
+			cur.PublicKey = e.value
+		case "endpoint":
+			cur.Endpoint = e.value
+		case "allowedips":
+			for _, item := range strings.Split(e.value, ",") {
+				if item = strings.Trim(item, " \t"); item != "" {
+					cur.AllowedIPs = append(cur.AllowedIPs, item)
+				}
+			}
+		}
+	}
+	return peers
+}
+
 // interfaceSection returns the [Interface] block with comments stripped, so
 // a peers-only change can be told apart from one that needs a restart.
 func interfaceSection(conf string) string {
 	var lines []string
-	in := false
-	for _, raw := range strings.Split(conf, "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "[Interface]" {
-			in = true
-			continue
-		}
-		if strings.HasPrefix(line, "[") {
-			in = false
-			continue
-		}
-		if in && line != "" && !strings.HasPrefix(line, "#") {
-			lines = append(lines, line)
+	for _, e := range wgEntries(conf) {
+		if e.section == "interface" && !e.start {
+			lines = append(lines, e.line)
 		}
 	}
 	return strings.Join(lines, "\n")
 }
 
-func confValue(conf, key string) string {
-	for _, raw := range strings.Split(conf, "\n") {
-		line := strings.TrimSpace(raw)
-		if strings.HasPrefix(line, key) {
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) == 2 && strings.TrimSpace(parts[0]) == key {
-				return strings.TrimSpace(parts[1])
-			}
+// interfaceValue returns the first value of key (lower case) in [Interface].
+func interfaceValue(conf, key string) string {
+	for _, e := range wgEntries(conf) {
+		if e.section == "interface" && e.key == key {
+			return e.value
 		}
 	}
 	return ""
 }
 
 func listenPortOf(conf string) int {
-	p, _ := strconv.Atoi(confValue(conf, "ListenPort"))
+	p, _ := strconv.Atoi(interfaceValue(conf, "listenport"))
 	return p
 }
 
-// allowedPrefixes collects every AllowedIPs prefix, normalised the way
+// routeForm writes an IPv4 AllowedIPs item the way `ip route` prints it: a
+// /32 as the bare address, a network in its canonical form. IPv6 items and
+// anything unparseable are left out (the routes here are IPv4 only).
+func routeForm(item string) (string, bool) {
+	if a, err := netip.ParseAddr(item); err == nil && a.Is4() {
+		return a.String(), true
+	}
+	p, err := netip.ParsePrefix(item)
+	if err != nil || !p.Addr().Is4() {
+		return "", false
+	}
+	if p.Bits() == 32 {
+		return p.Addr().String(), true
+	}
+	return p.Masked().String(), true
+}
+
+// allowedPrefixes collects every IPv4 AllowedIPs prefix, normalised the way
 // `ip route` prints them (a /32 becomes the bare address).
 func allowedPrefixes(conf string) map[string]bool {
 	out := map[string]bool{}
-	for _, raw := range strings.Split(conf, "\n") {
-		line := strings.TrimSpace(raw)
-		if !strings.HasPrefix(line, "AllowedIPs") {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		for _, p := range strings.Split(parts[1], ",") {
-			prefix := strings.TrimSuffix(strings.TrimSpace(p), "/32")
-			if prefix != "" {
-				out[prefix] = true
+	for _, p := range wgPeers(conf) {
+		for _, item := range p.AllowedIPs {
+			if r, ok := routeForm(item); ok {
+				out[r] = true
 			}
 		}
 	}
@@ -98,27 +172,20 @@ func allowedPrefixes(conf string) map[string]bool {
 // by generation the peer's own tunnel address — for latency probes.
 func peerTunnelIPs(conf string) map[string]string {
 	out := map[string]string{}
-	var key string
-	for _, raw := range strings.Split(conf, "\n") {
-		line := strings.TrimSpace(raw)
-		switch {
-		case line == "[Peer]":
-			key = ""
-		case strings.HasPrefix(line, "PublicKey"):
-			key = confValue(line, "PublicKey")
-		case strings.HasPrefix(line, "AllowedIPs") && key != "":
-			first := strings.TrimSpace(strings.SplitN(strings.SplitN(line, "=", 2)[1], ",", 2)[0])
-			ip := strings.TrimSuffix(first, "/32")
-			if !strings.Contains(ip, "/") {
-				out[key] = ip
-			}
-			key = ""
+	for _, p := range wgPeers(conf) {
+		if p.PublicKey == "" || len(p.AllowedIPs) == 0 {
+			continue
+		}
+		if ip, ok := routeForm(p.AllowedIPs[0]); ok && !strings.Contains(ip, "/") {
+			out[p.PublicKey] = ip
 		}
 	}
 	return out
 }
 
-func udpPortFree(port int) bool {
+// udpPortFree reports whether nothing on this host holds the UDP port. A
+// variable so the tests do not depend on the ports free where they run.
+var udpPortFree = func(port int) bool {
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
 	if err != nil {
 		return false
@@ -128,7 +195,8 @@ func udpPortFree(port int) bool {
 }
 
 func wgInterfaceExists(iface string) bool {
-	return exec.Command("wg", "show", iface).Run() == nil
+	_, err := runCmd("wg", "show", iface)
+	return err == nil
 }
 
 func wgQuickUp(confPath string) error {
@@ -143,9 +211,9 @@ func wgQuickDown(confPath string) error {
 
 // privateKeyPathOf extracts the key path from the sanctioned PostUp line.
 func privateKeyPathOf(conf string) string {
-	for _, raw := range strings.Split(conf, "\n") {
-		if _, key, value, _ := splitWgLine(raw); asciiLower(key) == "postup" {
-			if m := allowedPostUp.FindStringSubmatch(value); m != nil {
+	for _, e := range wgEntries(conf) {
+		if e.section == "interface" && e.key == "postup" {
+			if m := allowedPostUp.FindStringSubmatch(e.value); m != nil {
 				return m[1]
 			}
 		}
@@ -254,6 +322,9 @@ func parseRoutes(jsonText string) ([]ipRoute, error) {
 // routePlan decides which routes to add and delete so the interface carries
 // exactly the AllowedIPs prefixes, leaving the kernel's connected route
 // alone and not duplicating prefixes it already covers (as wg-quick does).
+// A default route on the interface is never desired (AllowedIPs may not hold
+// one), so it is always deleted: it would send the host's internet traffic
+// into the mesh.
 func routePlan(desired map[string]bool, current []ipRoute) (add, del []string) {
 	var connected []*net.IPNet
 	managed := map[string]bool{}
@@ -264,10 +335,11 @@ func routePlan(desired map[string]bool, current []ipRoute) (add, del []string) {
 			}
 			continue
 		}
-		if r.Dst == "default" {
-			continue
+		dst := r.Dst
+		if dst == "default" {
+			dst = "0.0.0.0/0"
 		}
-		managed[r.Dst] = true
+		managed[dst] = true
 	}
 	for p := range desired {
 		if managed[p] {
@@ -308,23 +380,28 @@ func maskLen(n *net.IPNet) int {
 	return ones
 }
 
+// reconcileRoutes deletes the stale routes first, then adds the missing
+// ones, and carries on past a failure so one bad route neither leaves stale
+// ones behind nor keeps the others from being added. The first error is
+// returned.
 func reconcileRoutes(iface, conf string) error {
 	current, err := listRoutes(iface)
 	if err != nil {
 		return err
 	}
 	add, del := routePlan(allowedPrefixes(conf), current)
-	for _, p := range add {
-		if _, err := runCmd("ip", "-4", "route", "add", withPrefix(p), "dev", iface); err != nil {
-			return err
-		}
-	}
+	var firstErr error
 	for _, p := range del {
-		if _, err := runCmd("ip", "-4", "route", "del", withPrefix(p), "dev", iface); err != nil {
-			return err
+		if _, err := runCmd("ip", "-4", "route", "del", withPrefix(p), "dev", iface); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
-	return nil
+	for _, p := range add {
+		if _, err := runCmd("ip", "-4", "route", "add", withPrefix(p), "dev", iface); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // --- wg show dump ------------------------------------------------------------

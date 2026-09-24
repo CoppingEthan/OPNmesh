@@ -158,20 +158,24 @@ func cmdRun(args []string, once bool) error {
 	// again until applyRetryAfter has passed or the controller changes it.
 	failedHash := ""
 	var failedAt time.Time
-	rr := newReresolver()
-	var lastBringUp time.Time
+	keeper := newTunnelKeeper()
+	// One client, and so one transport and its connections, for the life of
+	// the loop; each tick takes a copy carrying the token read afresh.
+	var base *Client
 
 	for {
 		// Keep the tunnel up from the files on disk whether or not the
 		// controller can be reached (opnmesh-wg.service may not have run,
 		// DNS may have been down at boot, a public address may have moved).
-		maintainTunnel(cfg, rr, &lastBringUp)
+		keeper.maintain(cfg)
 		token, err := cfg.token()
+		if err == nil && base == nil {
+			base, err = newClient(cfg, "")
+		}
 		if err != nil {
 			logf("%v", err)
-		} else if client, err := newClient(cfg, token); err != nil {
-			logf("%v", err)
 		} else {
+			client := base.withToken(token)
 			resp, err := client.SendTelemetry(collectReport(cfg, started, appliedHash, lastError))
 			if err == nil && failures > 0 {
 				logf("controller reachable again after %d failed report(s)", failures)
@@ -196,7 +200,7 @@ func cmdRun(args []string, once bool) error {
 				logf("this gateway is disabled in the OPNmesh UI")
 			case resp.ConfigHash != "" && resp.ConfigHash != appliedHash:
 				if resp.IntervalSeconds > 0 {
-					interval = time.Duration(resp.IntervalSeconds) * time.Second
+					interval = boundedInterval(resp.IntervalSeconds)
 				}
 				if resp.ConfigHash == failedHash && time.Since(failedAt) < applyRetryAfter {
 					// This exact configuration already failed here (and was rolled
@@ -222,7 +226,7 @@ func cmdRun(args []string, once bool) error {
 				}
 			default:
 				if resp.IntervalSeconds > 0 {
-					interval = time.Duration(resp.IntervalSeconds) * time.Second
+					interval = boundedInterval(resp.IntervalSeconds)
 				}
 			}
 			if err == nil && resp.Status == "active" {
@@ -240,13 +244,25 @@ func cmdRun(args []string, once bool) error {
 // The longest wait between reports while the controller keeps failing.
 const maxReportBackoff = time.Minute
 
+// The longest interval the controller may ask for. The number comes from
+// the network: unbounded, seconds*time.Second overflows into a negative
+// duration and the jitter's rand.Int63n panics, taking the agent down.
+const maxReportInterval = 300
+
+// boundedInterval turns a number of seconds from the controller into an
+// interval of 1 to maxReportInterval seconds.
+func boundedInterval(seconds int) time.Duration {
+	seconds = max(1, min(seconds, maxReportInterval))
+	return time.Duration(seconds) * time.Second
+}
+
 // reportInterval turns a configured number of seconds into an interval,
 // defaulting to five seconds when nothing sensible is configured.
 func reportInterval(seconds int) time.Duration {
 	if seconds < 1 {
 		seconds = 5
 	}
-	return time.Duration(seconds) * time.Second
+	return boundedInterval(seconds)
 }
 
 // backoffInterval is the wait after a run of failed reports: the configured

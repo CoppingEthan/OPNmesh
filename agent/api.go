@@ -56,6 +56,17 @@ func newClient(cfg Config, token string) (*Client, error) {
 	}, nil
 }
 
+// withToken returns a client that sends token and shares this one's
+// connections. The run loop builds one client and takes a copy per tick, so
+// the token file is re-read each time without a new transport (and a new
+// TLS connection, left idle for 90 seconds) every tick. Each copy is its own
+// value, so a health-check run still sending with one is never raced.
+func (c *Client) withToken(token string) *Client {
+	cp := *c
+	cp.token = token
+	return &cp
+}
+
 // refuseRedirect stops every redirect. The controller never redirects the
 // agent's API, and following one could carry the gateway token to another
 // host or down to plain http.
@@ -199,11 +210,12 @@ func (c *Client) Enrol(req EnrolRequest) (EnrolResponse, error) {
 
 // --- configuration ---------------------------------------------------------
 
+// ConfigMeta is the part of the controller's metadata the agent uses. The
+// listen port and private-key path it also sends are read from the checked
+// wireguard.conf instead, never from here.
 type ConfigMeta struct {
 	InterfaceName            string `json:"interfaceName"`
-	ListenPort               int    `json:"listenPort"`
 	NeedsReresolve           bool   `json:"needsReresolve"`
-	PrivateKeyPath           string `json:"privateKeyPath"`
 	TelemetryIntervalSeconds int    `json:"telemetryIntervalSeconds"`
 	SiteSlug                 string `json:"siteSlug"`
 }

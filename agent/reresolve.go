@@ -2,7 +2,6 @@ package main
 
 import (
 	"net"
-	"strings"
 	"time"
 )
 
@@ -30,25 +29,11 @@ type hostnamePeer struct {
 // IP literal, in config order.
 func hostnamePeers(conf string) []hostnamePeer {
 	var out []hostnamePeer
-	var key, endpoint string
-	flush := func() {
-		if key != "" && endpoint != "" && endpointIsHostname(endpoint) {
-			out = append(out, hostnamePeer{PublicKey: key, Endpoint: endpoint})
-		}
-		key, endpoint = "", ""
-	}
-	for _, raw := range strings.Split(conf, "\n") {
-		line := strings.TrimSpace(raw)
-		switch {
-		case strings.HasPrefix(line, "["):
-			flush()
-		case strings.HasPrefix(line, "PublicKey"):
-			key = confValue(line, "PublicKey")
-		case strings.HasPrefix(line, "Endpoint"):
-			endpoint = confValue(line, "Endpoint")
+	for _, p := range wgPeers(conf) {
+		if p.PublicKey != "" && endpointIsHostname(p.Endpoint) {
+			out = append(out, hostnamePeer{PublicKey: p.PublicKey, Endpoint: p.Endpoint})
 		}
 	}
-	flush()
 	return out
 }
 

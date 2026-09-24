@@ -1,7 +1,15 @@
 package main
 
 import (
+	"fmt"
+	"math"
+	"math/rand"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -115,6 +123,163 @@ func TestRoutePlan(t *testing.T) {
 	if strings.Join(add, ",") != "10.99.0.0/16" {
 		t.Errorf("wider prefix should be added: %v", add)
 	}
+	// A default route on the mesh interface is never desired, so it goes,
+	// in a form `ip route del` takes.
+	_, del = routePlan(desired, append(current, ipRoute{Dst: "default", Protocol: "boot"}))
+	if strings.Join(del, ",") != "0.0.0.0/0,10.50.0.0/24" {
+		t.Errorf("a stale default route must be deleted: del = %v", del)
+	}
+}
+
+func TestParsersReadLikeWgQuick(t *testing.T) {
+	// Lower- and upper-case names and inline comments, as wg-quick and the
+	// validator accept them.
+	conf := "[interface]\n" +
+		"address = 10.99.0.1/24\n" +
+		"listenport = 51821 # moved\n" +
+		"POSTUP = wg set %i private-key /etc/opnmesh/private.key # own key\n" +
+		"\n[PEER]\n" +
+		"publickey = " + testKey + " # office\n" +
+		"endpoint = office.example.com:51820 # dynamic DNS\n" +
+		"allowedips = 10.99.0.2/32, 192.168.20.0/24 # tunnel and LAN\n" +
+		"AllowedIPs = fd00::/64\n"
+	if err := validateWireGuard(conf, "/etc/opnmesh"); err != nil {
+		t.Fatalf("the validator must accept what the parsers read: %v", err)
+	}
+	if p := listenPortOf(conf); p != 51821 {
+		t.Errorf("listen port: %d", p)
+	}
+	if p := privateKeyPathOf(conf); p != "/etc/opnmesh/private.key" {
+		t.Errorf("key path: %q", p)
+	}
+	if got := allowedPrefixes(conf); len(got) != 2 || !got["10.99.0.2"] || !got["192.168.20.0/24"] {
+		t.Errorf("allowed prefixes (IPv4 only, comment dropped): %v", got)
+	}
+	if got := peerTunnelIPs(conf); got[testKey] != "10.99.0.2" {
+		t.Errorf("tunnel ips: %v", got)
+	}
+	if got := hostnamePeers(conf); len(got) != 1 || got[0].PublicKey != testKey || got[0].Endpoint != "office.example.com:51820" {
+		t.Errorf("hostname peers: %+v", got)
+	}
+	if sec := interfaceSection(conf); strings.Contains(sec, "#") || !strings.Contains(sec, "listenport = 51821") {
+		t.Errorf("interface section: %q", sec)
+	}
+	// A comment is not a change that needs the interface rebuilt.
+	if interfaceSection(conf) != interfaceSection(strings.Replace(conf, "# moved", "# moved again", 1)) {
+		t.Error("a comment edit changed the interface section")
+	}
+	// Keys in the wrong section are not read as the interface's.
+	if p := listenPortOf("[Peer]\nListenPort = 1\n"); p != 0 {
+		t.Errorf("listen port from [Peer]: %d", p)
+	}
+	// Malformed files on disk are read without panicking.
+	for _, bad := range []string{"[Peer]\nPublicKey = x\nAllowedIPs\n", "AllowedIPs =\n", "[Peer]\nAllowedIPs = ,\n"} {
+		_ = peerTunnelIPs(bad)
+		_ = allowedPrefixes(bad)
+		_ = hostnamePeers(bad)
+	}
+}
+
+func TestBoundedIntervals(t *testing.T) {
+	s := time.Second
+	cases := map[int]time.Duration{math.MaxInt: 300 * s, math.MaxInt64 / 2: 300 * s, 301: 300 * s, 300: 300 * s, 30: 30 * s, 1: s, 0: s, -7: s, math.MinInt: s}
+	for in, want := range cases {
+		got := boundedInterval(in)
+		if got != want {
+			t.Errorf("boundedInterval(%d) = %s, want %s", in, got, want)
+		}
+		// The jitter the run loop draws must never panic.
+		_ = rand.Int63n(int64(got/5) + 1)
+	}
+	if reportInterval(math.MaxInt) != 300*s || reportInterval(0) != 5*s {
+		t.Error("reportInterval must be bounded too")
+	}
+}
+
+func TestProbeMTU(t *testing.T) {
+	cases := map[int]int{0: 1420, -1: 1420, 1: 576, 27: 576, 1280: 1280, 1420: 1420, 9001: 9000, math.MaxInt: 9000}
+	for in, want := range cases {
+		if got := probeMTU(in); got != want {
+			t.Errorf("probeMTU(%d) = %d, want %d", in, got, want)
+		}
+	}
+	for _, payload := range []int{-1, -28, math.MaxInt32} {
+		if _, err := icmpEcho("127.0.0.1", payload, true, time.Millisecond); err == nil {
+			t.Errorf("icmpEcho accepted a %d-byte payload", payload)
+		}
+	}
+}
+
+func TestDiagnosticsRunOneAtATime(t *testing.T) {
+	var busy atomic.Bool
+	release, finished := make(chan struct{}), make(chan struct{})
+	if !startExclusive(&busy, func() { <-release; close(finished) }) {
+		t.Fatal("the first run did not start")
+	}
+	if startExclusive(&busy, func() { t.Error("a second run started while the first was going") }) {
+		t.Fatal("startExclusive reported starting a second run")
+	}
+	close(release)
+	<-finished
+	for i := 0; busy.Load() && i < 1000; i++ {
+		time.Sleep(time.Millisecond)
+	}
+	ran := make(chan struct{})
+	if !startExclusive(&busy, func() { close(ran) }) {
+		t.Fatal("a run could not start after the previous one finished")
+	}
+	<-ran
+
+	// While a run is going, a new request is left for later, not marked seen.
+	diagRunning.Store(true)
+	defer diagRunning.Store(false)
+	last := ""
+	dispatchDiagnostics(Config{}, nil, TelemetryResponse{Actions: []DiagAction{{Type: "diagnose", Request: DiagRequest{ID: "req-2"}}}}, &last)
+	if last != "" {
+		t.Fatalf("request %q was taken while a run was in progress", last)
+	}
+}
+
+func TestClientReusesConnections(t *testing.T) {
+	var conns atomic.Int32
+	var mu sync.Mutex
+	var tokens []string
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		mu.Unlock()
+		fmt.Fprint(w, `{"status":"active"}`)
+	}))
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	base, err := newClient(Config{ControllerURL: srv.URL, InsecureHTTP: true}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 5 {
+		c := base.withToken(fmt.Sprintf("token-%d", i))
+		if c.http != base.http {
+			t.Fatal("a per-tick client must share the loop's http.Client")
+		}
+		if _, err := c.SendTelemetry(Report{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := conns.Load(); n != 1 {
+		t.Errorf("5 reports opened %d connections, want 1", n)
+	}
+	if strings.Join(tokens, ",") != "Bearer token-0,Bearer token-1,Bearer token-2,Bearer token-3,Bearer token-4" {
+		t.Errorf("tokens sent: %v", tokens)
+	}
+	if base.token != "" {
+		t.Error("withToken changed the shared client")
+	}
 }
 
 func TestParseRoutes(t *testing.T) {
@@ -191,7 +356,9 @@ func TestValidInterfaceName(t *testing.T) {
 			t.Errorf("%q should be valid", ok)
 		}
 	}
-	for _, bad := range []string{"", "0abc", "toolongname12345", "has space", "../x", "Upper"} {
+	// Names whose WireGuard file (<name>.conf) would overwrite another
+	// managed file are reserved.
+	for _, bad := range []string{"", "0abc", "toolongname12345", "has space", "../x", "Upper", "nftables", "sysctl", "wireguard"} {
 		if validInterfaceName(bad) {
 			t.Errorf("%q should be invalid", bad)
 		}
