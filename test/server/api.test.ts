@@ -101,7 +101,9 @@ describe("gateway lifecycle through the API", () => {
 
     const tok = await (await tokenPost(req("POST", `/api/admin/sites/${site.id}/enrol-token`, {}, asAdmin()), params({ id: site.id }))).json();
     expect(tok.command).toContain("curl -fsSL http://controller.test/install.sh");
-    expect(tok.command).toContain(`--token ${tok.token}`);
+    // The token reaches the installer in a private file, never on a command line.
+    expect(tok.command).toContain(`printf '%s\\n' '${tok.token}' > "$t"`);
+    expect(tok.command).toContain('--token-file "$t"');
     expect(tok.command).toContain("--insecure-http");
     expect(tok.installScriptSha256).toMatch(/^[a-f0-9]{64}$/);
 
