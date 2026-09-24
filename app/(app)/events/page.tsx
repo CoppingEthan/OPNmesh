@@ -2,6 +2,7 @@ import Link from "next/link";
 import { requireAdmin } from "@/server/session";
 import { listEvents } from "@/server/events";
 import { Badge, Card, PageHeader, Table, Td, Th, type Tone } from "@/ui/components";
+import { eventHref } from "@/ui/event-link";
 import { dateTime } from "@/ui/format";
 
 export const dynamic = "force-dynamic";
@@ -47,22 +48,31 @@ export default async function EventsPage({ searchParams }: { searchParams: Promi
                 </Td>
               </tr>
             )}
-            {rows.map((e) => (
-              <tr key={e.id}>
-                <Td className="whitespace-nowrap text-xs text-ink-3">{dateTime(e.ts)}</Td>
-                <Td>
-                  <div className="flex items-start gap-2">
-                    <Badge tone={KIND_TONE[e.kind] ?? "info"} className="mt-0.5 shrink-0">
-                      {e.kind}
-                    </Badge>
-                    <span className="text-ink">
-                      {e.subject && e.kind !== "login" ? <Link href={["site", "lan", "gateway", "enrol", "unifi", "apply-error"].includes(e.kind) ? `/sites/${e.subject}` : `/clients/${e.subject}`} className="hover:underline">{e.message}</Link> : e.message}
-                    </span>
-                  </div>
-                </Td>
-                <Td className="text-xs text-ink-2">{e.actor}</Td>
-              </tr>
-            ))}
+            {rows.map((e) => {
+              const href = eventHref(e);
+              return (
+                <tr key={e.id}>
+                  <Td className="whitespace-nowrap text-xs text-ink-3">{dateTime(e.ts)}</Td>
+                  <Td>
+                    <div className="flex items-start gap-2">
+                      <Badge tone={KIND_TONE[e.kind] ?? "info"} className="mt-0.5 shrink-0">
+                        {e.kind}
+                      </Badge>
+                      <span className="text-ink">
+                        {href ? (
+                          <Link href={href} className="hover:underline">
+                            {e.message}
+                          </Link>
+                        ) : (
+                          e.message
+                        )}
+                      </span>
+                    </div>
+                  </Td>
+                  <Td className="text-xs text-ink-2">{e.actor}</Td>
+                </tr>
+              );
+            })}
           </tbody>
         </Table>
         {rows.length === 100 && last && (
