@@ -280,7 +280,11 @@ A client is a WireGuard peer that belongs to a person, not a site.
   A client has at most one link. A new link replaces the old one, and the
   link is cancelled by *Cancel link*, by rotating keys, and by disabling or
   deleting the client. A link that cannot be served (client disabled, config
-  on hold) is not used up.
+  on hold) is not used up. Before collection the link reveals only the
+  client's name; the address that collected it goes into the event log.
+  The QR code on the client page loads only when the admin asks for it, and
+  every fetch of a config or QR code is logged (once per client, session and
+  kind every ten minutes), since each carries the private key.
 - **DNS**: optional. A site can declare a DNS server; clients get it in their
   config with the site's search domain. No DNS proxying in 2.0.
 
@@ -756,7 +760,9 @@ before the email is sent, so overlapping passes cannot send twice. A failed
 send restores the old state and is retried after a minute, backing off to an
 hour. Send failures are written to the event log. A "send a test email"
 button exercises the real path. Without TLS on connect the server must
-offer STARTTLS; the password is never sent unencrypted.
+offer STARTTLS; the password is never sent unencrypted. Changing the server,
+port or username clears the saved password unless a new one is given in the
+same save, so the old password is never sent to a new server.
 
 ### 11.2c Adaptive reporting
 
@@ -917,7 +923,7 @@ Sign-in throttling:
 - The limit is 10 failures per client per 15 minutes, where an IPv6 client
   counts by its /64, plus a global cap of 100.
 - A successful sign-in sets a device cookie. It is HMAC-signed with the
-  server secret, sent only to the sign-in endpoint, and gives that browser
+  server secret, read only by the sign-in endpoint, and gives that browser
   its own bucket outside the global cap. Junk from many addresses therefore
   cannot lock the admin out of a browser they already use. A new browser can
   still be refused while such an attack runs.
@@ -931,13 +937,21 @@ Sign-in throttling:
 The client address comes from `X-Forwarded-For` only when
 `OPNMESH_TRUST_PROXY` says how many reverse proxies are in front, and is
 counted from the right of that header, so an address a client adds itself
-is never used.
+is never used. The chosen entry must be an IP address (a port or IPv6
+brackets are dropped); anything else counts as one shared source, `invalid`,
+so varying text cannot buy fresh sign-in attempts.
 
 Every mutation must carry an `Origin` equal to the public URL, or to the host
 the request was addressed to with the public URL's scheme.
 `X-Forwarded-Host` counts only behind a configured proxy. A request without
-`Origin` is refused when `Sec-Fetch-Site` marks it cross-site. Cookies are
-HttpOnly and SameSite, and the usual security headers are set everywhere.
+`Origin` is refused when `Sec-Fetch-Site` marks it cross-site. The admin API
+goes further: whatever the method, it refuses a request the browser marks as
+`cross-site` or `same-site`, so a link or image on another page cannot make a
+signed-in browser download a backup or a client's config (tools that send
+no such header are unaffected). It answers `HEAD` with 405 without running
+anything. Cookies are HttpOnly and SameSite; over HTTPS they carry the
+`__Host-` prefix (Secure, whole host, no Domain), so a neighbouring subdomain
+cannot plant or shadow them. The usual security headers are set everywhere.
 
 Request bodies are capped at 1 MB while they stream in, so a chunked upload
 is never buffered first. The live event stream re-checks its session every
@@ -958,7 +972,13 @@ backup page says so. The controller refuses to start when `secret.key` is
 missing next to an existing database, or is empty or truncated, rather than
 generating a new one that could not open anything already stored.
 `OPNMESH_SECRET` must be at least 32 characters. The key file is written
-atomically, and the data directory is kept at mode 0700.
+atomically (a randomly named temporary file, fsynced, renamed, then the
+directory fsynced), and the data directory is kept at mode 0700.
+
+A database backup is written by `VACUUM INTO` to a temporary directory,
+opened, and deleted at once; the download streams from the open file, so no
+copy stays on disk however the request ends. One backup runs at a time, and
+copies left by a controller that stopped mid-backup are removed at start.
 
 ### 12.5 Gateway hardening
 
@@ -991,6 +1011,11 @@ and the image all come from that release. To upgrade, set the new version in
 `docker compose pull && docker compose up -d`. Backup is the
 `/opt/opnmesh/data` directory (or the database download in Settings, which
 is consistent while the controller runs) plus `.env`.
+
+On SIGTERM (`docker stop`) or SIGINT the controller stops its background
+jobs, ends open live streams so the HTTP server can close, checkpoints and
+closes the database, and exits with status 0; if a request still holds it
+after five seconds, it closes the database and exits anyway.
 
 To run it behind a reverse proxy you already operate instead of the
 bundled Caddy, use `deploy/controller/external-proxy/` and
