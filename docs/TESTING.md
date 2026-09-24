@@ -15,6 +15,7 @@ containers exactly as on a real VM); in CI it means GitHub's Ubuntu runners.
 | Go agent | `npm run agent:test` | `golang` container | seconds |
 | Production build + UI smoke | `npm run ui:test` | host or container | ~2 min |
 | Simulation | `npm run sim:up && npm run sim:test` | Docker compose, Ubuntu 24.04 images | ~5–10 min |
+| Controller installer | the `installer` job in `.github/workflows/ci.yml` | CI | ~1 min |
 | Deployment smoke | `deploy/controller/install.sh` + `scripts/deploy-smoke.mjs` | CI (a Linux host with Docker) | ~5 min |
 
 `npm run check` runs typecheck, lint, unit and Go; `npm run check:full` adds
@@ -109,7 +110,8 @@ controller runs as the image's unprivileged user against a bind-mounted data
 directory; and the gateway installer downloads the agent over that TLS. CI
 therefore builds the image, runs the real `deploy/controller/install.sh`
 against it on the runner (with `OPNMESH_RAW_BASE` pointed at the checkout so
-the compose file and Caddyfile come from the branch under test), and then
+the compose file and Caddyfile come from the branch under test, and
+`OPNMESH_FILE_SUMS` at their checksums, which a release would publish), and then
 `scripts/deploy-smoke.mjs` checks the first-install flow end to end: the CA
 root appears where the compose file expects it, `/api/admin/setup` answers
 over TLS signed by that CA, `/ca.crt` serves the same root, the controller
@@ -137,21 +139,78 @@ The controller's containers run on the same host throughout, which proves the
 gateway firewall leaves container bridges alone. Only use `--gateway-test`
 on a disposable machine.
 
+## The controller installer
+
+The `installer` CI job runs `deploy/controller/install.sh` with `--no-start`
+the way a one-line install does: from main, against the release it names.
+It checks that:
+
+- the release's compose file and Caddyfile match the SHA-256 the installer
+  carries;
+- `.env` pins the image by the digest that release's tag resolves to, and
+  both `.env.example` files pin the same image;
+- a file whose SHA-256 does not match is refused and nothing of it is kept;
+- a `--domain` or `--url` that is not a plain host name (a brace, a path,
+  `http://`, a bad port, an IPv6 literal, `10.0.0.256`) is refused before
+  anything on the machine changes.
+
+The installer's gateway counterpart is covered in
+`test/server/install-command.test.ts`, which runs the printed commands in a
+real shell with stand-ins for `curl` and `sudo`.
+
 ## Releasing
 
 1. Bump `version` in `package.json` and `package-lock.json`, commit, and
    wait for CI to pass on main.
-2. Tag the commit `vX.Y.Z` and push the tag. The release workflow publishes
-   the image and the agent binaries; `latest` moves only for stable
-   versions.
-3. Once the image is published, point the controller installer at it: set
-   `VERSION` in `deploy/controller/install.sh` and `OPNMESH_IMAGE` in both
-   `deploy/controller/.env.example` files, and commit that to main. This
-   step must come after the release exists: the one-line install fetches
-   the installer from main, and the installer then fetches the release's
-   files and image.
+2. Tag the commit `vX.Y.Z` and push the tag. The release workflow
+   (`.github/workflows/release.yml`) then:
+   - builds the agent binaries once, with the newest Go 1.27 patch release,
+     and runs `govulncheck` in binary mode on them;
+   - builds the multi-arch image around those same files (they replace the
+     Dockerfile's `agent` stage) and checks that both platforms' images
+     serve exactly them at `/dl`;
+   - signs build provenance for the image and both binaries (the only job
+     that can mint the OIDC token for it runs no repository code);
+   - publishes the GitHub release: the binaries, `SHA256SUMS`,
+     `controller-files.sha256` (the deployment files at this tag) and notes
+     that give the image's digest and the lines for step 3.
+
+   `latest` moves only for stable versions.
+3. Once the release is published, point the controller installer at it.
+   The release notes list the exact values:
+   - in `deploy/controller/install.sh`: `RELEASE`, `RELEASE_IMAGE_DIGEST`
+     and `RELEASE_FILE_SUMS` (the `docker-compose.yml` and `Caddyfile` lines
+     of `controller-files.sha256`);
+   - in both `deploy/controller/.env.example` files: `OPNMESH_IMAGE`, the
+     image by version and digest (`ghcr.io/coppingethan/opnmesh:X.Y.Z@sha256:…`).
+
+   Check the digest before committing, then commit to main:
+
+   ```bash
+   gh attestation verify oci://ghcr.io/coppingethan/opnmesh:X.Y.Z --repo CoppingEthan/OPNmesh
+   docker buildx imagetools inspect ghcr.io/coppingethan/opnmesh:X.Y.Z   # Digest: must match
+   ```
+
+   This step must come after the release exists: the one-line install
+   fetches the installer from main, and the installer then fetches the
+   release's files (refusing any whose SHA-256 differs) and pins its image
+   by digest. CI's `installer` job runs that path against the release the
+   installer names and fails if the files, the image digest or the
+   `.env.example` pins disagree with it.
 4. Upgrade a controller, then upgrade its gateways with the command shown
    on each site page, and check the dashboard.
+
+To verify a published release from anywhere (the image, and a binary
+downloaded from the release page):
+
+```bash
+gh attestation verify oci://ghcr.io/coppingethan/opnmesh:X.Y.Z --repo CoppingEthan/OPNmesh
+gh attestation verify opnmesh-gw-linux-amd64 --repo CoppingEthan/OPNmesh
+sha256sum -c SHA256SUMS
+```
+
+Releases up to 2.1.2 predate the attestations and `controller-files.sha256`;
+the installer carries 2.1.2's checksums and digest itself.
 
 ## Conventions
 
