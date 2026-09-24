@@ -79,12 +79,19 @@ describe("held configurations", () => {
     const bad = addLan(office.site.id, { cidr: "10.99.1.0/24", name: "Clash" });
     expect(getGenerated().findings.some((f) => f.level === "error")).toBe(true);
 
-    for (const t of [dc, office]) {
+    for (const [t, where] of [
+      [dc, "overlap at another site"],
+      [office, "overlap at this site"],
+    ] as const) {
       const r = await agentConfig(t.token);
       expect(r.status).toBe(409);
       const body = await r.json();
       expect(body.status).toBe("held");
-      expect(body.error).toContain("overlaps the client range");
+      // The gateway hears what kind of error holds it and where, not the
+      // admin's message, which names the other site and its networks.
+      expect(body.error).toContain(where);
+      expect(body.error).toContain("OPNmesh UI");
+      for (const secret of ["Office", "10.99.1.0", "Clash"]) expect(body.error).not.toContain(secret);
       // No new hash is advertised, so the agent keeps what it runs and does not ask.
       expect((await report(t.token)).configHash).toBe("");
     }
@@ -116,7 +123,11 @@ describe("held configurations", () => {
     const { dc, office, open, restricted } = mesh();
     getDb().update(settings).set({ mtu: 9000 }).run();
     bumpConfigVersion();
-    for (const t of [dc, office]) expect((await agentConfig(t.token)).status).toBe(409);
+    for (const t of [dc, office]) {
+      const r = await agentConfig(t.token);
+      expect(r.status).toBe(409);
+      expect((await r.json()).error).toContain("(mtu-range in the network settings)");
+    }
     for (const c of [open, restricted]) expect((await clientConf(c.id)).status).toBe(409);
     expect(Object.keys(getGenerated().held.gateways)).toHaveLength(2);
     expect(getSite(dc.site.id)!.gateway!.status).toBe("active");

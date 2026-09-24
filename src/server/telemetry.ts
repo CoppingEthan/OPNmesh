@@ -9,14 +9,17 @@
  * A gateway token is only trusted for the gateway's own view: a report keeps
  * only the peers and counters that gateway's generated config defines, at
  * the rate the gateway was asked to report, so one compromised gateway can
- * neither fill the disk nor speak for another site.
+ * neither fill the disk nor speak for another site. Whether a report will be
+ * kept is decided before it is read (admitTelemetry), so reporting too often
+ * does not even cost the controller the parsing.
  */
 import { and, gte, lt, sql } from "drizzle-orm";
 import { getDb } from "@/db";
 import { pair1h, pair1m, pair5s, telemetry1h, telemetry1m, telemetry5s } from "@/db/schema";
 import type { GatewayRow } from "@/db/schema";
+import { nftIdent, parsePairCounter } from "@/core/generate/nftables";
 import { logEvent } from "./events";
-import { HANDSHAKE_SKEW_MS, liveState, type CounterReport, type PeerReport, type TelemetryReport } from "./live";
+import { HANDSHAKE_SKEW_MS, cleanAgentText, cleanEndpoint, liveState, type CounterReport, type PeerReport, type TelemetryReport } from "./live";
 import { recordClientHandshake } from "./clients";
 import { hostAddresses, recordGatewayReport } from "./sites";
 import { getGenerated, type Reportable } from "./snapshot";
@@ -34,33 +37,50 @@ export const APPLY_ERROR_LOG_GAP_MS = 5 * 60_000;
 /** A gateway whose addresses keep changing gets one audit event per this long; its row always has the latest. */
 export const ADDRESS_LOG_GAP_MS = 5 * 60_000;
 
-/** Control and bidi-override characters, which could forge lines or reorder text in the UI and log. */
-const UNPRINTABLE_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]+/g;
-
 export function cleanAgentError(s: string): string {
-  return s.replace(UNPRINTABLE_RE, " ").trim().slice(0, 500);
+  return cleanAgentText(s, 500);
 }
 
 /**
  * The part of a report this gateway may speak for: its own peers and
- * counters, each once, and no handshake from the future.
+ * counters, each once, and no handshake from the future. Its words are
+ * cleaned, and a peer endpoint that is not an address and port is dropped.
  */
 export function ownReport(report: TelemetryReport, own: Reportable | undefined, at: number): TelemetryReport {
   const latest = Math.floor((at + HANDSHAKE_SKEW_MS) / 1000);
   const peers = new Map<string, PeerReport>();
   for (const p of report.peers) {
     if (!own?.peers.has(p.publicKey) || peers.has(p.publicKey)) continue;
-    peers.set(p.publicKey, p.latestHandshake > latest ? { ...p, latestHandshake: 0 } : p);
+    peers.set(p.publicKey, { ...p, endpoint: cleanEndpoint(p.endpoint), latestHandshake: p.latestHandshake > latest ? 0 : p.latestHandshake });
   }
   const counters = new Map<string, CounterReport>();
   for (const c of report.counters) {
     if (own?.counters.has(c.name) && !counters.has(c.name)) counters.set(c.name, c);
   }
-  return { ...report, lastError: cleanAgentError(report.lastError), peers: [...peers.values()], counters: [...counters.values()] };
+  return {
+    ...report,
+    version: cleanAgentText(report.version, 32),
+    lastError: cleanAgentError(report.lastError),
+    peers: [...peers.values()],
+    counters: [...counters.values()],
+    host: { ...report.host, kernel: cleanAgentText(report.host.kernel, 64) },
+  };
 }
 
-export function ingestTelemetry(gw: GatewayRow, raw: TelemetryReport): IngestOutcome {
-  const t = now();
+export interface Admission {
+  /** What the gateway is told, whether or not its report is kept. */
+  outcome: IngestOutcome;
+  /** Whether the report may be stored (see LiveState.admitReport). */
+  admitted: boolean;
+}
+
+/**
+ * The answer to a report from this gateway, and whether the report will be
+ * kept. It does not depend on the report, so it is decided before the body
+ * is read. Call once per report: each call spends one of the gateway's
+ * allowance when it admits.
+ */
+export function admitTelemetry(gw: GatewayRow, t = now()): Admission {
   const gen = getGenerated();
   const state = liveState();
   // While someone is watching the overview, one report a second makes the
@@ -70,8 +90,22 @@ export function ingestTelemetry(gw: GatewayRow, raw: TelemetryReport): IngestOut
   const configHash = gen.held.gateways[gw.id] !== undefined ? "" : (gen.bundle.gateways[gw.id]?.hash ?? "");
   // The agent waits at least the interval between reports. One that comes
   // much sooner still gets its answer, so the agent carries on, but is not kept.
-  if (!state.admitReport(gw.id, t, (intervalSeconds * 1000) / 2)) return { configHash, intervalSeconds };
+  const admitted = state.admitReport(gw.id, t, (intervalSeconds * 1000) / 2);
+  return { outcome: { configHash, intervalSeconds }, admitted };
+}
 
+/** Admit and, when admitted, store one report. */
+export function ingestTelemetry(gw: GatewayRow, raw: TelemetryReport): IngestOutcome {
+  const t = now();
+  const { outcome, admitted } = admitTelemetry(gw, t);
+  if (admitted) storeTelemetry(gw, raw, t);
+  return outcome;
+}
+
+/** Keep a report that admitTelemetry admitted at `t`. */
+export function storeTelemetry(gw: GatewayRow, raw: TelemetryReport, t: number): void {
+  const gen = getGenerated();
+  const state = liveState();
   const report = ownReport(raw, gen.reportable[gw.id], t);
   const { live, hasRates } = state.ingest(gw.id, gw.siteId, report, t);
 
@@ -123,20 +157,19 @@ export function ingestTelemetry(gw: GatewayRow, raw: TelemetryReport): IngestOut
           .onConflictDoNothing()
           .run();
       }
+      // Site pairs only; the clients' counters are live figures, not history.
       for (const c of report.counters) {
         const bps = live.counterRates.get(c.name);
         if (bps === undefined) continue;
-        const m = /^c_(.+)_to_(.+)$/.exec(c.name);
-        if (!m) continue;
+        const pair = parsePairCounter(c.name);
+        if (!pair) continue;
         tx.insert(pair5s)
-          .values({ ts: t, gatewayId: gw.id, fromSlug: m[1]!, toSlug: m[2]!, bytes: c.bytes, bps })
+          .values({ ts: t, gatewayId: gw.id, fromSlug: pair.from, toSlug: pair.to, bytes: c.bytes, bps })
           .onConflictDoNothing()
           .run();
       }
     });
   }
-
-  return { configHash, intervalSeconds };
 }
 
 // ---------------------------------------------------------------------------
@@ -307,15 +340,21 @@ export interface PairPoint {
   bps: number;
 }
 
-/** Routed bytes/s from one site slug to another over a range, max across reporting gateways. */
+/**
+ * Routed bytes/s from one site slug to another over a range, max across
+ * reporting gateways. History is kept under the counters' form of the slug
+ * ("branch_office" for "branch-office"), so the slugs are looked up in that form.
+ */
 export function pairSeries(fromSlug: string, toSlug: string, range: Range, at = now()): PairPoint[] {
   const db = getDb();
   const since = at - RANGE_MS[range];
   const table = range === "1h" || range === "6h" ? pair5s : range === "30d" || range === "1y" ? pair1h : pair1m;
+  const from = nftIdent(fromSlug);
+  const to = nftIdent(toSlug);
   const rows = db
     .select({ ts: table.ts, bps: sql<number>`MAX(${table.bps})` })
     .from(table)
-    .where(and(sql`${table.fromSlug} = ${fromSlug}`, sql`${table.toSlug} = ${toSlug}`, gte(table.ts, since), lt(table.ts, at + 1)))
+    .where(and(sql`${table.fromSlug} = ${from}`, sql`${table.toSlug} = ${to}`, gte(table.ts, since), lt(table.ts, at + 1)))
     .groupBy(table.ts)
     .orderBy(table.ts)
     .all();

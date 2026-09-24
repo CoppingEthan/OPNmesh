@@ -18,7 +18,7 @@ import { formatIpv4, isHostname, parseIpv4 } from "@/core/ip";
 import { endpointOf, isReachable, listenPortOf, meshSites, mtuOf, pairStatus, type MeshSite } from "@/core/topology";
 import { now } from "./env";
 import { logEvent } from "./events";
-import { liveState } from "./live";
+import { cleanAgentText, liveState } from "./live";
 import { getSettings, publicUrl } from "./settings";
 import { getSite } from "./sites";
 import { getGenerated } from "./snapshot";
@@ -58,20 +58,58 @@ export interface AgentDiagRequest {
   endpointHosts: Array<{ host: string; label: string }>;
 }
 
+/**
+ * How much of a gateway's check is kept. The agent builds ids and titles
+ * from what it tested, e.g. "dns:" and a peer's host name of up to 253
+ * characters, so these are generous, and longer text is cut, not refused:
+ * one long name must not cost the whole report.
+ */
+const CHECK_LIMITS = { id: 300, title: 300, detail: 2000, hint: 2000 } as const;
+
+/** Prefix for the ids of the gateway's checks, which the controller's own never use. */
+export const AGENT_CHECK_PREFIX = "agent:";
+
+/** As received; agentChecks makes a report's checks fit to show. The bounds only stop absurd input. */
 export const checkResultSchema = z.object({
-  id: z.string().min(1).max(80),
+  id: z.string().min(1).max(4 * CHECK_LIMITS.id),
   status: z.enum(["pass", "warn", "fail", "skip"]),
-  title: z.string().min(1).max(200),
-  detail: z.string().max(2000).default(""),
-  hint: z.string().max(2000).optional(),
+  title: z.string().min(1).max(4 * CHECK_LIMITS.title),
+  detail: z.string().max(4 * CHECK_LIMITS.detail).default(""),
+  hint: z.string().max(4 * CHECK_LIMITS.hint).optional(),
 });
 
 export const agentDiagReportSchema = z.object({
   id: z.string().min(1).max(40),
   ranAt: z.number().int().min(0),
-  checks: z.array(checkResultSchema).max(200),
+  checks: z.array(checkResultSchema).max(500),
 });
 export type AgentDiagReport = z.infer<typeof agentDiagReportSchema>;
+
+/**
+ * The gateway's checks as they are stored and shown: text cleaned like any
+ * other text from a gateway and cut to length, and ids that begin "agent:"
+ * so they never meet the controller's own, made unique within the report.
+ * Applying it twice changes nothing, so reports stored before it existed
+ * are brought into line when read.
+ */
+export function agentChecks(checks: CheckResult[]): CheckResult[] {
+  const seen = new Set<string>();
+  return checks.map((c) => {
+    const raw = cleanAgentText(c.id, CHECK_LIMITS.id) || "check";
+    const base = (raw.startsWith(AGENT_CHECK_PREFIX) ? raw : AGENT_CHECK_PREFIX + raw).slice(0, CHECK_LIMITS.id);
+    let id = base;
+    for (let n = 2; seen.has(id); n++) id = `${base.slice(0, CHECK_LIMITS.id - 6)}#${n}`;
+    seen.add(id);
+    const hint = c.hint === undefined ? "" : cleanAgentText(c.hint, CHECK_LIMITS.hint);
+    return {
+      id,
+      status: c.status,
+      title: cleanAgentText(c.title, CHECK_LIMITS.title) || "Check from the gateway",
+      detail: cleanAgentText(c.detail, CHECK_LIMITS.detail),
+      ...(hint ? { hint } : {}),
+    };
+  });
+}
 
 export interface SiteDiagnostics {
   requestedAt: number | null;
@@ -123,6 +161,25 @@ function isPending(gw: GatewayRow, at: number): boolean {
   return gw.diagRequestedAt !== null && (gw.diagAt === null || gw.diagAt < gw.diagRequestedAt) && at - gw.diagRequestedAt < AGENT_WAIT_MS;
 }
 
+/**
+ * How long after a request its answer is still taken. The request is handed
+ * out for two minutes and even a large mesh's checks finish within a couple
+ * more; this only bounds how long an unanswered request lets a gateway send
+ * answers.
+ */
+export const AGENT_ANSWER_WINDOW_MS = 10 * 60_000;
+
+/**
+ * Whether this gateway has a request to answer: it is active, a run was
+ * asked for recently, and it has not answered yet. Checked before its
+ * answer is even read.
+ */
+export function awaitingAgentReport(gw: GatewayRow, at = now()): boolean {
+  if (gw.status !== "active" || gw.diagRequestedAt === null) return false;
+  if (gw.diagAt !== null && gw.diagAt >= gw.diagRequestedAt) return false;
+  return at - gw.diagRequestedAt < AGENT_ANSWER_WINDOW_MS;
+}
+
 /** The request to hand a gateway with its telemetry response, if one is outstanding. */
 export function pendingAgentRequest(gw: GatewayRow, at = now()): AgentDiagRequest | null {
   if (!isPending(gw, at)) return null;
@@ -164,18 +221,18 @@ export function buildAgentRequest(gw: GatewayRow, id: string): AgentDiagRequest 
 
 /**
  * Keep the gateway's answer. Returns false unless the gateway is active and
- * this answers the request it was given, once: a report nobody asked for, or
- * one for an older or already answered request, is not kept.
+ * this answers the request it was given, once and in time: a report nobody
+ * asked for, or one for an older or already answered request, is not kept.
+ * What is kept is cleaned first (see agentChecks).
  */
-export function storeAgentReport(gw: GatewayRow, report: AgentDiagReport): boolean {
-  if (gw.status !== "active" || gw.diagRequestedAt === null) return false;
-  if (report.id !== String(gw.diagRequestedAt)) return false;
-  if (gw.diagAt !== null && gw.diagAt >= gw.diagRequestedAt) return false;
+export function storeAgentReport(gw: GatewayRow, report: AgentDiagReport, at = now()): boolean {
+  if (!awaitingAgentReport(gw, at) || report.id !== String(gw.diagRequestedAt)) return false;
+  const kept: AgentDiagReport = { ...report, checks: agentChecks(report.checks) };
   // Conditional on the request still being the one answered, in case a new run was asked for meanwhile.
   const r = getDb()
     .update(gateways)
-    .set({ diagJson: JSON.stringify(report), diagAt: now() })
-    .where(and(eq(gateways.id, gw.id), eq(gateways.diagRequestedAt, gw.diagRequestedAt)))
+    .set({ diagJson: JSON.stringify(kept), diagAt: at })
+    .where(and(eq(gateways.id, gw.id), eq(gateways.diagRequestedAt, gw.diagRequestedAt!)))
     .run();
   return r.changes === 1;
 }
@@ -352,7 +409,7 @@ export async function siteDiagnostics(siteId: string, at = now()): Promise<SiteD
     pending: gw ? isPending(gw, at) : false,
     agentUnanswered: unanswered && at - (requestedAt ?? at) >= AGENT_WAIT_MS,
     controller,
-    agent: agent?.checks ?? [],
+    agent: agentChecks(agent?.checks ?? []),
   };
 }
 

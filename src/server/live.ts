@@ -6,7 +6,41 @@
  * Rates are computed here rather than on the gateway so the agent stays
  * stateless: it sends cumulative counters, the controller differences them.
  */
+import { isIPv4, isIPv6 } from "node:net";
 import { z } from "zod";
+
+/** Control and bidi-override characters, which could forge lines or reorder text in the UI and log. */
+const UNPRINTABLE_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]+/g;
+
+/**
+ * Free text from a gateway, made fit to store and show: no control or bidi
+ * characters, trimmed, at most `max` characters. Everything a gateway says
+ * in words goes through this: errors, versions, health-check results.
+ */
+export function cleanAgentText(s: string, max: number): string {
+  return s.replace(UNPRINTABLE_RE, " ").trim().slice(0, max);
+}
+
+const ENDPOINT_RE = /^(?:(\d{1,3}(?:\.\d{1,3}){3})|\[([0-9A-Fa-f:.]{2,45})(?:%[A-Za-z0-9_.-]{1,32})?\]):(\d{1,5})$/;
+
+/**
+ * A peer endpoint as `wg show dump` prints it, `ip:port` or `[ipv6]:port`,
+ * or null. Anything else is dropped rather than refused: the endpoint is
+ * only ever shown, and an agent's report is worth keeping without it.
+ */
+export function cleanEndpoint(ep: string | null): string | null {
+  const m = ep === null ? null : ENDPOINT_RE.exec(ep);
+  if (!m) return null;
+  const port = Number(m[3]);
+  const ipOk = m[1] !== undefined ? isIPv4(m[1]) : isIPv6(m[2]!);
+  return ipOk && port >= 1 && port <= 65535 ? ep : null;
+}
+
+/** A configuration hash as the agent reports it: SHA-256 in lowercase hex, or empty when it has none. */
+const hashSchema = z
+  .string()
+  .regex(/^(?:[0-9a-f]{64})?$/, "must be a SHA-256 hex digest")
+  .default("");
 
 export const peerReportSchema = z.object({
   publicKey: z.string().min(40).max(48),
@@ -26,8 +60,8 @@ export const pairReportSchema = z.object({
 export const telemetrySchema = z.object({
   version: z.string().max(32).default(""),
   uptimeSeconds: z.number().int().min(0).default(0),
-  appliedHash: z.string().max(64).default(""),
-  diskHash: z.string().max(64).default(""),
+  appliedHash: hashSchema,
+  diskHash: hashSchema,
   lastError: z.string().max(2000).default(""),
   interfaceUp: z.boolean().default(true),
   peers: z.array(peerReportSchema).max(1000).default([]),

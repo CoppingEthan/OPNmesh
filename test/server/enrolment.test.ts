@@ -11,7 +11,7 @@ import { enrolTokens, gateways } from "@/db/schema";
 import { generateKeyPair, sha256Hex } from "@/core/crypto";
 import { createClient } from "@/server/clients";
 import { resetRateLimitsForTests } from "@/server/http";
-import { addLan, createEnrolToken, createSite, enrolGateway, getSite, updateGateway, SiteError, type EnrolRequest } from "@/server/sites";
+import { addLan, createEnrolToken, createSite, enrolGateway, getSite, removeGateway, updateGateway, SiteError, type EnrolRequest } from "@/server/sites";
 import { POST as enrolPost } from "../../app/api/agent/enrol/route";
 import { POST as tokenPost } from "../../app/api/admin/sites/[id]/enrol-token/route";
 
@@ -71,6 +71,20 @@ describe("public keys", () => {
     const again = enrolGateway(request(createEnrolToken(a.id).token, { publicKey: key, hostname: "rebuilt" }));
     expect(again.ok).toBe(true);
     expect(getSite(a.id)!.gateway!.hostname).toBe("rebuilt");
+  });
+
+  it("refuses a key that `wg` would refuse, even one a lenient decoder reads as 32 bytes", async () => {
+    const s = site();
+    const { token } = createEnrolToken(s.id);
+    const good = generateKeyPair().publicKey;
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const sloppy = `${good.slice(0, 42)}${alphabet[alphabet.indexOf(good[42]!) + 1]}=`;
+    expect(Buffer.from(sloppy, "base64")).toHaveLength(32);
+    const res = await enrolPost(req("POST", "/api/agent/enrol", request(token, { publicKey: sloppy })));
+    expect(res.status).toBe(400);
+    expect((await res.json()).reason).toBe("bad-key");
+    expect(getSite(s.id)!.gateway).toBeNull();
+    expect(enrolGateway(request(token, { publicKey: good })).ok).toBe(true);
   });
 
   it("answers 409, not 500, when another enrolment takes the key first", async () => {
@@ -159,5 +173,76 @@ describe("enrolment tokens", () => {
     const rows = getDb().select().from(gateways).all();
     expect(rows.map((g) => g.hostname)).toEqual(["first"]);
     expect(getSite(s.id)!.gateway!.id).toBe(winner);
+  });
+});
+
+describe("tokens that need approval", () => {
+  it("cannot replace an active gateway, so the site stays in the mesh", async () => {
+    const s = site();
+    expect(enrolGateway(request(createEnrolToken(s.id).token, { hostname: "working" })).ok).toBe(true);
+    const working = getSite(s.id)!.gateway!;
+    const { token } = createEnrolToken(s.id, { autoApprove: false });
+
+    const res = await enrolPost(req("POST", "/api/agent/enrol", request(token, { hostname: "newcomer" })));
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ reason: "gateway-active", error: expect.stringContaining("remove the site's gateway") });
+    // Nothing changed: the working gateway is still the site's, still active, and the token is not spent.
+    expect(getSite(s.id)!.gateway).toEqual(working);
+    expect(unusedTokens(s.id)).toHaveLength(1);
+
+    // Once the admin removes the gateway on purpose, the same token enrols the newcomer for approval.
+    removeGateway(s.id);
+    expect(enrolGateway(request(token, { hostname: "newcomer" }))).toMatchObject({ ok: true, status: "pending" });
+    expect(getSite(s.id)!.gateway!.hostname).toBe("newcomer");
+  });
+
+  it("may replace a gateway that is not active", () => {
+    const s = site();
+    const pendingToken = () => createEnrolToken(s.id, { autoApprove: false }).token;
+    expect(enrolGateway(request(pendingToken(), { hostname: "first" }))).toMatchObject({ ok: true, status: "pending" });
+    expect(enrolGateway(request(pendingToken(), { hostname: "second" }))).toMatchObject({ ok: true, status: "pending" });
+    updateGateway(s.id, { status: "disabled" });
+    expect(enrolGateway(request(pendingToken(), { hostname: "third" }))).toMatchObject({ ok: true, status: "pending" });
+    expect(getSite(s.id)!.gateway!.hostname).toBe("third");
+    // A token that approves by itself still replaces an active gateway at once (a rebuilt VM).
+    updateGateway(s.id, { status: "active" });
+    expect(enrolGateway(request(createEnrolToken(s.id).token, { hostname: "rebuilt" }))).toMatchObject({ ok: true, status: "active" });
+    expect(getSite(s.id)!.gateway!.hostname).toBe("rebuilt");
+  });
+});
+
+describe("rate limits", () => {
+  const post = (body: unknown) => enrolPost(req("POST", "/api/agent/enrol", body));
+  const junk = () => enrolPost(new Request("http://controller.test/api/agent/enrol", { method: "POST", headers: { host: "controller.test" }, body: "not json" }));
+
+  it("junk from anyone cannot lock out a gateway with a usable token", async () => {
+    const s = site();
+    // Without a proxy every caller is the same source: this is everyone's allowance.
+    const statuses: number[] = [];
+    for (let i = 0; i < 15; i++) statuses.push((await junk()).status);
+    for (let i = 0; i < 15; i++) statuses.push((await post(request(`not-a-real-token-${i}-xxxxxxxx`))).status);
+    expect(statuses.slice(0, 15).every((x) => x === 400)).toBe(true);
+    expect(statuses.slice(15, 20).every((x) => x === 403)).toBe(true);
+    expect(statuses.slice(20).every((x) => x === 429)).toBe(true);
+    expect((await junk()).status).toBe(429);
+
+    expect((await post(request(createEnrolToken(s.id).token))).status).toBe(201);
+  });
+
+  it("limits the attempts made with one usable token, apart from other tokens", async () => {
+    const a = site("A");
+    const b = site("B");
+    const { token } = createEnrolToken(a.id);
+    for (let i = 0; i < 10; i++) expect((await post(request(token, { publicKey: "x".repeat(44) }))).status).toBe(400);
+    expect((await post(request(token))).status).toBe(429);
+    expect(unusedTokens(a.id)).toHaveLength(1);
+    expect((await post(request(createEnrolToken(b.id).token, { addresses: ["10.0.250.7"] }))).status).toBe(201);
+  });
+
+  it("refuses a body far larger than an enrolment", async () => {
+    const s = site();
+    const res = await post({ ...request(createEnrolToken(s.id).token), padding: "x".repeat(64 * 1024) });
+    expect(res.status).toBe(413);
+    expect(getSite(s.id)!.gateway).toBeNull();
   });
 });

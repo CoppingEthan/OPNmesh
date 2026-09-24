@@ -32,8 +32,11 @@ function setup() {
   return { dc: getSite(dc.id)!, office: getSite(office.id)!, client: getClient(client.id)! };
 }
 
+/** Some configuration other than the one generated. */
+const OTHER_HASH = "0".repeat(64);
+
 function report(partial: Partial<TelemetryReport> & { peers: TelemetryReport["peers"] }): TelemetryReport {
-  return telemetrySchema.parse({ version: "2.0.0", appliedHash: "h", diskHash: "h", ...partial });
+  return telemetrySchema.parse({ version: "2.0.0", appliedHash: OTHER_HASH, diskHash: OTHER_HASH, ...partial });
 }
 
 beforeEach(() => {
@@ -52,7 +55,7 @@ describe("ingest", () => {
     const gen = getGenerated();
     const gwDc = dc.gateway!;
     const officeKey = office.gateway!.publicKey;
-    const first = ingestTelemetry(gwDc, report({ peers: [{ publicKey: officeKey, endpoint: "203.0.113.20:51820", latestHandshake: Math.floor(now / 1000), rxBytes: 1000, txBytes: 2000, rttMs: 12 }], counters: [{ name: "c_dc_to_office", bytes: 500, packets: 5 }] }));
+    const first = ingestTelemetry(gwDc, report({ peers: [{ publicKey: officeKey, endpoint: "203.0.113.20:51820", latestHandshake: Math.floor(now / 1000), rxBytes: 1000, txBytes: 2000, rttMs: 12 }], counters: [{ name: "c2_dc_to_office", bytes: 500, packets: 5 }] }));
     expect(first.configHash).toBe(gen.bundle.gateways[gwDc.id]!.hash);
     expect(first.intervalSeconds).toBe(5);
     expect(getDb().select().from(telemetry5s).all()).toHaveLength(0); // no rate yet
@@ -60,10 +63,10 @@ describe("ingest", () => {
     liveState(); // same instance
     // 5 s later: 5000 more bytes received, 10000 sent.
     const at = tick(5000);
-    ingestTelemetry(gwDc, report({ peers: [{ publicKey: officeKey, endpoint: "203.0.113.20:51820", latestHandshake: Math.floor(now / 1000), rxBytes: 6000, txBytes: 12000, rttMs: 14 }], counters: [{ name: "c_dc_to_office", bytes: 5500, packets: 50 }] }));
+    ingestTelemetry(gwDc, report({ peers: [{ publicKey: officeKey, endpoint: "203.0.113.20:51820", latestHandshake: Math.floor(now / 1000), rxBytes: 6000, txBytes: 12000, rttMs: 14 }], counters: [{ name: "c2_dc_to_office", bytes: 5500, packets: 50 }] }));
     const live = liveState().get(gwDc.id)!;
     expect(live.peerRates.get(officeKey)).toEqual({ rxBps: 1000, txBps: 2000 });
-    expect(live.counterRates.get("c_dc_to_office")).toBe(1000);
+    expect(live.counterRates.get("c2_dc_to_office")).toBe(1000);
     const rows = getDb().select().from(telemetry5s).all();
     expect(rows).toHaveLength(1);
     expect(rows[0]!.rxBps).toBe(1000);
@@ -81,7 +84,7 @@ describe("ingest", () => {
 
     const view = gatewayView(getSite(dc.id)!.gateway!, "dc", live, first.configHash, at, 5);
     expect(view.health).toBe("online");
-    expect(view.attention).toBe("configuration change not yet applied"); // reported hash "h" ≠ desired
+    expect(view.attention).toBe("configuration change not yet applied"); // reported hash ≠ desired
   });
 
   it("marks gateways stale and offline as reports age", () => {

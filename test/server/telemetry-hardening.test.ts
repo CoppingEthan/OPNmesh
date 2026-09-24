@@ -17,8 +17,10 @@ import { createEnrolToken, createSite, addLan, enrolGateway, getSite, updateGate
 import { buildState } from "@/server/state";
 import { clientViews, pairRateViews } from "@/server/status";
 import { APPLY_ERROR_LOG_GAP_MS, ingestTelemetry, pairSeries } from "@/server/telemetry";
+import { clientCounterNames, pairCounterName } from "@/core/generate/nftables";
 import { POST as telemetryPost } from "../../app/api/agent/telemetry/route";
 import { GET as stateGet } from "../../app/api/admin/state/route";
+import { GET as trafficGet } from "../../app/api/admin/traffic/route";
 
 let now = 1_800_000_000_000;
 const sec = () => Math.floor(now / 1000);
@@ -57,9 +59,9 @@ describe("what a report may contain", () => {
       ingest(alpha, {
         peers: [peer(bravo.publicKey, bytes), peer(bravo.publicKey, 9e12), peer(charlie.publicKey, bytes), peer(client.publicKey, bytes), ...Array.from({ length: 500 }, (_, i) => peer(junkKey(i), bytes))],
         counters: [
-          { name: "c_alpha_to_bravo", bytes, packets: 1 },
-          { name: "c_alpha_to_bravo", bytes: 9e12, packets: 1 },
-          { name: "c_bravo_to_charlie", bytes, packets: 1 }, // alpha does not relay that pair
+          { name: "c5_alpha_to_bravo", bytes, packets: 1 },
+          { name: "c5_alpha_to_bravo", bytes: 9e12, packets: 1 },
+          { name: "c5_bravo_to_charlie", bytes, packets: 1 }, // alpha does not relay that pair
           ...Array.from({ length: 1000 }, (_, i) => ({ name: `c_junk${i}_to_x`, bytes, packets: 1 })),
         ],
       });
@@ -69,7 +71,7 @@ describe("what a report may contain", () => {
 
     const live = liveState().get(gatewayOf(alpha).id)!;
     expect(live.report.peers.map((p) => p.publicKey).sort()).toEqual([bravo.publicKey, charlie.publicKey, client.publicKey].sort());
-    expect(live.report.counters.map((c) => c.name)).toEqual(["c_alpha_to_bravo"]);
+    expect(live.report.counters.map((c) => c.name)).toEqual(["c5_alpha_to_bravo"]);
     expect(live.peerRates.get(bravo.publicKey)).toEqual({ rxBps: 1000, txBps: 1000 }); // the first copy, not the duplicate
     expect(getDb().select().from(telemetry5s).all()).toHaveLength(3);
     expect(getDb().select().from(pair5s).all().map((r) => `${r.fromSlug}>${r.toSlug}`)).toEqual(["alpha>bravo"]);
@@ -78,9 +80,9 @@ describe("what a report may contain", () => {
   it("lets no gateway speak for another site's traffic, live or in history", () => {
     const { alpha, bravo, charlie } = threeSites();
     for (const bytes of [0, 5_000_000]) {
-      ingest(alpha, { peers: [peer(bravo.publicKey, bytes)], counters: [{ name: "c_alpha_to_bravo", bytes: bytes / 1000, packets: 1 }] });
+      ingest(alpha, { peers: [peer(bravo.publicKey, bytes)], counters: [{ name: "c5_alpha_to_bravo", bytes: bytes / 1000, packets: 1 }] });
       // Charlie is not on the path between alpha and bravo, yet claims a huge flow.
-      ingest(charlie, { peers: [peer(alpha.publicKey, bytes)], counters: [{ name: "c_alpha_to_bravo", bytes: bytes * 100, packets: 1 }] });
+      ingest(charlie, { peers: [peer(alpha.publicKey, bytes)], counters: [{ name: "c5_alpha_to_bravo", bytes: bytes * 100, packets: 1 }] });
       now += 5000;
     }
     const gen = getGenerated();
@@ -89,6 +91,121 @@ describe("what a report may contain", () => {
     const rows = getDb().select().from(pair5s).all();
     expect(rows.map((r) => r.gatewayId)).toEqual([gatewayOf(alpha).id]);
     expect(pairSeries("alpha", "bravo", "1h", now).map((p) => p.bps)).toEqual([1000]);
+  });
+});
+
+describe("what a gateway says in words", () => {
+  it("is cleaned before it is kept or shown", () => {
+    const { alpha, bravo, client } = threeSites();
+    ingest(alpha, {
+      version: "2.1.0\u202e\n\u0000x",
+      host: { load1: null, memUsedPct: null, addresses: [], kernel: "6.8\r\nFORGED" },
+      peers: [peer(bravo.publicKey, 1), peer(client.publicKey, 1)],
+    });
+    const live = liveState().get(gatewayOf(alpha).id)!.report;
+    expect(live.version).toBe("2.1.0 x");
+    expect(gatewayOf(alpha).agentVersion).toBe("2.1.0 x");
+    expect(live.host.kernel).toBe("6.8 FORGED");
+  });
+
+  it("keeps a peer endpoint only when it is an address and a port", () => {
+    const { alpha, bravo, charlie, client } = threeSites();
+    const endpoints: Array<[string | null, string | null]> = [
+      ["203.0.113.5:51820", "203.0.113.5:51820"],
+      ["[2001:db8::1]:51820", "[2001:db8::1]:51820"],
+      ["[fe80::1%eth0]:51820", "[fe80::1%eth0]:51820"],
+      ["bravo.example.com:51820", null],
+      ["203.0.113.5", null],
+      ["203.0.113.5:0", null],
+      ["203.0.113.5:65536", null],
+      ["999.0.113.5:51820", null],
+      ["2001:db8::1:51820", null],
+      ["[2001:db8::zz]:51820", null],
+      ["203.0.113.5:51820\u202e", null],
+      [null, null],
+    ];
+    const peers = [bravo.publicKey, charlie.publicKey, client.publicKey];
+    for (let i = 0; i < endpoints.length; i += peers.length) {
+      const batch = endpoints.slice(i, i + peers.length);
+      now += 5000;
+      ingest(alpha, { peers: batch.map(([ep], j) => ({ ...peer(peers[j]!, 1), endpoint: ep })) });
+      const got = liveState().get(gatewayOf(alpha).id)!.report.peers;
+      batch.forEach(([ep, want], j) => expect(got.find((p) => p.publicKey === peers[j])!.endpoint, String(ep)).toBe(want));
+    }
+  });
+
+  it("refuses configuration hashes that are not SHA-256 hex", () => {
+    const hash = "ab".repeat(32);
+    expect(telemetrySchema.safeParse({ appliedHash: hash, diskHash: hash }).success).toBe(true);
+    expect(telemetrySchema.safeParse({ appliedHash: "", diskHash: "" }).success).toBe(true);
+    for (const bad of ["h", "AB".repeat(32), "ab".repeat(31), `${"ab".repeat(31)}a\n`, `${"ab".repeat(31)}zz`, "<b>".repeat(21)]) {
+      expect(telemetrySchema.safeParse({ appliedHash: bad }).success, bad).toBe(false);
+      expect(telemetrySchema.safeParse({ diskHash: bad }).success, bad).toBe(false);
+    }
+  });
+});
+
+describe("the telemetry route", () => {
+  const post = (token: string, body: string) =>
+    telemetryPost(new Request("http://controller.test/api/agent/telemetry", { method: "POST", headers: { host: "controller.test", ...bearer(token) }, body }));
+
+  it("reads a report only when it will be kept", async () => {
+    const { alpha } = threeSites();
+    // Bad bodies: the burst an agent may send at start is read (and refused),
+    // the rest come too soon to be kept, so they are answered without being read.
+    const statuses: number[] = [];
+    for (let i = 0; i < 10; i++) statuses.push((await post(alpha.token, "{not json")).status);
+    expect(statuses).toEqual([400, 400, 400, 200, 200, 200, 200, 200, 200, 200]);
+    const answer = await (await post(alpha.token, "{not json")).json();
+    expect(answer).toMatchObject({ status: "active", configHash: getGenerated().bundle.gateways[gatewayOf(alpha).id]!.hash, intervalSeconds: 5 });
+    // Once one is due again it is read.
+    now += 2500;
+    expect((await post(alpha.token, "{not json")).status).toBe(400);
+    now += 2500;
+    expect((await post(alpha.token, JSON.stringify({ version: "2.1.9" }))).status).toBe(200);
+    expect(liveState().get(gatewayOf(alpha).id)!.report.version).toBe("2.1.9");
+  });
+
+  it("does not read a report from a gateway that is not active", async () => {
+    const s = createSite({ name: "Branch" });
+    addLan(s.id, { cidr: "10.9.0.0/24", name: "LAN" });
+    const r = enrolGateway({ token: createEnrolToken(s.id, { autoApprove: false }).token, publicKey: generateKeyPair().publicKey, hostname: "b", os: "", arch: "", addresses: ["10.9.0.2"], agentVersion: "" });
+    if (!r.ok) throw new Error(r.reason);
+    const res = await post(r.gatewayToken, "{not json");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ status: "pending", configHash: "" });
+  });
+
+  it("refuses a body far larger than any report", async () => {
+    const { alpha } = threeSites();
+    const res = await post(alpha.token, JSON.stringify({ version: "2.1.0", padding: "x".repeat(600 * 1024) }));
+    expect(res.status).toBe(413);
+    // A report the size a large mesh sends is fine.
+    now += 5000;
+    const big = report({ peers: Array.from({ length: 800 }, (_, i) => peer(junkKey(i), 1e12)), counters: Array.from({ length: 2000 }, (_, i) => ({ name: `c11_branch_${String(i).padStart(4, "0")}_to_office`, bytes: 1e12, packets: 1e9 })) });
+    const body = JSON.stringify(big);
+    expect(body.length).toBeGreaterThan(256 * 1024);
+    expect((await post(alpha.token, body)).status).toBe(200);
+  });
+});
+
+describe("traffic history", () => {
+  it("is found for sites whose slug has a hyphen", async () => {
+    const { alpha } = threeSites();
+    const branch = meshSite("Branch Office", "10.4.0.0/24", "10.4.0.2", "branch.example.com", 4);
+    expect(branch.site.slug).toBe("branch-office");
+    const name = pairCounterName(branch.site, alpha.site);
+    const fromClients = clientCounterNames(branch.site).toSite;
+    for (const bytes of [0, 5000]) {
+      ingest(branch, { counters: [{ name, bytes, packets: 1 }, { name: fromClients, bytes, packets: 1 }] });
+      now += 5000;
+    }
+    expect(liveState().get(gatewayOf(branch).id)!.counterRates.get(fromClients)).toBe(1000);
+    expect(pairSeries("branch-office", "alpha", "1h", now).map((p) => p.bps)).toEqual([1000]);
+    const res = await trafficGet(req("GET", "/api/admin/traffic?range=1h&from=branch-office&to=alpha", undefined, adminHeaders()));
+    expect((await res.json()).points.map((p: { bps: number }) => p.bps)).toEqual([1000]);
+    // The clients' counters are live figures only and never mix with a site's history.
+    expect(getDb().select().from(pair5s).all().map((r) => `${r.fromSlug}>${r.toSlug}`)).toEqual(["branch_office>alpha"]);
   });
 });
 
@@ -237,8 +354,8 @@ describe("live data that no longer describes the present", () => {
     const { alpha, bravo, client } = threeSites();
     const start = now;
     for (const bytes of [0, 50_000]) {
-      ingest(alpha, { peers: [peer(bravo.publicKey, bytes), peer(client.publicKey, bytes)], counters: [{ name: "c_alpha_to_bravo", bytes, packets: 1 }] });
-      ingest(bravo, { peers: [peer(alpha.publicKey, bytes)], counters: [{ name: "c_alpha_to_bravo", bytes, packets: 1 }] });
+      ingest(alpha, { peers: [peer(bravo.publicKey, bytes), peer(client.publicKey, bytes)], counters: [{ name: "c5_alpha_to_bravo", bytes, packets: 1 }] });
+      ingest(bravo, { peers: [peer(alpha.publicKey, bytes)], counters: [{ name: "c5_alpha_to_bravo", bytes, packets: 1 }] });
       now += 5000;
     }
     const at = start + 5000;

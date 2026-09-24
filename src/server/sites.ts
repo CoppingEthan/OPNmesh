@@ -12,7 +12,7 @@ import { randomId, randomToken, sha256Hex } from "@/core/crypto";
 import { SLUG_RE, WG_KEY_RE, slugify, type RouterLayout } from "@/core/model";
 import { logEvent } from "./events";
 import { now } from "./env";
-import { liveState } from "./live";
+import { cleanAgentText, liveState } from "./live";
 import { bumpConfigVersion, getSettings } from "./settings";
 
 export class SiteError extends Error {
@@ -275,7 +275,21 @@ export interface EnrolRequest {
 
 export type EnrolResult =
   | { ok: true; gatewayId: string; gatewayToken: string; status: "pending" | "active"; siteName: string }
-  | { ok: false; reason: "invalid-token" | "expired" | "used" | "bad-key" | "duplicate-key" | "no-address" };
+  | { ok: false; reason: "invalid-token" | "expired" | "used" | "bad-key" | "duplicate-key" | "no-address" | "gateway-active" };
+
+/**
+ * Whether a token could enrol a gateway now: known, unused and unexpired.
+ * One indexed lookup; the enrolment route uses it to decide which limit an
+ * attempt counts against.
+ */
+export function enrolTokenUsable(token: string): boolean {
+  const tok = getDb()
+    .select({ usedAt: enrolTokens.usedAt, expiresAt: enrolTokens.expiresAt })
+    .from(enrolTokens)
+    .where(eq(enrolTokens.tokenHash, sha256Hex(token)))
+    .get();
+  return tok !== undefined && tok.usedAt === null && now() <= tok.expiresAt;
+}
 
 /** Thrown inside the enrolment transaction when another request spent the token first. */
 class TokenSpent extends Error {}
@@ -306,6 +320,12 @@ export function hostAddresses(reported: string[], tunnelIp?: string): string[] {
  * never leaves the gateway; only the public key arrives here. When the site
  * already has a gateway (a rebuilt VM), its addressing and endpoint settings
  * carry over so the mesh re-forms without re-entering anything.
+ *
+ * A token that needs approval cannot replace an active gateway: the site
+ * has room for one gateway, so the working one would go at once and the site
+ * would leave the mesh until someone approved a newcomer they may never have
+ * asked for. That refusal leaves the token unspent; remove the gateway
+ * first, or replace it with a token that approves automatically.
  */
 export function enrolGateway(req: EnrolRequest): EnrolResult {
   const db = getDb();
@@ -318,6 +338,8 @@ export function enrolGateway(req: EnrolRequest): EnrolResult {
   const site = getSite(tok.siteId);
   if (!site) return { ok: false, reason: "invalid-token" };
   const previous = site.gateway;
+  const status = tok.autoApprove ? "active" : "pending";
+  if (status === "pending" && previous?.status === "active") return { ok: false, reason: "gateway-active" };
 
   // A key is one peer's identity mesh-wide. A roaming client's key accepted
   // here would give its holder a gateway token; a rebuilt VM may keep its own.
@@ -337,7 +359,6 @@ export function enrolGateway(req: EnrolRequest): EnrolResult {
 
   const gatewayToken = randomToken();
   const id = randomId();
-  const status = tok.autoApprove ? "active" : "pending";
   const cleanHost = req.hostname.replace(/[^A-Za-z0-9._-]/g, "").slice(0, 63);
 
   try {
@@ -370,7 +391,7 @@ export function enrolGateway(req: EnrolRequest): EnrolResult {
           enrolledAt: t,
           approvedAt: status === "active" ? t : null,
           lastSeenAt: null,
-          agentVersion: req.agentVersion.slice(0, 32),
+          agentVersion: cleanAgentText(req.agentVersion, 32),
           os: req.os.replace(/[^A-Za-z0-9 ._-]/g, "").slice(0, 64),
           arch: req.arch.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 16),
           addresses,

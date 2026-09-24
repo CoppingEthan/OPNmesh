@@ -3,7 +3,8 @@
 /**
  * Health checks for one site: what the controller can see plus what the
  * gateway found when last asked. Problems first, then warnings, then the
- * things that passed, so the eye lands on what matters.
+ * things that passed, so the eye lands on what matters. Advice written by
+ * the gateway is labelled as the gateway's, apart from the controller's own.
  */
 import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, MinusCircle, PlayCircle, XCircle } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
@@ -15,6 +16,14 @@ import { Ago, Notice } from "../components-client";
 
 const ORDER: Record<CheckResult["status"], number> = { fail: 0, warn: 1, pass: 2, skip: 3 };
 
+/** Who ran a check: the controller, or the gateway (whose words are its own). */
+type Source = "controller" | "gateway";
+
+interface Sourced {
+  c: CheckResult;
+  from: Source;
+}
+
 function Icon({ status }: { status: CheckResult["status"] }) {
   const cls = "mt-0.5 h-4 w-4 shrink-0";
   if (status === "fail") return <XCircle className={cx(cls, "text-bad")} aria-label="Failed" />;
@@ -23,7 +32,7 @@ function Icon({ status }: { status: CheckResult["status"] }) {
   return <MinusCircle className={cx(cls, "text-ink-3")} aria-label="Skipped" />;
 }
 
-function Row({ c }: { c: CheckResult }) {
+function Row({ c, from }: Sourced) {
   const quiet = c.status === "pass" || c.status === "skip";
   return (
     <li className={cx("flex items-start gap-3 px-5 py-2.5", !quiet && "bg-surface-2/60")}>
@@ -33,7 +42,7 @@ function Row({ c }: { c: CheckResult }) {
         {c.detail && <div className={cx("text-xs", quiet ? "text-ink-3" : "text-ink-2")}>{c.detail}</div>}
         {c.hint && !quiet && (
           <div className="mt-1 text-xs text-ink-2">
-            <span className="font-medium text-ink">Try:</span> {c.hint}
+            <span className="font-medium text-ink">{from === "gateway" ? "The gateway suggests:" : "Try:"}</span> {c.hint}
           </div>
         )}
       </div>
@@ -93,11 +102,13 @@ export function ChecksPanel({ site }: { site: SiteState }) {
     }
   };
 
-  const checks = diag ? [...diag.controller, ...diag.agent].sort((a, b) => ORDER[a.status] - ORDER[b.status]) : [];
-  const problems = checks.filter((c) => c.status === "fail" || c.status === "warn");
-  const quiet = checks.filter((c) => c.status === "pass" || c.status === "skip");
-  const fails = checks.filter((c) => c.status === "fail").length;
-  const warns = checks.filter((c) => c.status === "warn").length;
+  const checks: Sourced[] = diag
+    ? [...diag.controller.map((c) => ({ c, from: "controller" as const })), ...diag.agent.map((c) => ({ c, from: "gateway" as const }))].sort((a, b) => ORDER[a.c.status] - ORDER[b.c.status])
+    : [];
+  const problems = checks.filter(({ c }) => c.status === "fail" || c.status === "warn");
+  const quiet = checks.filter(({ c }) => c.status === "pass" || c.status === "skip");
+  const fails = checks.filter(({ c }) => c.status === "fail").length;
+  const warns = checks.filter(({ c }) => c.status === "warn").length;
 
   return (
     <Card
@@ -150,8 +161,8 @@ export function ChecksPanel({ site }: { site: SiteState }) {
             <p className="px-5 pt-3 text-xs text-ink-3">Press “Run checks” to have the gateway test forwarding, its firewall, routes, the site router and packet sizes.</p>
           )}
           <ul className="divide-y divide-line">
-            {problems.map((c) => (
-              <Row key={c.id} c={c} />
+            {problems.map(({ c, from }) => (
+              <Row key={`${from}:${c.id}`} c={c} from={from} />
             ))}
           </ul>
           {quiet.length > 0 && (
@@ -162,8 +173,8 @@ export function ChecksPanel({ site }: { site: SiteState }) {
               </button>
               {showPassed && (
                 <ul className="divide-y divide-line border-t border-line">
-                  {quiet.map((c) => (
-                    <Row key={c.id} c={c} />
+                  {quiet.map(({ c, from }) => (
+                    <Row key={`${from}:${c.id}`} c={c} from={from} />
                   ))}
                 </ul>
               )}

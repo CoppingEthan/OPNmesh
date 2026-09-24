@@ -95,7 +95,16 @@ export const DEFAULT_SETTINGS: NetworkSettings = {
 };
 
 export const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
-export const WG_KEY_RE = /^[A-Za-z0-9+/]{43}=$/;
+
+/**
+ * A WireGuard key in canonical base64: 32 bytes, 43 characters and one "=".
+ * Those 43 characters carry 258 bits, so the last one must leave the two
+ * spare bits zero (A, E, I, … 8). "…AB=" decodes to the same bytes as
+ * "…AA=" in a lenient decoder, but `wg` and the agent decode strictly and
+ * refuse it, and one such key in a peer's config stops that peer applying
+ * any change at all.
+ */
+export const WG_KEY_RE = /^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$/;
 
 /** Turn a human name into a slug; the caller ensures uniqueness. */
 export function slugify(name: string): string {
