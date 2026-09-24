@@ -74,20 +74,31 @@ export interface GatewayCommand {
  * verification, checks it against the SHA-256 the admin is looking at, and
  * only then runs it; the installer pins the CA by fingerprint for everything
  * after that.
+ *
+ * The enrolment token never appears in a command line, since `ps` shows every
+ * process's arguments to every user and sudo logs its own. The shell's
+ * built-in printf (no process of its own) writes it to a file only this user
+ * can read (mktemp creates it 0600), the installer reads it with
+ * --token-file, and the file is removed when the command ends, however it
+ * ends. The subshell keeps the variable and the trap out of the admin's shell.
  */
 export function gatewayCommand(opts: { token: string } | { upgrade: true }): GatewayCommand {
   const base = checkedBase(publicUrl());
   const installScriptSha256 = createHash("sha256").update(installScript(base)).digest("hex");
   const caFingerprint = base.startsWith("https://") ? privateCaFingerprint() : null;
+  // Tokens are base64url; anything else could break out of the quotes below.
+  if ("token" in opts && !/^[A-Za-z0-9_-]+$/.test(opts.token)) throw new Error("enrolment token has an unexpected format");
   const flags = [
-    "token" in opts ? `--token ${opts.token}` : "--upgrade",
+    "token" in opts ? `--token-file "$t"` : "--upgrade",
     caFingerprint ? `--ca-fingerprint ${caFingerprint}` : null,
     base.startsWith("http://") ? "--insecure-http" : null,
   ]
     .filter(Boolean)
     .join(" ");
-  const command = caFingerprint
+  const install = caFingerprint
     ? `f=$(mktemp) && curl -fsSLk ${base}/install.sh -o "$f" && echo "${installScriptSha256}  $f" | sha256sum -c --quiet && sudo bash "$f" ${flags}`
     : `curl -fsSL ${base}/install.sh | sudo bash -s -- ${flags}`;
+  const command =
+    "token" in opts ? `(t=$(mktemp) && trap 'rm -f "$t"' EXIT && printf '%s\\n' '${opts.token}' > "$t" && ${install})` : install;
   return { command, installScriptSha256, caFingerprint };
 }

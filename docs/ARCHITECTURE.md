@@ -680,7 +680,7 @@ token, the gateway keeps its identity, keys and telemetry history, and
 `opnmesh-wg` is left running so the tunnel stays up. The site page shows the
 command when a gateway reports an older agent than the controller.
 
-Enrolling with `--token` runs the new binary's `enrol` before installing it,
+Enrolling with a token runs the new binary's `enrol` before installing it,
 so a refused token (used, expired, wrong) changes nothing on the machine.
 With a fresh token it replaces the site's gateway, which is how a VM is
 rebuilt or moved. (A token that needs approval cannot replace an active
@@ -694,6 +694,14 @@ The install and upgrade one-liners depend on how the controller is reached:
   the installer without verification, checks it against the SHA-256 shown in
   the UI, and only then runs it with `--ca-fingerprint`; everything after
   that is verified against the pinned CA.
+
+The enrolment token is never an argument of any process: `ps` shows every
+process's arguments to every user, and sudo logs its own. The install
+command runs in a subshell that writes the token with the shell's built-in
+`printf` to a file from `mktemp` (mode 0600), passes that file with
+`--token-file`, and removes it when the command ends. The installer hands the
+token to the agent in its environment. Both installers run from a `main()`
+called on their last line, so a download cut short runs nothing.
 
 ## 11. Real-time traffic and the dashboard
 
@@ -1025,14 +1033,23 @@ material and fails the build. `.env` files and data volumes are gitignored.
 curl -fsSL https://raw.githubusercontent.com/CoppingEthan/OPNmesh/main/deploy/controller/install.sh | sudo bash
 ```
 
-On any Ubuntu 22.04/24.04 with Docker, this creates `/opt/opnmesh/` with a
+On any Ubuntu 22.04/24.04, this creates `/opt/opnmesh/` with a
 `docker-compose.yml`, `.env` (site name, public URL, ports, TLS mode),
 starts Caddy + the controller, and prints the URL and one-time setup code.
-The data directory is owned by uid 1000, the unprivileged user the image runs
-as. The installer belongs to one release: the compose file, the Caddyfile
-and the image all come from that release. To upgrade, set the new version in
-`OPNMESH_IMAGE` in `.env`, then run
-`docker compose pull && docker compose up -d`. Backup is the
+Without Docker it first installs Docker Engine from Docker's apt repository,
+after checking the repository's signing key against the fingerprint Docker
+publishes; it does not run Docker's convenience script. The data directory is
+owned by uid 1000, the unprivileged user the image runs as. The installer
+belongs to one release: it downloads that release's compose file and
+Caddyfile, refuses either unless its SHA-256 is the one the release
+published (each is written beside its final name and moved into place only
+once checked, since a re-run keeps existing files), and pins that release's
+image by digest in `.env`. The release workflow builds the agent binaries
+once and builds the image around them, so the binaries on the release page
+are the bytes every controller serves at `/dl`, and signs build provenance
+for the image and the binaries (`gh attestation verify`). To upgrade, put the
+new release's image, by version and digest, in `OPNMESH_IMAGE` in `.env`,
+then run `docker compose pull && docker compose up -d`. Backup is the
 `/opt/opnmesh/data` directory (or the database download in Settings, which
 is consistent while the controller runs) plus `.env`.
 
@@ -1057,10 +1074,11 @@ design does not depend on that.
 In the UI: Sites → *site* → Gateway → "Install". Copy the one-liner:
 
 ```bash
-curl -fsSL https://mesh.example.com/install.sh | sudo bash -s -- --token 3f9c…
+(t=$(mktemp) && trap 'rm -f "$t"' EXIT && printf '%s\n' '3f9c…' > "$t" && curl -fsSL https://mesh.example.com/install.sh | sudo bash -s -- --token-file "$t")
 ```
 
-It installs `wireguard-tools`, `nftables` and `iproute2`, downloads the agent
+The token reaches the installer in a private file, never on a command line
+(§10.1). It installs `wireguard-tools`, `nftables` and `iproute2`, downloads the agent
 binary for the CPU, generates the keypair, enrols, installs the systemd units
 (`opnmesh-gw.service` for the agent, `opnmesh-wg.service` bringing up
 `opnmesh0` from disk at boot) and starts them. Sixty seconds later the site
@@ -1154,7 +1172,9 @@ WireGuard built in. Full detail in [TESTING.md](TESTING.md).
    TLS with the CA Caddy issued, `/ca.crt`, first-run setup, an install
    command carrying the CA fingerprint, the agent download over TLS.
 8. **CI** — every push runs 1–4, 6 and 7 in minutes and 5 in about ten
-   minutes; a release tag builds the multi-arch image and the agent binaries.
+   minutes, and checks the controller installer's release pins; a release
+   tag builds the agent binaries once, scans them with `govulncheck`, builds
+   the multi-arch image around them, and signs build provenance for both.
 
 ## 16. What changed from v1 and why
 

@@ -23,6 +23,9 @@ services:
   controller:
     image: ${OPNMESH_IMAGE:-ghcr.io/coppingethan/opnmesh:latest}
     restart: unless-stopped
+    # A minimal init as PID 1 passes docker stop's SIGTERM on to the
+    # controller and reaps any process it leaves behind.
+    init: true
     logging: *logging
     environment:
       OPNMESH_DATA_DIR: /data

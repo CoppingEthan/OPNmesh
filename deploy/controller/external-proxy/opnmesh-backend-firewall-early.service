@@ -3,9 +3,11 @@ Description=OPNmesh: close the controller backend before Docker starts
 Documentation=file:///opt/opnmesh/backend-allow
 # Runs before Docker publishes the controller's port, so there is no moment
 # at boot when the backend is open. opnmesh-backend-firewall.service checks
-# the result again once Docker is up.
+# the result again once Docker is up. It also runs after any firewall service
+# that loads a saved rule set, since loading one can flush these rules
+# (ordering only: it does not pull those services in).
 DefaultDependencies=no
-After=local-fs.target
+After=local-fs.target netfilter-persistent.service nftables.service firewalld.service iptables.service
 Before=docker.service network-pre.target
 Wants=network-pre.target
 

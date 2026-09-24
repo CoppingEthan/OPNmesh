@@ -48,6 +48,13 @@ command carries the CA fingerprint so the installer verifies what it
 downloads before trusting it. The script prints the URL and a one-time setup
 code; open the URL, enter the code, and create the admin account.
 
+The installer belongs to one release. It checks the compose file and
+Caddyfile it downloads against that release's SHA-256 and pins the image by
+digest in `.env`. If Docker is missing it installs it from Docker's apt
+repository, and checks the repository's signing key against the fingerprint
+Docker publishes. That works on Ubuntu and Debian; on anything else, install
+Docker Engine and its compose plugin first.
+
 Already run a reverse proxy or web application firewall? Put the controller
 behind it instead of the bundled Caddy: see
 [docs/REVERSE-PROXY.md](docs/REVERSE-PROXY.md) for the layout, what the proxy
@@ -57,8 +64,11 @@ must do, and which paths gateways need.
 and paste it into an Ubuntu VM at that site:
 
 ```bash
-curl -fsSL https://mesh.example.com/install.sh | sudo bash -s -- --token <one-time-token>
+(t=$(mktemp) && trap 'rm -f "$t"' EXIT && printf '%s\n' '<one-time-token>' > "$t" && curl -fsSL https://mesh.example.com/install.sh | sudo bash -s -- --token-file "$t")
 ```
+
+The token goes to the installer in a private temporary file rather than on
+the command line, where `ps` and sudo's log would show it.
 
 Within a minute the site shows online and its *Router setup* page lists the
 routes to add (or connect the site to its UniFi console and let OPNmesh add
@@ -73,9 +83,10 @@ send the person a one-time link.
   `Caddyfile`, `.env` (site name, public URL, ports, TLS mode) and two
   directories: `data` (the SQLite database and `secret.key`, owned by uid
   1000, the unprivileged user the image runs as) and `caddy` (certificates).
-- **Upgrades**: the controller first. `.env` pins the image, so set the new
-  release in `OPNMESH_IMAGE` (for example
-  `ghcr.io/coppingethan/opnmesh:2.1.1`), then run
+- **Upgrades**: the controller first. `.env` pins the image by version and
+  digest, so replace the whole `OPNMESH_IMAGE` value with the new release's,
+  which its release notes give (for example
+  `ghcr.io/coppingethan/opnmesh:2.1.3@sha256:…`), then run
   `cd /opt/opnmesh && docker compose pull && docker compose up -d`. Then each
   gateway: when its agent is older than the controller, the site's Gateway card
   shows the upgrade command,
@@ -83,6 +94,19 @@ send the person a one-time link.
   It installs the agent the controller ships (checked against its SHA-256) and
   restarts it; the gateway keeps its identity and its tunnel stays up. No
   token is needed.
+- **Verifying a release**: releases after 2.1.2 carry signed build
+  provenance for the image and both agent binaries, made by this
+  repository's release workflow. Check it with the GitHub CLI:
+
+  ```bash
+  gh attestation verify oci://ghcr.io/coppingethan/opnmesh:<version> --repo CoppingEthan/OPNmesh
+  gh attestation verify opnmesh-gw-linux-amd64 --repo CoppingEthan/OPNmesh   # downloaded from the release
+  ```
+
+  The agent binaries on a release page are the same files the image serves
+  to gateways, so the release's `SHA256SUMS` also checks an installed agent:
+  compare `sha256sum /usr/local/bin/opnmesh-gw` with the `SHA256SUMS` of the
+  release the controller runs.
 - **Backups**: back up `data` as a whole. `secret.key` encrypts the client
   private keys stored in the database, so neither file is useful without the
   other. *Settings → Download database backup* gives a consistent copy while

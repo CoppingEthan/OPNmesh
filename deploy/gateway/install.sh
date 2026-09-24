@@ -1,8 +1,13 @@
 #!/bin/sh
 # OPNmesh gateway installer.
 #
-#   curl -fsSL __OPNMESH_URL__/install.sh | sudo bash -s -- --token <one-time-token>
+#   curl -fsSL __OPNMESH_URL__/install.sh | sudo bash -s -- --token-file <file>
 #   curl -fsSL __OPNMESH_URL__/install.sh | sudo bash -s -- --upgrade
+#
+# The UI prints the enrolment command in full. It has the shell write the
+# one-time token to a private temporary file with its built-in printf and
+# passes that file, because every argument of every process shows in `ps`
+# and in sudo's log.
 #
 # What it does, in order:
 #   1. Installs wireguard-tools, nftables, iproute2, curl and openssl (apt,
@@ -24,8 +29,8 @@
 # needed, the gateway keeps its identity, and the tunnel stays up throughout.
 #
 # Flags:
-#   --token <t>            one-time enrolment token from the OPNmesh UI
-#   --token-file <f>       read the token from a file instead (keeps it out of `ps`)
+#   --token-file <f>       read the one-time enrolment token from a file
+#   --token <t>            the token itself (older commands; visible in `ps`)
 #   --upgrade              update the agent of an already enrolled gateway
 #   --controller <url>     override the controller URL baked into this script
 #                          (scheme://host[:port], nothing more)
@@ -41,9 +46,11 @@
 #   --no-deps              skip package installation
 #   --no-start             install but do not start the services
 #
-# Inspect this script before running it; the UI shows its SHA-256.
+# Inspect this script before running it; the UI shows its SHA-256. It runs
+# from main(), called on its last line, so a download cut short runs nothing.
 set -eu
 
+main() {
 CONTROLLER="__OPNMESH_URL__"
 TOKEN="${OPNMESH_TOKEN:-}"
 # Only the agent gets the token, and only when it enrols.
@@ -59,7 +66,10 @@ BIN=/usr/local/bin/opnmesh-gw
 while [ $# -gt 0 ]; do
   case "$1" in
     --token) TOKEN="$2"; shift 2 ;;
-    --token-file) TOKEN="$(cat "$2")"; shift 2 ;;
+    --token-file)
+      [ -f "$2" ] && [ -r "$2" ] || { echo "--token-file: cannot read $2" >&2; exit 2; }
+      TOKEN="$(tr -d '[:space:]' < "$2")"
+      shift 2 ;;
     --upgrade) UPGRADE=1; shift ;;
     --controller) CONTROLLER="$2"; shift 2 ;;
     --ca-fingerprint) CA_FP="$2"; shift 2 ;;
@@ -67,7 +77,7 @@ while [ $# -gt 0 ]; do
     --binary) LOCAL_BIN="$2"; shift 2 ;;
     --no-deps) INSTALL_DEPS=0; shift ;;
     --no-start) START=0; shift ;;
-    -h|--help) sed -n '2,44p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -156,11 +166,14 @@ umask 077
 mkdir -p /etc/opnmesh /var/lib/opnmesh
 
 # 2. Private CA (optional) ----------------------------------------------------
-CURL_CA=""
+# Downloads from an https:// controller stay on https, redirects included.
+CURL_PROTO="--proto =https"
+[ "$ALLOW_HTTP" = "0" ] || CURL_PROTO=""
 CA_PIN=/etc/opnmesh/controller-ca.crt
 if [ -n "$CA_FP" ]; then
   log "downloading the controller's CA certificate"
-  curl -fsSk "$CONTROLLER/ca.crt" -o "$CA_PIN.new"
+  # shellcheck disable=SC2086
+  curl -fsSk $CURL_PROTO "$CONTROLLER/ca.crt" -o "$CA_PIN.new"
   # Newer controllers give the certificate's own fingerprint (SHA-256 of its
   # DER form), older ones the SHA-256 of the PEM file; either will do.
   GOT_FILE="$(sha256sum "$CA_PIN.new" | cut -d' ' -f1)"
@@ -185,8 +198,10 @@ if [ -n "$CA_FP" ]; then
   log "CA certificate verified and pinned"
 fi
 # A CA pinned now or by an earlier install verifies every download below.
-[ -f "$CA_PIN" ] && CURL_CA="--cacert $CA_PIN"
-[ "$ALLOW_HTTP" = "1" ] && CURL_CA="" || true
+CURL_OPTS="$CURL_PROTO"
+if [ -f "$CA_PIN" ] && [ "$ALLOW_HTTP" = "0" ]; then
+  CURL_OPTS="$CURL_OPTS --cacert $CA_PIN"
+fi
 
 # 3. Agent binary (staged; installed after enrolment succeeds) ----------------
 rm -f "$BIN.new"
@@ -196,9 +211,9 @@ if [ -n "$LOCAL_BIN" ]; then
 else
   log "downloading opnmesh-gw for linux/$ARCH"
   # shellcheck disable=SC2086
-  curl -fsSL $CURL_CA "$CONTROLLER/dl/opnmesh-gw-linux-$ARCH" -o "$BIN.new"
+  curl -fsSL $CURL_OPTS "$CONTROLLER/dl/opnmesh-gw-linux-$ARCH" -o "$BIN.new"
   # shellcheck disable=SC2086
-  WANT_SUM="$(curl -fsSL $CURL_CA "$CONTROLLER/dl/opnmesh-gw-linux-$ARCH.sha256" | cut -d' ' -f1)"
+  WANT_SUM="$(curl -fsSL $CURL_OPTS "$CONTROLLER/dl/opnmesh-gw-linux-$ARCH.sha256" | cut -d' ' -f1)"
   GOT_SUM="$(sha256sum "$BIN.new" | cut -d' ' -f1)"
   if [ -z "$WANT_SUM" ] || [ "$WANT_SUM" != "$GOT_SUM" ]; then
     rm -f "$BIN.new"
@@ -313,3 +328,6 @@ else
   log "done. This gateway will appear in OPNmesh within a minute."
 fi
 log "Public key fingerprint (compare with the UI): $(printf '%s' "$(wg pubkey < /etc/opnmesh/private.key)" | sha256sum | cut -c1-16)"
+}
+
+main "$@"

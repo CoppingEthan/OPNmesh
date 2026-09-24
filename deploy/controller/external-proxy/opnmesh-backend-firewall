@@ -196,7 +196,7 @@ finish() {
       else
         log "no backend address is known: only $BRIDGE and backends from earlier runs are CLOSED to every source."
       fi
-      log "fix $CONF, then run: systemctl restart opnmesh-backend-firewall"
+      log "fix the above, then run: systemctl restart opnmesh-backend-firewall"
       [ "$rc" -ne 0 ] || rc=1
       ;;
   esac
@@ -295,17 +295,26 @@ if [ -n "$fw" ]; then
   cid=$(dk ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter label=com.docker.compose.service=controller 2>/dev/null | head -1) || cid=""
 fi
 if [ -n "$cid" ]; then
+  have_bridge=0
+  ip link show "$BRIDGE" >/dev/null 2>&1 && have_bridge=1
   published=$(dk port "$cid" "$CPORT/tcp" 2>/dev/null) || published=""
   while IFS= read -r p; do
     case $p in
       '') ;;
       0.0.0.0:*)
-        log "WARNING: the controller port is published on every IPv4 address ($p)."
-        log "  Only the bridge rule filters that. Set OPNMESH_BACKEND_BIND to one private address."
+        if [ "$have_bridge" = 1 ]; then
+          log "WARNING: the controller port is published on every IPv4 address ($p)."
+          log "  Only the bridge rule filters that. Set OPNMESH_BACKEND_BIND to one private address."
+        else
+          problem "the controller port is published on every IPv4 address ($p) and there is no $BRIDGE bridge to filter it by;" \
+            "set OPNMESH_BACKEND_BIND in $ENV_FILE to one private address, then docker compose up -d"
+        fi
         ;;
       \[* | *::*)
-        log "WARNING: the controller port is also published on IPv6 ($p), which this firewall does not filter."
-        log "  Set OPNMESH_BACKEND_BIND to an IPv4 address, or disable IPv6 port publishing."
+        # This firewall filters IPv4 only, so the port would be open to
+        # every IPv6 client.
+        problem "the controller port is published on IPv6 ($p), which this firewall cannot filter;" \
+          "set OPNMESH_BACKEND_BIND in $ENV_FILE to <private IPv4 address>:<port>, then docker compose up -d"
         ;;
       *)
         case " $targets " in
@@ -321,7 +330,7 @@ if [ -n "$cid" ]; then
   done <<EOF
 $published
 EOF
-  ip link show "$BRIDGE" >/dev/null 2>&1 ||
+  [ "$have_bridge" = 1 ] ||
     log "WARNING: no $BRIDGE bridge. Only the published address is filtered until the controller is recreated with the current docker-compose.yml (docker compose up -d)."
 elif [ -z "$fw" ] && [ "$EARLY" = 0 ]; then
   log "warning: cannot ask Docker what it publishes; applying the rules anyway"

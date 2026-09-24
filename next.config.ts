@@ -28,6 +28,9 @@ const contentSecurityPolicy = [
  */
 const traceExcludes = [
   ".git/**",
+  // Local tooling: agent worktrees (whole checkouts, data and all) and settings.
+  ".claude/**",
+  ".kilo/**",
   "data/**",
   "backups/**",
   "sim/**",

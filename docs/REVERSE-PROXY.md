@@ -34,7 +34,9 @@ The firewall matters because the controller trusts `X-Forwarded-For` from its
 proxy (see §2). If anything else can reach the port, it can claim to be any
 client address.
 
-To set it up by hand:
+To set it up by hand (take the files from the release you run; its
+`controller-files.sha256` lists their SHA-256, and its notes give the image
+by digest for `OPNMESH_IMAGE`):
 
 ```bash
 sudo mkdir -p /opt/opnmesh/data
@@ -73,9 +75,17 @@ To confirm the lock works:
 - **`BACKEND=` must match `OPNMESH_BACKEND_BIND` in `.env`.** Without a
   `BACKEND=` line the firewall uses the `.env` value. If the two differ, it
   closes both.
-- **It warns about what Docker really publishes.** A port published on
-  `0.0.0.0` or on IPv6 is not fully filtered, so fix `OPNMESH_BACKEND_BIND`.
-  A published address the files do not name is filtered as well.
+- **It checks what Docker really publishes.** A port published on IPv6 is
+  an error: this firewall filters IPv4 only, so it closes the IPv4 backend
+  and the unit fails until `OPNMESH_BACKEND_BIND` names one private IPv4
+  address. So is a port published on `0.0.0.0` while the `opnmesh-br`
+  bridge is missing, since nothing would then filter the other addresses.
+  With the bridge, `0.0.0.0` only draws a warning: the bridge rule filters
+  it. A published address the files do not name is filtered as well.
+- **It runs after the host's own firewall at boot.** The early unit is
+  ordered after `netfilter-persistent`, `nftables`, `firewalld` and
+  `iptables` (whichever exist; it does not start them), because loading a
+  saved rule set can flush its rules.
 - **It refuses to run with Docker's nftables firewall backend** (Docker 29
   and later with `"firewall-backend": "nftables"`), because that backend
   ignores `DOCKER-USER`. Keep Docker's default iptables backend, or write
@@ -88,8 +98,9 @@ To confirm the lock works:
 
 The compose file runs the controller with a read-only root filesystem, no
 Linux capabilities, no way to gain privileges, a 1 GiB memory limit and a
-process limit. It writes only to `./data` and to small in-memory mounts for
-`/tmp` and the Next.js cache. Temporary files, such as the copy of the
+process limit, under a minimal init that passes `docker stop`'s signal on
+and reaps stray processes. It writes only to `./data` and to small in-memory
+mounts for `/tmp` and the Next.js cache. Temporary files, such as the copy of the
 database a backup makes, go to `./data`. The standard layout runs Caddy the
 same way, keeping only the capability to bind ports 80 and 443.
 

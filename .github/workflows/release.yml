@@ -7,24 +7,22 @@ on:
 # Each job asks for what it needs and nothing more.
 permissions: {}
 
+# The agent binaries are built once, by the first job. The image is built
+# around those same files (they replace the Dockerfile's agent stage), so the
+# binaries on the release page, SHA256SUMS and what every controller serves
+# gateways at /dl are the same bytes, and one attestation covers them all.
 jobs:
-  image:
-    name: Controller image (amd64 + arm64)
+  agent:
+    name: Agent binaries (built once, for the image and the release)
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      packages: write
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
       # v2.0.0 → 2.0.0: the same string the agent binaries carry and the UI shows.
       - id: ver
         run: |
@@ -34,28 +32,138 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      # The newest 1.27 patch release rather than the go.mod minimum: the
+      # standard library is compiled into the binaries, and so are its fixes.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.27"
+          check-latest: true
+          cache: false
+      - name: Build
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          # Exactly the toolchain installed above, never one go.mod asks for.
+          GOTOOLCHAIN: local
+        run: |
+          go version
+          cd agent
+          go mod download
+          go mod verify
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o ../dist/opnmesh-gw-linux-$arch .
+          done
+          cd ../dist
+          # One checksum file per binary for the gateway installer (/dl), and
+          # one list for the release page.
+          for f in opnmesh-gw-linux-amd64 opnmesh-gw-linux-arm64; do sha256sum "$f" > "$f.sha256"; done
+          sha256sum opnmesh-gw-linux-amd64 opnmesh-gw-linux-arm64 > SHA256SUMS
+          cat SHA256SUMS
+      # Binary mode checks what ships: the module versions and the standard
+      # library compiled into each binary.
+      - name: Known vulnerabilities in the shipped binaries
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          for f in dist/opnmesh-gw-linux-amd64 dist/opnmesh-gw-linux-arm64; do
+            "$(go env GOPATH)/bin/govulncheck" -mode=binary "$f"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agent
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    name: Controller image (amd64 + arm64)
+    needs: agent
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      name: ${{ steps.name.outputs.name }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # Outside the checkout, so it is not part of the main build context.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: agent
+          path: ${{ runner.temp }}/agent-context/out
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: name
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/opnmesh" >> "$GITHUB_OUTPUT"
       - id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
-          images: ghcr.io/${{ github.repository_owner }}/opnmesh
+          images: ${{ steps.name.outputs.name }}
           # latest only moves for stable releases, never for v2.1.0-rc.1 and the like.
           flavor: latest=false
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
-      # No build cache: a release is built from scratch, from this commit only.
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+      # No build cache: a release is built from scratch, from this commit
+      # only, around the agent binaries built above.
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
+          build-contexts: agent=${{ runner.temp }}/agent-context
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: VERSION=${{ steps.ver.outputs.version }}
+          build-args: VERSION=${{ needs.agent.outputs.version }}
+      - name: Every platform's image serves exactly the release's agent binaries
+        env:
+          IMAGE: ${{ steps.name.outputs.name }}@${{ steps.build.outputs.digest }}
+          SUMS: ${{ runner.temp }}/agent-context/out/SHA256SUMS
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            docker run --rm --platform "$platform" -w /app/public/dl "$IMAGE" \
+              sha256sum opnmesh-gw-linux-amd64 opnmesh-gw-linux-arm64 | diff -u "$SUMS" -
+            echo "$platform: /dl matches SHA256SUMS"
+          done
 
-  binaries:
-    name: Agent binaries on the GitHub release
+  attest:
+    name: Build provenance for the image and the agent binaries
+    needs: [agent, image]
+    runs-on: ubuntu-24.04
+    # The only job that can mint the OIDC token Sigstore signs with. It runs
+    # no code from the repository.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: agent
+          path: dist
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/opnmesh-gw-linux-amd64
+            dist/opnmesh-gw-linux-arm64
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ needs.image.outputs.name }}
+          subject-digest: ${{ needs.image.outputs.digest }}
+
+  release:
+    name: GitHub release (agent binaries, checksums, image digest)
+    needs: [agent, image, attest]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -63,21 +171,68 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          go-version-file: agent/go.mod
-          check-latest: true
-          cache: false
-      - name: Build
+          name: agent
+          path: dist
+      - name: Release files and notes
+        env:
+          VERSION: ${{ needs.agent.outputs.version }}
+          IMAGE_NAME: ${{ needs.image.outputs.name }}
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          printf '%s\n' "$version" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?'
-          cd agent
-          for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$version" -o ../dist/opnmesh-gw-linux-$arch .
-          done
-          cd ../dist && sha256sum * > SHA256SUMS
+          printf '%s\n' "$IMAGE_DIGEST" | grep -Eqx 'sha256:[0-9a-f]{64}'
+          mkdir release
+          cp dist/opnmesh-gw-linux-amd64 dist/opnmesh-gw-linux-arm64 dist/SHA256SUMS release/
+          # The controller installer checks each file it downloads against
+          # this list; the rest are for anyone setting up by hand.
+          (cd deploy/controller && sha256sum docker-compose.yml Caddyfile .env.example \
+            external-proxy/docker-compose.yml external-proxy/.env.example external-proxy/backend-allow.example \
+            external-proxy/opnmesh-backend-firewall external-proxy/opnmesh-backend-firewall.service \
+            external-proxy/opnmesh-backend-firewall-early.service) > release/controller-files.sha256
+          compose="$(awk '$2 == "docker-compose.yml" { print $1 }' release/controller-files.sha256)"
+          caddyfile="$(awk '$2 == "Caddyfile" { print $1 }' release/controller-files.sha256)"
+          cat > notes.md <<'EOF'
+          ## Verifying this release
+
+          The controller image, by version and digest. This whole value goes in `OPNMESH_IMAGE` in `.env`:
+
+          ```
+          @IMAGE_NAME@:@VERSION@@@IMAGE_DIGEST@
+          ```
+
+          The image and both agent binaries carry build provenance signed by this repository's release workflow:
+
+          ```
+          gh attestation verify oci://@IMAGE_NAME@:@VERSION@ --repo @REPO@
+          gh attestation verify opnmesh-gw-linux-amd64 --repo @REPO@
+          ```
+
+          The agent binaries attached here are the ones the image serves to gateways, so `SHA256SUMS` also checks an installed agent (`sha256sum /usr/local/bin/opnmesh-gw`). `controller-files.sha256` holds the SHA-256 of the deployment files at this release; the controller installer checks what it downloads against it.
+
+          ## Pointing the controller installer at this release
+
+          In `deploy/controller/install.sh` (see docs/TESTING.md, Releasing):
+
+          ```
+          RELEASE=@VERSION@
+          RELEASE_IMAGE_DIGEST=@IMAGE_DIGEST@
+          RELEASE_FILE_SUMS="@COMPOSE@  docker-compose.yml
+          @CADDYFILE@  Caddyfile"
+          ```
+
+          and in both `deploy/controller/.env.example` files:
+
+          ```
+          OPNMESH_IMAGE=@IMAGE_NAME@:@VERSION@@@IMAGE_DIGEST@
+          ```
+
+          EOF
+          sed -i -e "s|@IMAGE_NAME@|$IMAGE_NAME|g" -e "s|@VERSION@|$VERSION|g" -e "s|@IMAGE_DIGEST@|$IMAGE_DIGEST|g" \
+            -e "s|@REPO@|$GITHUB_REPOSITORY|g" -e "s|@COMPOSE@|$compose|g" -e "s|@CADDYFILE@|$caddyfile|g" notes.md
+          cat notes.md
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: dist/*
+          files: release/*
+          body_path: notes.md
           generate_release_notes: true

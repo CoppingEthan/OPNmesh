@@ -16,6 +16,9 @@
 	# Nothing in this container needs to trust the private CA, and its root
 	# filesystem is read-only.
 	skip_install_trust
+	# Nothing uses Caddy's admin API: the configuration is this read-only
+	# file, and a change to it takes effect with docker compose restart caddy.
+	admin off
 }
 
 {$OPNMESH_SITE} {
