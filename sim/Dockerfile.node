@@ -1,7 +1,7 @@
 # Simulation node: Ubuntu 24.04 with exactly the tooling a real gateway,
 # router or host would have. Used for routers, gateways, LAN hosts and the
 # roaming client; the entrypoint decides the role.
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -qq \
     && apt-get install -qq -y --no-install-recommends \
