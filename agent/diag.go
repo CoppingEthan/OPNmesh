@@ -21,6 +21,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -79,15 +80,22 @@ type DiagReport struct {
 	Checks []Check `json:"checks"`
 }
 
+// diagRunning is set while a health-check run is in progress.
+var diagRunning atomic.Bool
+
 // dispatchDiagnostics starts a run for a request we have not seen before.
 // It runs in the background so per-second reports keep flowing meanwhile.
+// Only one run goes at a time: a controller that hands out a fresh request
+// on every report must not pile up runs (each adds and removes the same
+// probe rule and route). A request that arrives meanwhile is left unseen and
+// picked up once the run in progress has finished, if it is still wanted.
 func dispatchDiagnostics(cfg Config, client *Client, resp TelemetryResponse, last *string) {
 	for _, a := range resp.Actions {
 		if a.Type != "diagnose" || a.Request.ID == "" || a.Request.ID == *last {
 			continue
 		}
-		*last = a.Request.ID
-		go func(req DiagRequest) {
+		req := a.Request
+		started := startExclusive(&diagRunning, func() {
 			logf("running health checks (%s)", req.ID)
 			report := runDiagnostics(cfg, req)
 			if err := client.SendDiagnostics(report); err != nil {
@@ -95,8 +103,25 @@ func dispatchDiagnostics(cfg Config, client *Client, resp TelemetryResponse, las
 			} else {
 				logf("health checks done: %s", summarise(report.Checks))
 			}
-		}(a.Request)
+		})
+		if !started {
+			return
+		}
+		*last = req.ID
 	}
+}
+
+// startExclusive runs fn in the background unless a run guarded by busy is
+// still going, and reports whether it started one.
+func startExclusive(busy *atomic.Bool, fn func()) bool {
+	if !busy.CompareAndSwap(false, true) {
+		return false
+	}
+	go func() {
+		defer busy.Store(false)
+		fn()
+	}()
+	return true
 }
 
 func summarise(checks []Check) string {
@@ -586,11 +611,26 @@ func frameCarries(frame []byte, dst net.IP, marker []byte) bool {
 
 // --- packet size --------------------------------------------------------------
 
-func checkMTU(req DiagRequest) []Check {
-	mtu := req.MTU
-	if mtu <= 0 {
-		mtu = 1420
+// The packet sizes the MTU check may test: from the IPv4 minimum every link
+// carries up to jumbo frames.
+const (
+	minProbeMTU     = 576
+	maxProbeMTU     = 9000
+	defaultProbeMTU = 1420
+)
+
+// probeMTU is the size the check tests for a requested MTU. The number comes
+// from the controller: unbounded, a tiny one made a negative-sized buffer
+// (a panic) and a huge one an allocation that could exhaust memory.
+func probeMTU(requested int) int {
+	if requested <= 0 {
+		return defaultProbeMTU
 	}
+	return max(minProbeMTU, min(requested, maxProbeMTU))
+}
+
+func checkMTU(req DiagRequest) []Check {
+	mtu := probeMTU(req.MTU)
 	var out []Check
 	for _, t := range req.MTUTargets {
 		id := "mtu:" + t.IP
@@ -625,6 +665,9 @@ func checkMTU(req DiagRequest) []Check {
 // icmpEcho sends one echo with the given payload size and waits for its reply.
 // With df set, the kernel refuses to fragment (EMSGSIZE) rather than send.
 func icmpEcho(ip string, payload int, df bool, timeout time.Duration) (bool, error) {
+	if payload < 0 || payload > maxProbeMTU {
+		return false, fmt.Errorf("refusing a %d-byte ping", payload)
+	}
 	c, err := net.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
 		return false, err

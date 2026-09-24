@@ -103,6 +103,19 @@ func TestValidateWireGuardRefuses(t *testing.T) {
 		"key outside conf dir":      "[Interface]\nPostUp = wg set %i private-key /root/.ssh/id_rsa\n",
 		"key path escaping":         "[Interface]\nPostUp = wg set %i private-key /etc/opnmesh/../shadow\n",
 		"relative key path":         "[Interface]\nPostUp = wg set %i private-key private.key\n",
+		"token as the key":          "[Interface]\nPostUp = wg set %i private-key /etc/opnmesh/agent.token\n",
+		"key in a subdirectory":     "[Interface]\nPostUp = wg set %i private-key /etc/opnmesh/keys/private.key\n",
+		"key path spelled oddly":    "[Interface]\nPostUp = wg set %i private-key /etc/opnmesh//private.key\n",
+		"key path via dot":          "[Interface]\nPostUp = wg set %i private-key /etc/opnmesh/./private.key\n",
+		"default route":             "[Peer]\nAllowedIPs = 0.0.0.0/0\n",
+		"IPv6 default route":        "[Peer]\nAllowedIPs = ::/0\n",
+		"default among others":      "[Peer]\nAllowedIPs = 10.99.0.2/32, 0.0.0.0/0\n",
+		"half the internet":         "[Peer]\nAllowedIPs = 0.0.0.0/1, 128.0.0.0/1\n",
+		"shorter than /8":           "[Peer]\nAllowedIPs = 8.0.0.0/7\n",
+		"host bits set":             "[Peer]\nAllowedIPs = 192.168.20.1/24\n",
+		"host bits set on a /8":     "[Peer]\nAllowedIPs = 10.0.0.1/8\n",
+		"lower-case allowedips /0":  "[peer]\nallowedips = 0.0.0.0/0\n",
+		"allowed ip with a zone":    "[Peer]\nAllowedIPs = fe80::1%eth0\n",
 		"address with a command":    "[Interface]\nAddress = 10.99.0.1/24; reboot\n",
 		"address glob":              "[Interface]\nAddress = /etc/*\n",
 		"port with a suffix":        "[Interface]\nListenPort = 51820 x\n",
@@ -136,13 +149,13 @@ func TestValidateWireGuardAccepts(t *testing.T) {
 		"  address\t=\t10.99.0.1/24, fd00::1/64\n" +
 		"LISTENPORT = 51820 # the port routers forward\n" +
 		"mtu = 1420\n" +
-		"postup = wg set %i private-key /etc/opnmesh/keys/private.key\n" +
+		"postup = wg set %i private-key /etc/opnmesh/private.key # the gateway's own key\n" +
 		"\n" +
 		"[PEER]\n" +
 		"PublicKey = " + testKey + "\n" +
 		"PresharedKey = " + testKey + "\n" +
 		"Endpoint = [2001:db8::1]:51820\n" +
-		"AllowedIPs = 10.99.0.2, 192.168.20.0/24\n" +
+		"AllowedIPs = 10.99.0.2, 192.168.20.0/24, 10.0.0.0/8, fd00::/64\n" +
 		"PersistentKeepalive = off\n" +
 		"[Peer]\n" +
 		"PublicKey = " + testKey + "\n" +
@@ -152,7 +165,7 @@ func TestValidateWireGuardAccepts(t *testing.T) {
 	if err := validateWireGuard(conf, "/etc/opnmesh/"); err != nil {
 		t.Fatal(err)
 	}
-	if p := privateKeyPathOf(conf); p != "/etc/opnmesh/keys/private.key" {
+	if p := privateKeyPathOf(conf); p != "/etc/opnmesh/private.key" {
 		t.Fatalf("key path: %q", p)
 	}
 	if err := validateWireGuard("", "/etc/opnmesh"); err != nil {
@@ -242,6 +255,96 @@ func TestValidateNftables(t *testing.T) {
 	for name, conf := range bad {
 		if err := validateNftables(conf); err == nil {
 			t.Errorf("%s: accepted %q", name, conf)
+		}
+	}
+}
+
+// nftForward wraps rules in the generator's forward chain.
+func nftForward(rules string) string {
+	return "table inet opnmesh {}\ndelete table inet opnmesh\ntable inet opnmesh {\n" +
+		"  chain forward {\n    type filter hook forward priority filter; policy drop;\n" + rules + "\n  }\n}\n"
+}
+
+func TestValidateNftablesBody(t *testing.T) {
+	ok := map[string]string{
+		"MSS clamp":           nftForward(`    oifname "opnmesh0" tcp flags syn tcp option maxseg size set rt mtu`),
+		"keywords as strings": nftForward(`    iifname "dnat" comment "meta mark set 1; notrack" accept`),
+		"sets and counters": "table inet opnmesh {\n  set lan_a {\n    type ipv4_addr\n    flags interval\n    elements = { 10.0.1.0/24,\n      10.0.2.0/24 }\n  }\n" +
+			"  counter c_a_to_b {}\n  chain forward {\n    type filter hook forward priority filter; policy drop;\n" +
+			"    ip saddr @lan_a counter name \"c_a_to_b\"\n    ct state established,related accept\n  }\n}\n",
+		"masquerade layout": "table inet opnmesh {\n  chain forward {\n    type filter hook forward priority filter; policy drop;\n  }\n" +
+			"  chain postrouting {\n    type nat hook postrouting priority srcnat; policy accept;\n    iifname \"opnmesh0\" oifname != \"opnmesh0\" masquerade\n  }\n}\n",
+	}
+	for name, conf := range ok {
+		if err := validateNftables(conf); err != nil {
+			t.Errorf("%s: refused: %v", name, err)
+		}
+	}
+	bad := map[string]string{
+		"dnat":                    nftForward("    ip daddr 10.0.1.5 dnat to 10.0.1.6"),
+		"dnat via a map":          nftForward("    dnat to ip daddr map { 10.0.1.5 : 10.0.1.6 }"),
+		"DNAT in capitals":        nftForward("    DNAT to 10.0.1.6"),
+		"dnat after a semicolon":  nftForward("    accept;dnat to 10.0.1.6"),
+		"dnat after a comma":      nftForward("    ip daddr { 10.0.1.5,dnat }"),
+		"snat":                    nftForward("    snat to 203.0.113.9"),
+		"snat ip":                 nftForward("    snat ip to 203.0.113.9"),
+		"redirect":                nftForward("    tcp dport 80 redirect to :8080"),
+		"tproxy":                  nftForward("    tproxy to :50080"),
+		"queue":                   nftForward("    queue num 0 bypass"),
+		"notrack":                 nftForward("    notrack"),
+		"dup":                     nftForward("    dup to 203.0.113.9"),
+		"fwd":                     nftForward("    fwd to \"eth1\""),
+		"flow offload":            nftForward("    flow add @ft"),
+		"meta mark set":           nftForward("    meta mark set 0x1"),
+		"ct mark set":             nftForward("    ct mark set 1"),
+		"ct helper set":           nftForward("    ct helper set \"ftp\""),
+		"meta nftrace set":        nftForward("    meta nftrace set 1"),
+		"address rewrite":         nftForward("    ip daddr set 10.0.1.6"),
+		"raw payload rewrite":     nftForward("    @nh,128,32 set 0x0a000106"),
+		"set from a map":          nftForward("    meta mark set ip saddr map { 10.0.1.5 : 1 }"),
+		"MSS set to a number":     nftForward("    tcp option maxseg size set 500"),
+		"variable":                nftForward("    ip daddr $target accept"),
+		"define in the table":     "table inet opnmesh {\n  define target = 10.0.1.5\n}\n",
+		"table flags dormant":     "table inet opnmesh {\n  flags dormant\n}\n",
+		"table flags owner":       "table inet opnmesh { flags owner; }\n",
+		"flags in a chain":        nftForward("    flags offload"),
+		"masquerade in forward":   nftForward("    masquerade"),
+		"masquerade in a chain":   "table inet opnmesh {\n  chain x {\n    masquerade\n  }\n}\n",
+		"input hook":              "table inet opnmesh {\n  chain input {\n    type filter hook input priority filter; policy drop;\n  }\n}\n",
+		"output hook":             "table inet opnmesh {\n  chain output {\n    type filter hook output priority filter; policy accept;\n  }\n}\n",
+		"prerouting hook":         "table inet opnmesh {\n  chain pre {\n    type nat hook prerouting priority dstnat; policy accept;\n  }\n}\n",
+		"route hook":              "table inet opnmesh {\n  chain out {\n    type route hook output priority mangle; policy accept;\n  }\n}\n",
+		"ingress hook":            "table inet opnmesh {\n  chain in {\n    type filter hook ingress device \"eth0\" priority 0; policy accept;\n  }\n}\n",
+		"forward before others":   "table inet opnmesh {\n  chain forward {\n    type filter hook forward priority -500; policy drop;\n  }\n}\n",
+		"forward policy accept":   "table inet opnmesh {\n  chain forward {\n    type filter hook forward priority filter; policy accept;\n  }\n}\n",
+		"forward with no policy":  "table inet opnmesh {\n  chain forward {\n    type filter hook forward priority filter;\n  }\n}\n",
+		"two hooks in one chain":  nftForward("    type nat hook postrouting priority srcnat"),
+		"hook outside a chain":    "table inet opnmesh {\n  type filter hook forward priority filter\n}\n",
+		"flowtable":               "table inet opnmesh {\n  flowtable ft {\n    hook ingress priority 0; devices = { eth0 };\n  }\n}\n",
+		"set declared in a chain": nftForward("    set s {\n    }"),
+	}
+	for name, conf := range bad {
+		if err := validateNftables(conf); err == nil {
+			t.Errorf("%s: accepted %q", name, conf)
+		}
+	}
+}
+
+func TestNftFiltersForwarding(t *testing.T) {
+	for p, conf := range goldenFiles(t, "nftables.conf") {
+		if !nftFiltersForwarding(conf) {
+			t.Errorf("%s: the forward chain was not recognised", p)
+		}
+	}
+	for _, conf := range []string{
+		"",
+		"table inet opnmesh {}\n",
+		"table inet opnmesh {\n  chain c {\n  }\n}\n",
+		"table inet opnmesh {\n  chain postrouting {\n    type nat hook postrouting priority srcnat; policy accept;\n  }\n}\n",
+		"flush ruleset\n",
+	} {
+		if nftFiltersForwarding(conf) {
+			t.Errorf("%q does not filter forwarding", conf)
 		}
 	}
 }

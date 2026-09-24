@@ -77,13 +77,12 @@ type Meta struct {
 	AppliedAt         int64  `json:"applied_at"`
 	SiteSlug          string `json:"site_slug"`
 	TelemetryEverySec int    `json:"telemetry_interval_seconds"`
-	PrivateKeyPath    string `json:"private_key_path"`
 }
 
 func (c Config) metaPath() string { return filepath.Join(c.ConfDir, "meta.json") }
 
 func (c Config) loadMeta() Meta {
-	m := Meta{Interface: "opnmesh0", TelemetryEverySec: 5, PrivateKeyPath: filepath.Join(c.ConfDir, "private.key")}
+	m := Meta{Interface: "opnmesh0", TelemetryEverySec: 5}
 	data, err := os.ReadFile(c.metaPath())
 	if err == nil {
 		_ = json.Unmarshal(data, &m)
@@ -107,7 +106,20 @@ func (c Config) saveMeta(m Meta) error {
 
 var ifaceRe = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,14}$`)
 
-func validInterfaceName(s string) bool { return ifaceRe.MatchString(s) }
+// validInterfaceName accepts a Linux interface name whose WireGuard file,
+// <name>.conf in ConfDir, cannot land on another managed file: an interface
+// called "nftables" would have its config written over nftables.conf.
+func validInterfaceName(s string) bool {
+	if !ifaceRe.MatchString(s) {
+		return false
+	}
+	for _, m := range ManagedFiles {
+		if s+".conf" == m {
+			return false
+		}
+	}
+	return true
+}
 
 // writeFileAtomic writes via a temp file and rename so a crash never leaves a
 // half-written configuration behind.
