@@ -54,10 +54,56 @@ jobs:
           go-version: "1.27"
           check-latest: true
           cache-dependency-path: agent/go.sum
-      - run: cd agent && go mod tidy && test -z "$(gofmt -l .)" && go vet ./... && go test ./...
+      # tidy -diff changes nothing and fails when go.mod or go.sum is not tidy.
+      - run: cd agent && go mod tidy -diff && test -z "$(gofmt -l .)" && go vet ./... && go test ./...
       - name: Known vulnerabilities in the agent and the Go standard library
-        run: cd agent && go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: cd agent && go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
       - run: cd agent && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/opnmesh-gw .
+
+  installer:
+    name: Controller installer (release pins, checksums, input checks)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # The one-line install runs the installer from main against the release
+      # it names; this is that path, short of starting anything.
+      - name: Downloads the release it names, each file matching the checksum it carries
+        run: sudo bash deploy/controller/install.sh --dir "$RUNNER_TEMP/pinned" --url https://203.0.113.5 --no-start
+      - name: Pins the image by the digest that release published, as both .env.example files do
+        run: |
+          image="$(sudo sed -n 's/^OPNMESH_IMAGE=//p' "$RUNNER_TEMP/pinned/.env")"
+          echo "the installer pins $image"
+          case "$image" in *:*@sha256:*) ;; *) echo "the installer does not pin the image by digest" >&2; exit 1 ;; esac
+          published="$(docker buildx imagetools inspect "${image%@*}" --format '{{json .Manifest}}' | jq -r .digest)"
+          [ "$published" = "${image#*@}" ] || { echo "${image%@*} is $published, not ${image#*@}" >&2; exit 1; }
+          for f in deploy/controller/.env.example deploy/controller/external-proxy/.env.example; do
+            grep -Fqx "OPNMESH_IMAGE=$image" "$f" || { echo "$f does not pin $image" >&2; exit 1; }
+          done
+      - name: Refuses a file that does not match its checksum, and keeps nothing of it
+        run: |
+          cd deploy/controller
+          { echo "0000000000000000000000000000000000000000000000000000000000000000  docker-compose.yml"; sha256sum Caddyfile; } > "$RUNNER_TEMP/bad.sha256"
+          if sudo env OPNMESH_RAW_BASE="file://$PWD" OPNMESH_FILE_SUMS="file://$RUNNER_TEMP/bad.sha256" \
+              bash install.sh --dir "$RUNNER_TEMP/tampered" --url https://203.0.113.5 --no-start; then
+            echo "the installer accepted a file that does not match its checksum" >&2
+            exit 1
+          fi
+          left="$(sudo ls -A "$RUNNER_TEMP/tampered" | grep -vx -e data -e caddy || true)"
+          [ -z "$left" ] || { echo "left behind: $left" >&2; exit 1; }
+      - name: Refuses a domain or URL that is not a plain host name, before changing anything
+        run: |
+          for arg in "--domain mesh.example.com{" "--domain Mesh.Example.com/x" "--domain mesh" \
+              "--url https://mesh.example.com/path" "--url http://mesh.example.com" "--url https://mesh.example.com:99999" \
+              "--url https://[2001:db8::5]" "--url https://10.0.0.256"; do
+            # shellcheck disable=SC2086 # two words: the flag and its value
+            if sudo bash deploy/controller/install.sh --dir "$RUNNER_TEMP/bad-input" --no-start $arg; then
+              echo "accepted $arg" >&2
+              exit 1
+            fi
+          done
+          [ ! -e "$RUNNER_TEMP/bad-input" ]
 
   deploy:
     name: Controller deployment and a real gateway (installer, private CA, systemd, upgrade)
@@ -73,9 +119,13 @@ jobs:
           node-version: 22
       - name: Build the controller image
         run: docker build -t opnmesh:ci .
+      # What a release publishes as controller-files.sha256, for the files under test.
+      - name: Checksums of the deployment files
+        run: cd deploy/controller && sha256sum docker-compose.yml Caddyfile > "$RUNNER_TEMP/controller-files.sha256"
       - name: Run the controller installer against the local image
         env:
           OPNMESH_RAW_BASE: file://${{ github.workspace }}/deploy/controller
+          OPNMESH_FILE_SUMS: file://${{ runner.temp }}/controller-files.sha256
           OPNMESH_HTTP_PORT: "18080"
           OPNMESH_HTTPS_PORT: "18443"
         run: sudo -E bash deploy/controller/install.sh --dir /tmp/opnmesh-ci --url https://127.0.0.1:18443 --image opnmesh:ci

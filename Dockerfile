@@ -3,12 +3,17 @@
 # the APIs, the installer and the agent binaries.
 #
 #   docker build -t opnmesh .
-#   docker run -p 3000:3000 -v opnmesh-data:/data opnmesh
+#   docker run -p 3000:3000 -v opnmesh-data:/data --init opnmesh
 
 ARG VERSION=2.0.0-dev
 
 # --- agent -------------------------------------------------------------------
-FROM golang:1.27 AS agent
+# Cross-compiled once on the build machine, so every platform's image serves
+# the same bytes. A release replaces this stage with the binaries its workflow
+# built, scanned and attested (docker buildx build --build-context
+# agent=<dir holding out/>), so the image serves exactly what the release
+# publishes.
+FROM --platform=$BUILDPLATFORM golang:1.27 AS agent
 ARG VERSION
 WORKDIR /src
 COPY agent/go.mod agent/go.sum* ./
