@@ -25,6 +25,9 @@ services:
   controller:
     image: ${OPNMESH_IMAGE:-ghcr.io/coppingethan/opnmesh:latest}
     restart: unless-stopped
+    # A minimal init as PID 1 passes docker stop's SIGTERM on to the
+    # controller and reaps any process it leaves behind.
+    init: true
     logging: *logging
     environment:
       OPNMESH_DATA_DIR: /data
@@ -61,7 +64,8 @@ services:
       retries: 3
 
   caddy:
-    image: caddy:2-alpine
+    # Pinned by version and digest; Dependabot proposes updates.
+    image: caddy:2.11.4-alpine@sha256:6aeddd44c3078b0f9a35206472a11420648a79c184603ef95957d0a20044cb2b
     restart: unless-stopped
     logging: *logging
     ports:

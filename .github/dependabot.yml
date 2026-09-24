@@ -1,6 +1,7 @@
 # Weekly update pull requests for everything the build pulls in: the pinned
-# workflow actions, the agent's Go modules, the app's npm packages and the
-# base images of the controller and the simulation.
+# workflow actions, the agent's Go modules, the app's npm packages, the base
+# images of the controller and the simulation, and the images the deployment
+# compose files pin (Caddy).
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -22,5 +23,12 @@ updates:
     directories:
       - /
       - /sim
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker-compose
+    directories:
+      - /deploy/controller
+      - /deploy/controller/external-proxy
     schedule:
       interval: weekly

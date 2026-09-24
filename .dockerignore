@@ -1,9 +1,6 @@
-node_modules
 .next
 out
-data
 backups
-sim/state
 .git
 .github
 docs
@@ -11,6 +8,17 @@ test
 coverage
 *.md
 !README.md
+# dependencies, runtime data and local test state, wherever they sit in the
+# checkout (agent worktrees under .claude/ are whole checkouts of their own)
+**/node_modules
+**/data
+**/sim/state
+**/.test-data
+# local tooling: agent worktrees and settings
+**/.claude
+**/.kilo
+# the image serves only the agent binaries its own build produced
+public/dl
 # secrets and databases, wherever they sit in the checkout
 **/.env
 **/.env.*
@@ -23,6 +31,5 @@ coverage
 # development-only material
 branding
 screenshots
-.test-data
 *.tsbuildinfo
 gradient-wallpapers-*.jpg
