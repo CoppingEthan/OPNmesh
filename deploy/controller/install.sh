@@ -35,10 +35,10 @@ set -eu
 # main moves on. The image is pinned in .env too: to upgrade, set the new
 # release's image in OPNMESH_IMAGE there, then
 # docker compose pull && docker compose up -d.
-RELEASE=2.1.2
-RELEASE_IMAGE_DIGEST=sha256:3f81674b88141265f29e2070586302b0ce7dcf1592c358a7dd70bd8be7692cf7
-RELEASE_FILE_SUMS="8c9a7d2c79a97b58c01c8496d4b783e8420d170b3466eb4bad8943bddbac888b  docker-compose.yml
-b7be502ee93f26d70e5675e5d4ac96894ae60d5167a503c252d1d87488203f23  Caddyfile"
+RELEASE=2.1.4
+RELEASE_IMAGE_DIGEST=sha256:4afa4b8f618f29f0362e04cc59e75067c4bcca307df362d94a4a80a14eb447f7
+RELEASE_FILE_SUMS="4b470c001bbec626a97baf5b63223e783d67600155b31619983d1fbff2fa447b  docker-compose.yml
+acd1a7da96d7a6bd1416bf7346bb95a33dfcecf51b787bb601faf71f8ae64db0  Caddyfile"
 
 REPO=CoppingEthan/OPNmesh
 IMAGE_REPO=ghcr.io/coppingethan/opnmesh
