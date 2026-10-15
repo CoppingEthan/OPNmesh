@@ -34,7 +34,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
       # The newest 1.27 patch release rather than the go.mod minimum: the
       # standard library is compiled into the binaries, and so are its fixes.
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.27"
           check-latest: true
